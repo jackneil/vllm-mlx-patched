@@ -773,8 +773,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens "
-            f"in {elapsed:.2f}s"
+            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens in {elapsed:.2f}s"
         )
 
         # Build OpenAI-compatible response with ordered indices
@@ -795,8 +794,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise HTTPException(
             status_code=503,
             detail=(
-                "mlx-embeddings not installed. "
-                "Install with: pip install mlx-embeddings"
+                "mlx-embeddings not installed. Install with: pip install mlx-embeddings"
             ),
         )
     except HTTPException:
@@ -1375,6 +1373,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     has_media = bool(images or videos)
+    if engine.is_mllm and not has_media:
+        # MLLM extracts media from messages directly, so images/videos are
+        # always empty. Check message content for video/image types instead.
+        for msg in request.messages:
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    item_type = (
+                        item.type
+                        if hasattr(item, "type")
+                        else (item.get("type", "") if isinstance(item, dict) else "")
+                    )
+                    if item_type in ("image_url", "image", "video", "video_url"):
+                        has_media = True
+                        break
+            if has_media:
+                break
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format

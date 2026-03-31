@@ -12,16 +12,11 @@ from typing import List, Optional
 
 import mlx.core as mx
 
-# MambaCache was removed in mlx-lm 0.30.6 - make import conditional
+# MambaCache was removed in mlx-lm 0.30.6, fall back to ArraysCache
 try:
     from mlx_lm.models.cache import MambaCache
-
-    HAS_MAMBA_CACHE = True
 except ImportError:
-    # Fallback for mlx-lm >= 0.30.6 where MambaCache was removed
     from mlx_lm.models.cache import ArraysCache as MambaCache
-
-    HAS_MAMBA_CACHE = False
 
 logger = logging.getLogger(__name__)
 

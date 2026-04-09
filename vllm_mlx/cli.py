@@ -357,7 +357,7 @@ def bench_compile_command(args):
     def run_measurement(model, tokenizer, label, num_runs):
         results = []
         for i in range(num_runs):
-            mx.metal.clear_cache()
+            mx.clear_cache()
 
             prompt_tps = 0.0
             gen_tps = 0.0
@@ -368,7 +368,7 @@ def bench_compile_command(args):
                 tokenizer,
                 base_prompt,
                 max_tokens=args.max_tokens,
-                temp=0.0,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),  # Greedy for determinism
             ):
                 if response.finish_reason is not None:
                     prompt_tps = response.prompt_tps
@@ -395,9 +395,9 @@ def bench_compile_command(args):
     model, tokenizer = load(args.model)
 
     print("Warmup run (discarded)...")
-    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10, temp=0.0):
+    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10):
         pass
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     print(f"\nMeasuring WITHOUT compile ({args.prompts} runs)...")
     baseline_results = run_measurement(model, tokenizer, "baseline", args.prompts)
@@ -407,9 +407,9 @@ def bench_compile_command(args):
     apply_compile(model)
 
     print("Warmup run (triggers compilation, discarded)...")
-    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10, temp=0.0):
+    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10):
         pass
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     print(f"\nMeasuring WITH compile ({args.prompts} runs)...")
     compiled_results = run_measurement(model, tokenizer, "compiled", args.prompts)

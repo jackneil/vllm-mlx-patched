@@ -95,3 +95,9 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# UV lock file
+uv.lock
+
+# Superpowers planning artifacts
+docs/superpowers/

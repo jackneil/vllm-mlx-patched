@@ -63,6 +63,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 | `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
+| `gemma4` | | Google Gemma 4 | `<\|tool_call>call:name{<\|"\|>key<\|"\|>:val}<tool_call\|>` |
 
 ## Model Examples
 
@@ -124,6 +125,18 @@ vllm-mlx serve mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-MLX-6Bit \
 # GLM-4.7 Flash
 vllm-mlx serve lmstudio-community/GLM-4.7-Flash-MLX-8bit \
   --enable-auto-tool-choice --tool-call-parser glm47
+```
+
+### Gemma 4
+
+```bash
+# Gemma 4 27B
+vllm-mlx serve mlx-community/gemma-4-31b-it-4bit \
+  --enable-auto-tool-choice --tool-call-parser gemma4
+
+# Gemma 4 MoE
+vllm-mlx serve mlx-community/gemma-4-26b-a4b-it-4bit \
+  --enable-auto-tool-choice --tool-call-parser gemma4
 ```
 
 ### Kimi K2

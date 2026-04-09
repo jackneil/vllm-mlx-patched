@@ -143,11 +143,30 @@ Prefill (TTFT) is **compute-bound** — large matrix multiplications benefit fro
 - [Ollama MLX Backend Announcement](https://ollama.com/blog/mlx)
 - [MLX vs llama.cpp Comparison (Groundy)](https://groundy.com/articles/mlx-vs-llamacpp-on-apple-silicon-which-runtime-to-use-for-local-llm-inference/)
 
-## What to build first
+## Completed Work (2026-04-08/09)
+
+### mx.compile() — IMPLEMENTED (PR #270)
+
+Added `--compile` flag and `bench-compile` A/B benchmark command. Results:
+
+| Model | Prefill Change | Decode Change |
+|-------|---------------|---------------|
+| Qwen3-0.6B-8bit | +38.6% | +0.3% (noise) |
+| Qwen3.5-35B-A3B-4bit | +33.3% | -0.8% (noise) |
+
+**Conclusion:** mx.compile significantly helps prefill (compute-bound) but does NOT improve decode tok/s (memory-bandwidth-bound). Useful for reducing TTFT on long prompts but won't change Arena speed benchmarks.
+
+### Gemma 4 Tool Parser — IMPLEMENTED (PR #269)
+
+Added `--tool-call-parser gemma4` with 30 tests including OpenAI format integration tests verifying Claude Code compatibility.
+
+### MedGemma Chat Template Fix — IMPLEMENTED (PR #271)
+
+Fixed crash when models have no chat_template configured (processor inherits method but no template set).
+
+## What to build next
 
 **Recommended sequence:**
-1. Async GPU evaluation in simple engine (1-2 hours, easy win)
-2. `mx.compile()` on forward pass (1-2 days, biggest single improvement)
-3. Benchmark infrastructure (needed before anything else to measure real impact)
-4. Speculative decoding with draft model (1-2 weeks, biggest total improvement)
-5. Interleaved scheduling (1 week, best for multi-user scenarios)
+1. Async GPU evaluation in simple engine (1-2 hours, easy win, 5-10%)
+2. Speculative decoding with draft model (1-2 weeks, biggest total improvement, 1.5-2.5x)
+3. Interleaved scheduling (1 week, best for multi-user scenarios, 15-25%)

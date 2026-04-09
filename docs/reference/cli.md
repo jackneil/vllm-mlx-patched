@@ -7,6 +7,7 @@
 | `vllm-mlx serve` | Start OpenAI-compatible server |
 | `vllm-mlx-bench` | Run performance benchmarks |
 | `vllm-mlx-chat` | Start Gradio chat interface |
+| `vllm-mlx bench-compile` | A/B benchmark: measure tok/s with and without mx.compile |
 
 ## `vllm-mlx serve`
 
@@ -43,7 +44,7 @@ vllm-mlx serve <model> [options]
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
-| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
+| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`, `gemma4`) | None |
 | `--compile` | Compile model forward pass with mx.compile for fused Metal kernels (experimental) | False |
 
 ### Examples

@@ -135,8 +135,9 @@ vllm_mlx/
 ├── models/
 │   ├── llm.py            # MLXLanguageModel
 │   └── mllm.py           # MLXMultimodalLM
-├── tool_parsers/         # Tool call parsers (12 formats)
-├── reasoning_parsers/    # Reasoning parsers (qwen3, deepseek_r1)
+├── tool_parsers/         # Tool call parsers (15 formats including gemma4)
+├── reasoning_parsers/    # Reasoning parsers (qwen3, deepseek_r1, gemma4)
+├── compile.py            # mx.compile wrapper for model optimization
 ├── server.py             # FastAPI server
 ├── engine_core.py        # AsyncEngineCore
 ├── scheduler.py          # LLM request scheduler

@@ -49,6 +49,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from typing import NamedTuple
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -2027,6 +2028,60 @@ async def stream_completion(
         yield f"data: {json.dumps(data)}\n\n"
 
     yield "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Streaming tool-parsing helper
+# ---------------------------------------------------------------------------
+
+
+class ToolDeltaResult(NamedTuple):
+    """Result from processing a streaming content delta through the tool parser."""
+
+    content: str | None
+    accumulated_text: str
+    markup_possible: bool
+    tools_found: bool
+    tool_result: dict | None
+
+
+def _process_streaming_tool_delta(
+    content: str | None,
+    tool_parser,
+    tool_accumulated_text: str,
+    tool_markup_possible: bool,
+) -> ToolDeltaResult:
+    """Feed a content delta through the streaming tool parser.
+
+    All known tool parsers use XML-like markup starting with '<'.
+    The fast path skips parsing until '<' is seen in the stream.
+
+    Both the reasoning and non-reasoning streaming branches call this
+    function -- a bug fix here fixes both paths.
+    """
+    if not tool_parser or not content:
+        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+
+    # Fast path: skip parsing until '<' seen
+    if not tool_markup_possible and "<" not in content:
+        tool_accumulated_text += content
+        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+
+    if not tool_markup_possible:
+        tool_markup_possible = True
+    tool_previous = tool_accumulated_text
+    tool_accumulated_text += content
+    tool_result = tool_parser.extract_tool_calls_streaming(
+        tool_previous, tool_accumulated_text, content
+    )
+
+    if tool_result is None:
+        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, False, None)
+    elif "tool_calls" in tool_result:
+        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, True, tool_result)
+    else:
+        new_content = tool_result.get("content", "")
+        return ToolDeltaResult(new_content, tool_accumulated_text, tool_markup_possible, False, None)
 
 
 async def stream_chat_completion(

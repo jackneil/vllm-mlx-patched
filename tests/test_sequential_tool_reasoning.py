@@ -32,8 +32,12 @@ class TestNonStreamingSequentialParsing:
         cleaned, tool_calls = _parse_tool_calls_with_parser(
             text_for_tools or model_output, _make_request()
         )
-        # Generic parser should find the tool call in the remainder
-        assert tool_calls is not None or "<tool_call>" in (text_for_tools or "")
+        # The remainder should contain tool markup for the generic parser
+        assert text_for_tools is not None
+        assert "<tool_call>" in text_for_tools
+        # Generic parser finds the tool call
+        if tool_calls is not None:
+            assert len(tool_calls) > 0
 
     def test_tools_only_no_reasoning(self):
         """Without reasoning tags, reasoning extraction is a no-op."""

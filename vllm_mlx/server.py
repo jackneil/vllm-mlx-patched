@@ -370,8 +370,6 @@ def _parse_tool_calls_with_parser(
     Returns:
         Tuple of (cleaned_text, tool_calls)
     """
-    global _tool_parser_instance
-
     request_dict = request.model_dump() if request else None
 
     # Honor tool_choice="none" — skip all parsing
@@ -382,28 +380,25 @@ def _parse_tool_calls_with_parser(
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return parse_tool_calls(output_text, request_dict)
 
-    # Initialize parser if needed
-    if _tool_parser_instance is None:
-        try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = None
-            if _engine is not None and hasattr(_engine, "_tokenizer"):
-                tokenizer = _engine._tokenizer
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
-        except Exception as e:
-            logger.warning(
-                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
-            )
-            logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text, request_dict)
-
-    # Use the configured parser
+    # Create per-request parser instance to avoid concurrency corruption.
+    # Non-streaming requests can interleave at await points in the caller,
+    # so sharing a global singleton is unsafe.
     try:
-        # Reset parser state between requests
-        _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        tokenizer = None
+        if _engine is not None and hasattr(_engine, "_tokenizer"):
+            tokenizer = _engine._tokenizer
+        parser = parser_cls(tokenizer)
+    except Exception as e:
+        logger.warning(
+            f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+        )
+        logger.warning("Falling back to generic parser")
+        return parse_tool_calls(output_text, request_dict)
+
+    # Use the per-request parser
+    try:
+        result = parser.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tool_calls = [
                 ToolCall(
@@ -1483,11 +1478,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     # Parse tool calls from the remainder (reasoning already extracted).
-    # The `or output.text` fallback handles the case where the model output is
-    # entirely reasoning (extract_reasoning returns (reasoning_text, None)),
-    # ensuring the tool parser still gets a chance to run on the raw text.
+    # When text_for_tools is None (model output was entirely reasoning),
+    # pass empty string — there are no tools to find in reasoning content.
+    # When no reasoning parser is active, text_for_tools == output.text.
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        text_for_tools or output.text, request
+        text_for_tools if text_for_tools is not None else "", request
     )
 
     # Process response_format if specified (after reasoning parser cleaned the text)
@@ -2059,7 +2054,7 @@ def _process_streaming_tool_delta(
     Both the reasoning and non-reasoning streaming branches call this
     function -- a bug fix here fixes both paths.
     """
-    if not tool_parser or not content:
+    if tool_parser is None or content is None:
         return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
 
     # Fast path: skip parsing until '<' seen
@@ -2141,7 +2136,6 @@ async def stream_chat_completion(
     if _enable_auto_tool_choice and _tool_call_parser and getattr(request, "tool_choice", None) != "none":
         # Create per-request parser instance to avoid concurrency corruption
         try:
-            from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParserManager
             parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
             tokenizer = None
             if _engine is not None and hasattr(_engine, "_tokenizer"):

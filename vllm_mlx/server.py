@@ -2116,9 +2116,12 @@ async def stream_chat_completion(
     )
     think_prefix_sent = False
 
-    # Reset reasoning parser state for this stream
+    # Create per-request reasoning parser to avoid concurrency corruption
+    reasoning_parser = None
     if _reasoning_parser:
-        _reasoning_parser.reset_state()
+        reasoning_parser = _reasoning_parser.__class__(
+            getattr(_reasoning_parser, "tokenizer", None)
+        )
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -2129,7 +2132,6 @@ async def stream_chat_completion(
     last_output = None
 
     # Tool call streaming state
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
@@ -2137,20 +2139,16 @@ async def stream_chat_completion(
     # tool_choice="none" prevents tool_parser init, which also guards the
     # streaming fallback block (it checks `if tool_parser`).
     if _enable_auto_tool_choice and _tool_call_parser and getattr(request, "tool_choice", None) != "none":
-        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
-            except Exception as e:
-                logger.warning(f"Failed to init tool parser for streaming: {e}")
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+        # Create per-request parser instance to avoid concurrency corruption
+        try:
+            from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParserManager
+            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+            tokenizer = None
+            if _engine is not None and hasattr(_engine, "_tokenizer"):
+                tokenizer = _engine._tokenizer
+            tool_parser = parser_cls(tokenizer)
+        except Exception as e:
+            logger.warning(f"Failed to init tool parser for streaming: {e}")
 
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -2164,15 +2162,49 @@ async def stream_chat_completion(
             completion_tokens = output.completion_tokens
 
         # Use reasoning parser if enabled
-        if _reasoning_parser and delta_text:
+        if reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, delta_text
             )
 
             if delta_msg is None:
                 # Skip this chunk (e.g., <think> token itself)
+                continue
+
+            content = delta_msg.content
+            reasoning = delta_msg.reasoning
+
+            # Feed content (NOT reasoning) through shared tool parser
+            td = _process_streaming_tool_delta(
+                content, tool_parser, tool_accumulated_text, tool_markup_possible
+            )
+            content = td.content
+            tool_accumulated_text = td.accumulated_text
+            tool_markup_possible = td.markup_possible
+
+            if td.tools_found:
+                tool_calls_detected = True
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                reasoning=reasoning,
+                                tool_calls=td.tool_result["tool_calls"],
+                            ),
+                            finish_reason="tool_calls" if output.finished else None,
+                        )
+                    ],
+                    usage=get_usage(output) if output.finished else None,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+                continue
+
+            # Skip empty chunks (no content and no reasoning)
+            if not content and not reasoning:
                 continue
 
             chunk = ChatCompletionChunk(
@@ -2181,10 +2213,16 @@ async def stream_chat_completion(
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
+                            content=content if content else None,
+                            reasoning=reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (
+                                output.finish_reason if output.finished else None
+                            )
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
@@ -2203,50 +2241,34 @@ async def stream_chat_completion(
                 content = "<think>" + content
                 think_prefix_sent = True
 
-            # Tool call streaming parsing
+            # Tool call streaming parsing (shared helper)
             if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
+                td = _process_streaming_tool_delta(
+                    content, tool_parser, tool_accumulated_text, tool_markup_possible
+                )
+                content = td.content
+                tool_accumulated_text = td.accumulated_text
+                tool_markup_possible = td.markup_possible
+
+                if td.tools_found:
+                    tool_calls_detected = True
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=_model_name,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=td.tool_result["tool_calls"]
+                                ),
+                                finish_reason=(
+                                    "tool_calls" if output.finished else None
+                                ),
+                            )
+                        ],
+                        usage=get_usage(output) if output.finished else None,
                     )
-
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=_model_name,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
-
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
 
             chunk = ChatCompletionChunk(
                 id=response_id,

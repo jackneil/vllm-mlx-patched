@@ -75,6 +75,10 @@ class HarmonyReasoningParser(ReasoningParser):
         final_match = _FINAL_PATTERN.search(model_output)
         content = final_match.group(1).strip() if final_match else None
 
+        # If no channel tags found at all, return original text as content
+        if reasoning is None and content is None and model_output:
+            return None, model_output
+
         return reasoning, content
 
     def extract_reasoning_streaming(

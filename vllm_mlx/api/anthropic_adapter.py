@@ -276,7 +276,8 @@ def _convert_tool_choice(tool_choice: dict) -> str | dict | None:
     Anthropic: {"type": "auto"} | {"type": "any"} | {"type": "tool", "name": "..."}
     OpenAI: "auto" | "none" | "required" | {"type": "function", "function": {"name": "..."}}
     """
-    choice_type = tool_choice.get("type", "auto")
+    raw_type = tool_choice.get("type", "auto")
+    choice_type = raw_type.lower() if isinstance(raw_type, str) else "auto"
 
     if choice_type == "auto":
         return "auto"

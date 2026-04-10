@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import time
 import uuid
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -167,6 +167,29 @@ class ChatCompletionRequest(BaseModel):
     # Tool calling
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
+
+    @field_validator("tool_choice", mode="before")
+    @classmethod
+    def normalize_tool_choice(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized not in ("none", "auto", "required"):
+                raise ValueError(
+                    f"Invalid tool_choice string: '{v}'. "
+                    "Must be 'none', 'auto', 'required', or a tool-choice object."
+                )
+            return normalized
+        if isinstance(v, dict):
+            choice_type = v.get("type", "")
+            if isinstance(choice_type, str) and choice_type.lower() == "none":
+                return "none"
+            return v
+        raise ValueError(
+            f"tool_choice must be a string, object, or null — got {type(v).__name__}"
+        )
+
     # Structured output
     response_format: ResponseFormat | dict | None = None
     # MLLM-specific parameters

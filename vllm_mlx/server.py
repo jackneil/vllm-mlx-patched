@@ -1471,16 +1471,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
-
-    # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
+    # IMPORTANT: Reasoning extraction MUST run before tool parsing.
+    # If reversed, tool parsers' strip_think_tags() destroys reasoning content
+    # before the reasoning parser can extract it. See issue #161.
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
-        text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
+    text_for_tools = output.text
+    if _reasoning_parser:
+        reasoning_text, text_for_tools = _reasoning_parser.extract_reasoning(
+            output.text
         )
+
+    # Parse tool calls from the remainder (reasoning already extracted).
+    # The `or output.text` fallback handles the case where the model output is
+    # entirely reasoning (extract_reasoning returns (reasoning_text, None)),
+    # ensuring the tool parser still gets a chance to run on the raw text.
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        text_for_tools or output.text, request
+    )
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:

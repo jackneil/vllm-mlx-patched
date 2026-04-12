@@ -1883,6 +1883,29 @@ class MLXMultimodalLM:
         accumulated_text = ""
         token_count = 0
 
+        # Precompute prompt tokens via tokenizer as a reliable fallback.
+        # The streaming chunks may report prompt_tokens=0; prefer the chunk value
+        # when truthy, otherwise use this precomputed count so usage reporting is
+        # never silently zero.
+        import logging as _logging
+        _precomputed_prompt_tokens = 0
+        try:
+            _tok = getattr(self.processor, "tokenizer", None)
+            if _tok is not None and hasattr(_tok, "encode"):
+                _precomputed_prompt_tokens = len(_tok.encode(formatted_prompt))
+            elif hasattr(self.processor, "encode"):
+                _precomputed_prompt_tokens = len(self.processor.encode(formatted_prompt))
+            else:
+                _precomputed_prompt_tokens = 0
+        except Exception as _e:
+            _logging.getLogger(__name__).warning(
+                "stream_chat: failed to precompute prompt_tokens via tokenizer: %s",
+                _e,
+            )
+            _precomputed_prompt_tokens = 0
+
+        _warned_mismatch = False
+
         for chunk in stream_generate(
             self.model,
             self.processor,
@@ -1898,18 +1921,39 @@ class MLXMultimodalLM:
             new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
             accumulated_text += new_text
 
+            _chunk_pt = getattr(chunk, "prompt_tokens", 0)
+            _reported_prompt_tokens = _chunk_pt or _precomputed_prompt_tokens
+
+            # One-shot warning if chunk-reported and precomputed diverge >10%
+            if (
+                not _warned_mismatch
+                and _chunk_pt
+                and _precomputed_prompt_tokens
+                and abs(_chunk_pt - _precomputed_prompt_tokens)
+                / max(_precomputed_prompt_tokens, 1)
+                > 0.10
+            ):
+                _logging.getLogger(__name__).warning(
+                    "stream_chat: prompt_tokens mismatch chunk=%d precomputed=%d",
+                    _chunk_pt,
+                    _precomputed_prompt_tokens,
+                )
+                _warned_mismatch = True
+
             yield MLLMOutput(
                 text=new_text,  # Just the new token for streaming
                 finish_reason=None,
-                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                prompt_tokens=_reported_prompt_tokens,
                 completion_tokens=token_count,
             )
 
         # Final yield with finish_reason
+        _final_chunk_pt = getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0
+        _final_prompt_tokens = _final_chunk_pt or _precomputed_prompt_tokens
         yield MLLMOutput(
             text="",
             finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
+            prompt_tokens=_final_prompt_tokens,
             completion_tokens=token_count,
         )
 

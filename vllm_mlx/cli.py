@@ -987,6 +987,8 @@ Examples:
     # .register_module (or register_lazy_module) is automatically a valid CLI
     # choice without needing a second edit here. Mirrors the pattern used for
     # --reasoning-parser below.
+    # Import locally: .tool_parsers imports from vllm_mlx top-level and a
+    # top-level import here would risk a circular dependency during CLI init.
     from .tool_parsers import ToolParserManager
     tool_parser_choices = ToolParserManager.list_registered()
     serve_parser.add_argument(

@@ -164,5 +164,110 @@ class TestStreamingThinkRouter(unittest.TestCase):
         assert r.flush() == []
 
 
+# =============================================================================
+# Configurable tokens + channel strip counter — DCR regression coverage
+# =============================================================================
+
+
+class TestStreamingThinkRouterConfigurableTokens(unittest.TestCase):
+    """Focused regression coverage for the DCR-flagged failure modes."""
+
+    def test_gemma4_full_block_single_chunk(self):
+        r = StreamingThinkRouter(
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        pieces = r.process(
+            "<|channel>thought\nI should call read_file<channel|>Here is the file."
+        ) + r.flush()
+        self.assertIn(("thinking", "I should call read_file"), pieces)
+        text_pieces = [t for b, t in pieces if b == "text"]
+        self.assertTrue(any("Here is the file." in t for t in text_pieces))
+
+    def test_gemma4_streaming_chunks_preserve_strip(self):
+        """Tokens + channel name split across chunk boundaries."""
+        r = StreamingThinkRouter(
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        self.assertEqual(r.process("<|channe"), [])
+        pieces = r.process("l>thou")
+        self.assertEqual("".join(t for b, t in pieces if b == "thinking"), "")
+        pieces = r.process("ght\nstep 1")
+        self.assertEqual(
+            "".join(t for b, t in pieces if b == "thinking"), "step 1"
+        )
+        self.assertEqual(r.process(" and step 2"), [("thinking", " and step 2")])
+        pieces = r.process("<channel|>answer") + r.flush()
+        text_pieces = [t for b, t in pieces if b == "text"]
+        self.assertTrue(any("answer" in t for t in text_pieces))
+
+    def test_reentry_resets_strip_counter(self):
+        """A second <|channel>thought\\n block also has its channel name stripped."""
+        r = StreamingThinkRouter(
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        pieces = r.process(
+            "<|channel>thought\nfirst<channel|>middle<|channel>thought\nsecond<channel|>end"
+        ) + r.flush()
+        thinking = [t for b, t in pieces if b == "thinking"]
+        self.assertIn("first", thinking)
+        self.assertIn("second", thinking)
+        for t in thinking:
+            self.assertNotIn("thought\n", t)
+
+    def test_default_tokens_qwen_compatible(self):
+        """Default behavior (no custom tokens) still recognizes <think>."""
+        r = StreamingThinkRouter()
+        pieces = r.process("before<think>reasoning</think>after") + r.flush()
+        self.assertEqual(
+            pieces,
+            [("text", "before"), ("thinking", "reasoning"), ("text", "after")],
+        )
+
+    def test_end_tokens_any_of_match_earliest_wins(self):
+        """Whichever end token appears first in the buffer closes thinking."""
+        r = StreamingThinkRouter(
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        # Alt end appears first → closes thinking there
+        pieces = r.process(
+            "<|channel>thought\nA<|channel>response\nB<channel|>C"
+        ) + r.flush()
+        self.assertIn(("thinking", "A"), pieces)
+        joined = "".join(t for b, t in pieces if b == "text")
+        self.assertIn("B", joined)
+        self.assertIn("C", joined)
+
+    def test_end_token_arrives_before_strip_prefix_completes(self):
+        """Edge case: reasoning is shorter than channel_strip_prefix.
+
+        Gemma 4 says reasoning content begins after 'thought\\n' (8 chars).
+        If a pathological stream closes thinking before all 8 chars arrive,
+        the router must still close cleanly without emitting raw channel-
+        prefix characters.
+        """
+        r = StreamingThinkRouter(
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        # Only 3 of the 8 strip-prefix chars arrive, then immediate close
+        pieces = r.process("<|channel>tho<channel|>after") + r.flush()
+        # Thinking piece (if present) must not contain the partial prefix
+        thinking = [t for b, t in pieces if b == "thinking"]
+        for t in thinking:
+            self.assertNotIn("tho", t)
+        # After text flows normally
+        joined = "".join(t for b, t in pieces if b == "text")
+        self.assertIn("after", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

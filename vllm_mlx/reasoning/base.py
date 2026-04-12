@@ -56,6 +56,42 @@ class ReasoningParser(ABC):
         """
         self.tokenizer = tokenizer
 
+    # -- Streaming router integration ---------------------------------------
+    # The Anthropic streaming path in server.py uses a StreamingThinkRouter
+    # that needs to know the reasoning delimiters. Expose them as properties
+    # so subclasses override only what they need. Defaults match the
+    # "<think>/</think>" convention that the router hardcoded before this
+    # refactor — safe fallback for any parser that doesn't override.
+
+    @property
+    def start_token(self) -> str:
+        """Opening delimiter for reasoning content. Default: ``<think>``."""
+        return "<think>"
+
+    @property
+    def end_tokens(self) -> list[str]:
+        """List of closing delimiters that terminate reasoning content.
+
+        The streaming router scans for the earliest occurrence of any entry
+        in this list and treats it as the close. Default is a single-entry
+        list matching ``</think>``. Override to supply protocol-specific
+        alternatives (e.g. parsers whose format has more than one valid
+        transition marker out of reasoning mode).
+        """
+        return ["</think>"]
+
+    @property
+    def channel_strip_prefix(self) -> str | None:
+        """Optional prefix stripped from the first reasoning emission.
+
+        Parsers whose protocol prefixes reasoning content with channel or
+        metadata tokens should override this to return that prefix string.
+        The router drops exactly ``len(prefix)`` characters from the very
+        start of the emitted reasoning content. Default ``None`` means
+        "strip nothing."
+        """
+        return None
+
     @abstractmethod
     def extract_reasoning(
         self,

@@ -60,7 +60,30 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
     @property
     def end_token(self) -> str:
+        # Retained for BaseThinkingReasoningParser's abstract contract and
+        # for this module's own extract_reasoning/streaming methods. The
+        # streaming router uses `end_tokens` (plural) instead.
         return "<channel|>"
+
+    @property
+    def end_tokens(self) -> list[str]:
+        """Gemma 4 emits ``<channel|>`` normally, and sometimes transitions
+        via ``<|channel>response`` (see ``_RESPONSE_MARKER`` and
+        ``extract_reasoning_streaming`` in this module). The streaming
+        router treats whichever marker arrives first as the close.
+        """
+        return ["<channel|>", _RESPONSE_MARKER]
+
+    @property
+    def channel_strip_prefix(self) -> str | None:
+        """Strip the ``thought\\n`` channel name from the first reasoning emission.
+
+        Gemma 4's protocol prefixes reasoning content with the channel name
+        (``thought``) followed by a newline. That's protocol metadata, not
+        reasoning, and must be removed before emitting to Anthropic
+        thinking blocks.
+        """
+        return "thought\n"
 
     def extract_reasoning(
         self,

@@ -632,7 +632,13 @@ class MLLMBatchGenerator:
 
         # Guard against excessive memory usage during cache merge.
         # Each token in the batch requires KV entries across all layers.
-        max_batch_tokens = self.prefill_step_size * len(requests)
+        # Use a generous per-request limit (64K tokens) — the model's actual
+        # context window (often 128K–262K) is the real constraint, and agentic
+        # tool payloads (Claude Code sends 29+ tools) easily reach 3K–10K tokens.
+        # The old formula (prefill_step_size * len(requests)) was too restrictive:
+        # prefill_step_size is a *chunking* parameter, not a prompt length limit.
+        _PER_REQUEST_TOKEN_LIMIT = 65536
+        max_batch_tokens = _PER_REQUEST_TOKEN_LIMIT * len(requests)
         if total_prompt_tokens > max_batch_tokens:
             raise ValueError(
                 f"Total prompt tokens ({total_prompt_tokens}) exceeds safe limit "

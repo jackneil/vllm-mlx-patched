@@ -226,10 +226,18 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "completion_batch_size", 16
         )
 
+        # Forward prefill_step_size from CLI (default 2048) so MLLM models
+        # can handle long prompts (e.g. Claude Code sends 29+ tools which
+        # tokenise to ~1200+ tokens — the old MLLM default of 1024 rejected them).
+        prefill_step_size = getattr(
+            self._scheduler_config, "prefill_step_size", 2048
+        )
+
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
+            prefill_step_size=prefill_step_size,
             enable_vision_cache=True,
             vision_cache_size=100,
         )

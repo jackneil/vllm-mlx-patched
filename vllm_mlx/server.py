@@ -1859,17 +1859,62 @@ async def _stream_anthropic_messages(
     # - Think router separates <think> content into Anthropic thinking blocks
     accumulated_text = ""
     tool_filter = StreamingToolCallFilter()
-    # Detect if the model's chat template injects <think> into the
-    # generation prompt. If so, the model starts in thinking mode and
-    # the opening tag never appears in the output stream.
+    # Detect the reasoning parser (if any) and pull its token configuration
+    # from the parser's properties. No class-name matching — the base class
+    # defines properties with safe defaults, concrete parsers override.
+    # See vllm_mlx/reasoning/base.py for the full property contract.
+    #
+    # SILENT-REBASE PROTECTION: we gate on hasattr so an upstream rename
+    # produces a loud error log + default-router fallback, not silent drift.
+    _rp = _reasoning_parser  # module-level, set by --reasoning-parser CLI flag
+    _EXPECTED_PROPS = ("start_token", "end_tokens", "channel_strip_prefix")
+
+    if _rp is not None and all(hasattr(_rp, p) for p in _EXPECTED_PROPS):
+        _start_token = _rp.start_token
+        _end_tokens = list(_rp.end_tokens)
+        _channel_strip = _rp.channel_strip_prefix
+        _parser_label = type(_rp).__name__
+    elif _rp is not None:
+        # Upstream API drift: parser is set but missing expected properties.
+        # Fall back to defaults, and make it impossible to miss in logs.
+        logger.error(
+            "Reasoning parser %s missing expected properties %r — upstream API "
+            "drift? Falling back to default router (reasoning blocks will not "
+            "be routed for this parser).",
+            type(_rp).__name__, _EXPECTED_PROPS,
+        )
+        _start_token = "<think>"
+        _end_tokens = ["</think>"]
+        _channel_strip = None
+        _parser_label = f"{type(_rp).__name__}(DRIFT-FALLBACK)"
+    else:
+        _start_token = "<think>"
+        _end_tokens = ["</think>"]
+        _channel_strip = None
+        _parser_label = "none"
+
+    # Detect if the model's chat template injects the start token into the
+    # generation prompt. If so, the model starts in thinking mode and the
+    # opening tag never appears in the output stream.
     _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
     _chat_template = ""
     if _tokenizer and hasattr(_tokenizer, "chat_template"):
         _chat_template = _tokenizer.chat_template or ""
     _starts_thinking = (
-        "<think>" in _chat_template and "add_generation_prompt" in _chat_template
+        _start_token in _chat_template and "add_generation_prompt" in _chat_template
     )
-    think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
+
+    logger.info(
+        "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",
+        _parser_label, _start_token, _end_tokens, _channel_strip, _starts_thinking,
+    )
+
+    think_router = StreamingThinkRouter(
+        start_in_thinking=_starts_thinking,
+        start_token=_start_token,
+        end_tokens=_end_tokens,
+        channel_strip_prefix=_channel_strip,
+    )
     prompt_tokens = 0
     completion_tokens = 0
 

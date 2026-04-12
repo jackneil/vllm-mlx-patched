@@ -982,30 +982,22 @@ Examples:
         action="store_true",
         help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
     )
+    # Tool-call parser choices loaded dynamically from the ToolParserManager
+    # registry. This ensures any new parser registered via @ToolParserManager
+    # .register_module (or register_lazy_module) is automatically a valid CLI
+    # choice without needing a second edit here. Mirrors the pattern used for
+    # --reasoning-parser below.
+    from .tool_parsers import ToolParserManager
+    tool_parser_choices = ToolParserManager.list_registered()
     serve_parser.add_argument(
         "--tool-call-parser",
         type=str,
         default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "glm47",
-        ],
+        choices=tool_parser_choices,
         help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
-            "Required for --enable-auto-tool-choice."
+            "Select the tool call parser for the model. "
+            "Required for --enable-auto-tool-choice. "
+            f"Options: {', '.join(tool_parser_choices)}."
         ),
     )
     # Reasoning parser options - choices loaded dynamically from registry

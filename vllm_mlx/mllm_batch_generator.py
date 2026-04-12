@@ -286,7 +286,7 @@ class MLLMBatchGenerator:
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
         prefill_batch_size: int = 4,  # Smaller for MLLM due to vision overhead
         completion_batch_size: int = 16,  # Can be larger for text generation
-        prefill_step_size: int = 1024,
+        prefill_step_size: int = 2048,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
     ):

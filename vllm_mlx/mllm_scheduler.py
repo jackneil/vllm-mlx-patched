@@ -52,8 +52,10 @@ class MLLMSchedulerConfig:
     prefill_batch_size: int = 16
     # Completion batch size
     completion_batch_size: int = 16
-    # Prefill step size for chunked prefill
-    prefill_step_size: int = 1024
+    # Prefill step size for chunked prefill.
+    # Must accommodate agentic tool payloads (Claude Code sends 29+ tools
+    # which tokenise to ~1200+ tokens). Matches the CLI --prefill-step-size default.
+    prefill_step_size: int = 2048
     # Enable vision embedding cache
     enable_vision_cache: bool = True
     # Maximum cache entries

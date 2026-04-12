@@ -5,6 +5,7 @@ Utility functions for text processing and model detection.
 
 import logging
 import re
+from typing import Iterable
 
 from .models import Message
 
@@ -248,9 +249,106 @@ class StreamingThinkRouter:
             so the tag never appears in the output stream).
     """
 
-    def __init__(self, start_in_thinking: bool = False):
+    def __init__(
+        self,
+        start_in_thinking: bool = False,
+        start_token: str = "<think>",
+        end_tokens: "Iterable[str]" = ("</think>",),
+        channel_strip_prefix: str | None = None,
+    ):
+        """Route reasoning content (delimited by start/end tokens) into
+        Anthropic thinking blocks.
+
+        Args:
+            start_in_thinking: the model's chat template injects the start
+                token into the generation prompt, so only the close tag
+                appears in output (e.g. MiniMax/Nemotron pattern).
+            start_token: opening delimiter. Default ``<think>`` works for
+                Qwen3 and other Anthropic-friendly models. Pass ``<|channel>``
+                for Gemma 4.
+            end_tokens: iterable of closing delimiters. The earliest match
+                in the buffer wins. Default ``("</think>",)`` preserves
+                legacy behavior. For Gemma 4 pass
+                ``("<channel|>", "<|channel>response")``.
+            channel_strip_prefix: optional string stripped from the start of
+                the first thinking emission. Gemma 4 emits
+                ``<|channel>thought\n<real reasoning>``; pass ``"thought\n"``
+                to drop the channel name from the Anthropic thinking delta.
+                None (default) strips nothing.
+        """
         self._buffer = ""
         self._in_think = start_in_thinking
+        self._start_token = start_token
+
+        # Normalize end_tokens to a tuple. Reject empty (ambiguous intent)
+        # and reject entries where one is a strict prefix of another —
+        # otherwise a long marker gets spuriously closed by its own prefix.
+        end_tokens_tuple: tuple[str, ...] = tuple(end_tokens)
+        if not end_tokens_tuple:
+            raise ValueError("StreamingThinkRouter requires at least one end token")
+        for a in end_tokens_tuple:
+            for b in end_tokens_tuple:
+                if a is not b and a != b and b.startswith(a):
+                    raise ValueError(
+                        f"end_tokens contains prefix collision: {a!r} is a prefix "
+                        f"of {b!r}; the shorter would spuriously close first"
+                    )
+        self._end_tokens: tuple[str, ...] = end_tokens_tuple
+
+        self._channel_strip_prefix = channel_strip_prefix
+
+        # Integer counter for channel-name strip. Set when we enter thinking
+        # mode (either via start_in_thinking=True or by matching the start
+        # token later). Each thinking emission drops up to _strip_remaining
+        # characters from the front of the piece and decrements. At 0, emits
+        # pass through. NOT buffer mutation — the counter survives buffer
+        # resets.
+        self._strip_remaining: int = (
+            len(channel_strip_prefix)
+            if (start_in_thinking and channel_strip_prefix)
+            else 0
+        )
+
+    def _enter_thinking(self) -> None:
+        """Transition from text mode to thinking mode.
+
+        Resets the channel-strip counter on every entry so multiple
+        <think>...</think> blocks within one stream each strip their
+        channel name. Defensive — most streams have a single block.
+        """
+        self._in_think = True
+        if self._channel_strip_prefix is not None:
+            self._strip_remaining = len(self._channel_strip_prefix)
+        else:
+            self._strip_remaining = 0
+
+    def _consume_strip(self, text: str) -> str:
+        """Drop up to ``self._strip_remaining`` characters from the front.
+
+        Called on every thinking-mode emission. Never mutates ``self._buffer``.
+        When ``_strip_remaining`` reaches 0 this is a no-op pass-through.
+        """
+        if self._strip_remaining <= 0 or not text:
+            return text
+        drop = min(self._strip_remaining, len(text))
+        self._strip_remaining -= drop
+        return text[drop:]
+
+    def _find_end_marker(self) -> tuple[int, int] | None:
+        """Find the earliest end-of-thinking marker in ``self._buffer``.
+
+        Returns (index, length) of the first match among ``self._end_tokens``.
+        If multiple markers are present, the earliest wins. Returns ``None``
+        if no marker is present in the buffer.
+        """
+        best: tuple[int, int] | None = None
+        for tok in self._end_tokens:
+            idx = self._buffer.find(tok)
+            if idx < 0:
+                continue
+            if best is None or idx < best[0]:
+                best = (idx, len(tok))
+        return best
 
     def process(self, delta: str) -> list[tuple[str, str]]:
         """Process a delta. Returns list of (block_type, text) pieces."""
@@ -263,50 +361,57 @@ class StreamingThinkRouter:
         """Extract all complete pieces from the buffer."""
         while True:
             if self._in_think:
-                idx = self._buffer.find("</think>")
-                if idx >= 0:
-                    # Emit thinking content, exit think mode
-                    thinking = self._buffer[:idx]
-                    self._buffer = self._buffer[idx + len("</think>") :]
+                end_marker = self._find_end_marker()
+                if end_marker is not None:
+                    end_idx, end_len = end_marker
+                    thinking = self._buffer[:end_idx]
+                    self._buffer = self._buffer[end_idx + end_len :]
                     self._in_think = False
+                    thinking = self._consume_strip(thinking)
                     if thinking:
                         pieces.append(("thinking", thinking))
                     continue  # Process remainder
                 else:
-                    # Check for partial close tag at end
-                    for plen in range(min(len("</think>"), len(self._buffer)), 0, -1):
-                        if self._buffer.endswith("</think>"[:plen]):
-                            # Hold back partial match
-                            emit = self._buffer[:-plen]
-                            self._buffer = self._buffer[-plen:]
-                            if emit:
-                                pieces.append(("thinking", emit))
-                            return
-                    # No partial match - emit all as thinking
+                    # Hold back any suffix that is a partial match of ANY
+                    # end token. Use the longest configured end token as the
+                    # upper bound on hold-back length.
+                    longest = max(len(t) for t in self._end_tokens)
+                    held = 0
+                    for plen in range(min(longest, len(self._buffer)), 0, -1):
+                        suffix = self._buffer[-plen:]
+                        if any(t.startswith(suffix) for t in self._end_tokens):
+                            held = plen
+                            break
+                    if held > 0:
+                        emit = self._buffer[:-held]
+                        self._buffer = self._buffer[-held:]
+                        emit = self._consume_strip(emit)
+                        if emit:
+                            pieces.append(("thinking", emit))
+                        return
                     if self._buffer:
-                        pieces.append(("thinking", self._buffer))
+                        emit = self._consume_strip(self._buffer)
                         self._buffer = ""
+                        if emit:
+                            pieces.append(("thinking", emit))
                     return
             else:
-                idx = self._buffer.find("<think>")
+                idx = self._buffer.find(self._start_token)
                 if idx >= 0:
-                    # Emit text before tag, enter think mode
                     before = self._buffer[:idx]
-                    self._buffer = self._buffer[idx + len("<think>") :]
-                    self._in_think = True
+                    self._buffer = self._buffer[idx + len(self._start_token) :]
+                    self._enter_thinking()
                     if before:
                         pieces.append(("text", before))
                     continue  # Process remainder
                 else:
-                    # Check for partial open tag at end
-                    for plen in range(min(len("<think>"), len(self._buffer)), 0, -1):
-                        if self._buffer.endswith("<think>"[:plen]):
+                    for plen in range(min(len(self._start_token), len(self._buffer)), 0, -1):
+                        if self._buffer.endswith(self._start_token[:plen]):
                             emit = self._buffer[:-plen]
                             self._buffer = self._buffer[-plen:]
                             if emit:
                                 pieces.append(("text", emit))
                             return
-                    # No partial match - emit all as text
                     if self._buffer:
                         pieces.append(("text", self._buffer))
                         self._buffer = ""
@@ -317,9 +422,14 @@ class StreamingThinkRouter:
         pieces = []
         if self._buffer:
             block_type = "thinking" if self._in_think else "text"
-            pieces.append((block_type, self._buffer))
+            text = self._buffer
             self._buffer = ""
+            if block_type == "thinking":
+                text = self._consume_strip(text)
+            if text:
+                pieces.append((block_type, text))
         self._in_think = False
+        self._strip_remaining = 0
         return pieces
 
 

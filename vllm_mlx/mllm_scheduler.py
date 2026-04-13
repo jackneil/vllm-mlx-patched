@@ -328,6 +328,25 @@ class MLLMScheduler:
             sampling_params=sampling_params,
         )
 
+        # Precompute prompt_tokens so Anthropic streaming path's
+        # message_delta.usage.input_tokens is non-zero. Image tokens are
+        # added during preprocessing and this is a conservative
+        # text-only baseline — better than 0 (which breaks Claude Code
+        # context-window tracking, CLIProxyAPI issue #1700).
+        try:
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            if hasattr(tokenizer, "encode"):
+                request.num_prompt_tokens = len(tokenizer.encode(prompt))
+        except Exception as _enc_err:
+            logger.warning(
+                "MLLMScheduler prompt_tokens precompute failed: %s — defaulting to 0",
+                _enc_err,
+            )
+
         self.requests[request_id] = request
         self.waiting.append(request)
 

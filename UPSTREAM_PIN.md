@@ -35,6 +35,42 @@ silently degrade to raw-text output.
    driven dynamically by `ToolParserManager.list_registered()` (NOT hardcoded).
    Tests in `tests/test_cli_argparse.py` pin this.
 
+### Added 2026-04-12: reasoning-parser streaming integration
+
+5. **`ReasoningParser` base class exposes these properties** (`vllm_mlx/reasoning/base.py`):
+   - `start_token: str` (default `"<think>"`)
+   - `end_tokens: list[str]` (default `["</think>"]`)
+   - `channel_strip_prefix: str | None` (default `None`)
+
+   These are read verbatim by `_stream_anthropic_messages` in `vllm_mlx/server.py`
+   behind a `hasattr` precondition to configure `StreamingThinkRouter`. If any
+   property is renamed, the server logs an error and falls back to default
+   router behavior. Pin: these three exact names with those exact defaults.
+   `tests/test_reasoning_parser_properties.py::TestRebaseBreakageSentinel` fires
+   in CI if any property name drifts.
+
+6. **`Gemma4ReasoningParser` overrides** `end_tokens` as `["<channel|>", "<|channel>response"]`
+   and `channel_strip_prefix` as `"thought\n"` (`vllm_mlx/reasoning/gemma4_parser.py`).
+   Note: the legacy singular `end_token` property is RETAINED because
+   `BaseThinkingReasoningParser` still declares it abstractmethod and uses it
+   in `extract_reasoning_streaming`. Do not remove without untangling the parent.
+
+7. **`StreamingThinkRouter.__init__` accepts** `start_token: str`,
+   `end_tokens: Iterable[str]`, `channel_strip_prefix: str | None` kwargs with
+   backward-compatible defaults (`vllm_mlx/api/utils.py`). Rejects prefix
+   collisions in `end_tokens` at construction. Uses an integer counter
+   `_strip_remaining` for channel-strip state (not buffer mutation). Pin:
+   the kwarg names, the prefix-collision invariant, and the counter-based
+   (non-buffer-mutating) design.
+
+8. **`MLLMScheduler.add_request` precomputes `num_prompt_tokens`** via
+   `self.processor.tokenizer.encode(prompt)` in `vllm_mlx/mllm_scheduler.py`.
+   Continuous-batching MLLM requests flow through this path — without it,
+   `message_delta.usage.input_tokens` leaks as 0 to Anthropic clients.
+   `MLLM.stream_chat` has a matching precompute in `vllm_mlx/models/mllm.py`
+   for the non-batched MLLM path. Both prefer a truthy chunk-reported value
+   when present.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

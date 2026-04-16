@@ -102,5 +102,42 @@ class TestDetectStartsThinking(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestStartsThinkingIntegration(unittest.TestCase):
+    """Verify the old inline code path is replaced."""
+
+    def test_gemma4_closed_block_produces_text_not_thinking(self):
+        """End-to-end: when starts_thinking is False, plain text routes as text."""
+        from vllm_mlx.api.utils import StreamingThinkRouter
+
+        # Simulate Gemma4 with _starts_thinking=False (the fix)
+        router = StreamingThinkRouter(
+            start_in_thinking=False,
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        pieces = router.process("Paris") + router.flush()
+
+        # Should be text, not thinking
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual(pieces[0], ("text", "Paris"))
+
+    def test_gemma4_true_starts_thinking_strips_and_misclassifies(self):
+        """Demonstrates the bug: starts_thinking=True eats short responses."""
+        from vllm_mlx.api.utils import StreamingThinkRouter
+
+        # The old broken behavior
+        router = StreamingThinkRouter(
+            start_in_thinking=True,
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
+            channel_strip_prefix="thought\n",
+        )
+        pieces = router.process("Paris") + router.flush()
+
+        # "Paris" (5 chars) is entirely consumed by the 8-char strip counter
+        self.assertEqual(pieces, [])
+
+
 if __name__ == "__main__":
     unittest.main()

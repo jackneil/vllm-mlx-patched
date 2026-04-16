@@ -1939,16 +1939,8 @@ async def _stream_anthropic_messages(
         _channel_strip = None
         _parser_label = "none"
 
-    # Detect if the model's chat template injects the start token into the
-    # generation prompt. If so, the model starts in thinking mode and the
-    # opening tag never appears in the output stream.
     _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-    _chat_template = ""
-    if _tokenizer and hasattr(_tokenizer, "chat_template"):
-        _chat_template = _tokenizer.chat_template or ""
-    _starts_thinking = (
-        _start_token in _chat_template and "add_generation_prompt" in _chat_template
-    )
+    _starts_thinking = _detect_starts_thinking(_tokenizer, _start_token, _end_tokens)
 
     logger.info(
         "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",

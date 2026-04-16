@@ -1752,6 +1752,52 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
+def _detect_starts_thinking(
+    tokenizer,
+    start_token: str,
+    end_tokens: list[str],
+) -> bool:
+    """Detect if the model's chat template leaves thinking genuinely OPEN.
+
+    Renders a minimal test prompt and checks whether the start token
+    appears after the last end token in the rendered output. This
+    correctly handles Gemma4 where the template contains <|channel> but
+    emits a CLOSED block (<|channel>thought\\n<channel|>) when
+    enable_thinking is not set.
+
+    Falls back to the naive text-in-template check if rendering fails
+    (safe default: True means router starts in thinking mode).
+    """
+    if tokenizer is None:
+        return False
+    if not hasattr(tokenizer, "chat_template"):
+        return False
+    chat_template = tokenizer.chat_template or ""
+    if start_token not in chat_template or "add_generation_prompt" not in chat_template:
+        return False
+
+    try:
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "x"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return True
+
+    suffix = rendered[-300:]
+    last_start = suffix.rfind(start_token)
+    if last_start < 0:
+        return False
+
+    # Check from the start token position onward for any end token.
+    # Using last_start (not last_start + len) handles end tokens that
+    # share the start token as a prefix (e.g. <|channel>response).
+    from_start = suffix[last_start:]
+    has_close = any(et in from_start for et in end_tokens)
+    return not has_close
+
+
 def _emit_content_pieces(
     pieces: list[tuple[str, str]],
     current_block_type: str | None,

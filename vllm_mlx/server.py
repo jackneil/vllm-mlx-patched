@@ -1776,6 +1776,13 @@ def _detect_starts_thinking(
     if start_token not in chat_template or "add_generation_prompt" not in chat_template:
         return False
 
+    # NOTE: enable_thinking is deliberately NOT passed here. The probe must
+    # match the kwargs the BatchedEngine uses (batched.py:387-392), which
+    # also omits enable_thinking. Templates that default it to True (Qwen3)
+    # produce the correct open-thinking result; templates that default it to
+    # False (Gemma4) produce the correct closed-thinking result. If a future
+    # engine path passes enable_thinking explicitly, this probe must be
+    # updated to match.
     try:
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": "x"}],

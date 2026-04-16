@@ -1752,6 +1752,59 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
+def _detect_starts_thinking(
+    tokenizer,
+    start_token: str,
+    end_tokens: list[str],
+) -> bool:
+    """Detect if the model's chat template leaves thinking genuinely OPEN.
+
+    Renders a minimal test prompt and checks whether the start token
+    appears after the last end token in the rendered output. This
+    correctly handles Gemma4 where the template contains <|channel> but
+    emits a CLOSED block (<|channel>thought\\n<channel|>) when
+    enable_thinking is not set.
+
+    Falls back to the naive text-in-template check if rendering fails
+    (safe default: True means router starts in thinking mode).
+    """
+    if tokenizer is None:
+        return False
+    if not hasattr(tokenizer, "chat_template"):
+        return False
+    chat_template = tokenizer.chat_template or ""
+    if start_token not in chat_template or "add_generation_prompt" not in chat_template:
+        return False
+
+    # NOTE: enable_thinking is deliberately NOT passed here. The probe must
+    # match the kwargs the BatchedEngine uses (batched.py:387-392), which
+    # also omits enable_thinking. Templates that default it to True (Qwen3)
+    # produce the correct open-thinking result; templates that default it to
+    # False (Gemma4) produce the correct closed-thinking result. If a future
+    # engine path passes enable_thinking explicitly, this probe must be
+    # updated to match.
+    try:
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "x"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return True
+
+    suffix = rendered[-300:]
+    last_start = suffix.rfind(start_token)
+    if last_start < 0:
+        return False
+
+    # Check from the start token position onward for any end token.
+    # Using last_start (not last_start + len) handles end tokens that
+    # share the start token as a prefix (e.g. <|channel>response).
+    from_start = suffix[last_start:]
+    has_close = any(et in from_start for et in end_tokens)
+    return not has_close
+
+
 def _emit_content_pieces(
     pieces: list[tuple[str, str]],
     current_block_type: str | None,
@@ -1893,16 +1946,8 @@ async def _stream_anthropic_messages(
         _channel_strip = None
         _parser_label = "none"
 
-    # Detect if the model's chat template injects the start token into the
-    # generation prompt. If so, the model starts in thinking mode and the
-    # opening tag never appears in the output stream.
     _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-    _chat_template = ""
-    if _tokenizer and hasattr(_tokenizer, "chat_template"):
-        _chat_template = _tokenizer.chat_template or ""
-    _starts_thinking = (
-        _start_token in _chat_template and "add_generation_prompt" in _chat_template
-    )
+    _starts_thinking = _detect_starts_thinking(_tokenizer, _start_token, _end_tokens)
 
     logger.info(
         "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",

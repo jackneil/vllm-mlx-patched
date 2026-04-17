@@ -286,6 +286,52 @@ class TestThinkingBudgetSentinel:
         b = RequestOutput(request_id="x", thinking_budget_applied=True)
         assert coll._merge_outputs(a, b).thinking_budget_applied is True
 
+    def test_thinking_message_token_cap_drops_oversize_message(self):
+        """DCR Wave-3: the defense-in-depth token-count cap on
+        thinking_budget_message must be enforced. If someone deletes
+        the `len(message_ids) > _THINKING_MESSAGE_MAX_TOKENS` check, a
+        malicious client can force the decode hot path to emit a huge
+        forced sequence — cheap DoS.
+
+        Fake tokenizer returns a list longer than the cap for the message
+        text; assert the processor is built but the force sequence does
+        NOT include message tokens (only end_token_ids)."""
+        from vllm_mlx.logits_processors import ThinkingTokenBudgetLogitsProcessor
+        from vllm_mlx.scheduler import (
+            _THINKING_MESSAGE_MAX_TOKENS,
+            _attach_thinking_budget_processor,
+        )
+
+        class _OversizeTok:
+            def encode(self, text, add_special_tokens=False):
+                if text == "<think>":
+                    return [100]
+                if text == "</think>":
+                    return [200]
+                # Message text: emit a token list larger than the cap.
+                return list(range(1000, 1000 + _THINKING_MESSAGE_MAX_TOKENS + 50))
+
+        class _FakeParser:
+            start_token = "<think>"
+            end_tokens = ["</think>"]
+
+        proc = _attach_thinking_budget_processor(
+            tokenizer=_OversizeTok(),
+            reasoning_parser=_FakeParser(),
+            budget=512,
+            message="hypothetical DoS payload",
+            prompt_token_ids=None,
+        )
+        assert isinstance(proc, ThinkingTokenBudgetLogitsProcessor)
+        # Force sequence must be end_token_ids only — the oversized
+        # message was dropped. If the cap check regresses, the sequence
+        # would be 1000..1549+[200] = 551 tokens.
+        assert proc._force_sequence == [200], (
+            f"Wave-3 regression: oversized thinking_budget_message was not "
+            f"dropped by the _THINKING_MESSAGE_MAX_TOKENS cap. "
+            f"Force sequence has {len(proc._force_sequence)} tokens; expected 1."
+        )
+
     def test_merge_outputs_prefers_non_none(self):
         """DCR Wave-1 CRITICAL-3: an abort-path RequestOutput may carry
         thinking_budget_applied=None (request already popped from

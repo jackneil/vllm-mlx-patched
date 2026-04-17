@@ -230,6 +230,12 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Thinking-token-budget state (mirrors Request.thinking_budget_applied):
+    #   True  = budget processor successfully attached.
+    #   False = budget requested but could not be enforced.
+    #   None  = no budget requested. Server reads this to emit the
+    #           x-thinking-budget-applied response header.
+    thinking_budget_applied: Optional[bool] = None
 
     @property
     def usage(self) -> Dict[str, int]:

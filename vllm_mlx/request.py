@@ -60,12 +60,22 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Max tokens inside <think>…</think>. None = no cap. 0 = force close on first <think>.
+    # Matches vllm-project/vllm SamplingParams.thinking_token_budget (PR #20859, merged 2026-03-24).
+    thinking_token_budget: Optional[int] = None
+    # Optional wrap-up hint injected before </think> when the budget is hit.
+    # Mirrors vllm PR #37112. None = force </think> directly.
+    thinking_budget_message: Optional[str] = None
 
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
         if self.stop_token_ids is None:
             self.stop_token_ids = []
+        if self.thinking_token_budget is not None and self.thinking_token_budget < 0:
+            raise ValueError(
+                f"thinking_token_budget must be >= 0, got {self.thinking_token_budget}"
+            )
 
 
 @dataclass

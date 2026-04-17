@@ -443,3 +443,48 @@ class TestAnthropicPlumbing:
         assert _anthropic_budget_requested(req_nested_enabled) is True
         assert _anthropic_budget_requested(req_nested_disabled) is True
         assert _anthropic_budget_requested(req_nested_only_budget) is True
+
+
+class TestMessageTokenCoincidence:
+    """Regression test for pre-mortem scenario 1: if the model naturally
+    emits one of the message tokens during thinking BEFORE the budget fires,
+    does the processor force-emit it a second time?"""
+
+    def test_message_token_in_natural_thinking_is_ok(self):
+        """Budget=5. Message tokens are [50, 51]. Model emits token 50
+        naturally at count=2, then continues thinking until count=5.
+        At budget, force sequence [50, 51, 200] kicks in.
+        Accepted behavior: the natural 50 at count=2 is counted as a
+        thinking token; the forced 50 at count=5 is the message prefix;
+        user sees two 50s separated by tokens. Not pretty, but not
+        corrupted."""
+        p = _make_processor(
+            budget=5,
+            end_ids=(200,),
+            message_ids=[50, 51],
+        )
+        _forced_token(p, [100])                # <think>
+        _forced_token(p, [100, 1])             # count=1
+        _forced_token(p, [100, 1, 50])         # count=2, natural 50
+        _forced_token(p, [100, 1, 50, 2])      # count=3
+        _forced_token(p, [100, 1, 50, 2, 3])   # count=4
+        # count=5 hits budget, force sequence begins with token 50
+        forced1 = _forced_token(p, [100, 1, 50, 2, 3, 4])
+        assert forced1 == 50
+        # Then 51, then 200
+        forced2 = _forced_token(p, [100, 1, 50, 2, 3, 4, 50])
+        assert forced2 == 51
+        forced3 = _forced_token(p, [100, 1, 50, 2, 3, 4, 50, 51])
+        assert forced3 == 200
+
+    def test_end_token_in_natural_thinking_closes_early(self):
+        """Edge case: if the model naturally emits </think> (token 200)
+        while thinking, the processor exits think mode — model closed on
+        its own. Subsequent tokens must NOT be forced."""
+        p = _make_processor(budget=100, end_ids=(200,))
+        _forced_token(p, [100])              # <think>
+        _forced_token(p, [100, 1])           # count=1
+        _forced_token(p, [100, 1, 200])      # model closed
+        # Post-close: no force regardless of counter
+        assert _forced_token(p, [100, 1, 200, 5]) is None
+        assert _forced_token(p, [100, 1, 200, 5, 6]) is None

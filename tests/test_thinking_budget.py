@@ -332,12 +332,17 @@ class TestApplyPropagation:
 
 class TestStreamingHeader:
     """The streaming path can't read output.thinking_budget_applied, so
-    it uses a pre-flight check. M1: check _reasoning_parser presence too."""
+    it uses a pre-flight check. Guards: MLLM routing, missing parser,
+    SimpleEngine (which silently drops the budget)."""
 
-    def _compute(self, is_mllm, reasoning_parser):
+    def _compute(self, is_mllm, reasoning_parser, engine_supports_budget=True):
         from vllm_mlx.server import _streaming_header_value
 
-        return _streaming_header_value(is_mllm=is_mllm, reasoning_parser=reasoning_parser)
+        return _streaming_header_value(
+            is_mllm=is_mllm,
+            reasoning_parser=reasoning_parser,
+            engine_supports_budget=engine_supports_budget,
+        )
 
     def test_mllm_always_false(self):
         assert self._compute(is_mllm=True, reasoning_parser=object()) == "false"
@@ -347,6 +352,19 @@ class TestStreamingHeader:
 
     def test_text_with_parser_true(self):
         assert self._compute(is_mllm=False, reasoning_parser=object()) == "true"
+
+    def test_simple_engine_always_false(self):
+        """SimpleEngine runs outside the logits-processor pipeline — header
+        must be 'false' regardless of parser presence to avoid lying to
+        streaming clients. DCR Wave-2 CRITICAL O-1 regression."""
+        assert (
+            self._compute(
+                is_mllm=False,
+                reasoning_parser=object(),
+                engine_supports_budget=False,
+            )
+            == "false"
+        )
 
 
 class TestAnthropicPlumbing:

@@ -173,12 +173,16 @@ def _resolve_thinking_budget(top_level=None, template_kwargs=None):
     return budget, message
 
 
-def _streaming_header_value(*, is_mllm: bool, reasoning_parser) -> str:
+def _streaming_header_value(
+    *, is_mllm: bool, reasoning_parser, engine_supports_budget: bool
+) -> str:
     """Streaming pre-flight: decide the x-thinking-budget-applied header
     before the engine runs.
 
     Returns "false" when the feature is known to no-op for this request:
       - MLLM engines don't plumb logits_processors in v1
+      - SimpleEngine (simple mode) ignores the budget entirely — the
+        logits-processor pipeline only runs under continuous batching
       - Text engines without --reasoning-parser can't resolve delimiters
 
     Returns "true" when the processor is likely to attach. False positives
@@ -186,6 +190,8 @@ def _streaming_header_value(*, is_mllm: bool, reasoning_parser) -> str:
     WARN + increments the noop counter in those cases, so alerting works.
     """
     if is_mllm:
+        return "false"
+    if not engine_supports_budget:
         return "false"
     if reasoning_parser is None:
         return "false"
@@ -1543,6 +1549,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             streaming_applied = _streaming_header_value(
                 is_mllm=getattr(engine, "_is_mllm", False),
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
             )
             stream_headers["x-thinking-budget-applied"] = streaming_applied
         return StreamingResponse(
@@ -1726,6 +1733,7 @@ async def create_anthropic_message(
             headers["x-thinking-budget-applied"] = _streaming_header_value(
                 is_mllm=getattr(engine, "_is_mllm", False),
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
             )
         return StreamingResponse(
             _disconnect_guard(

@@ -80,33 +80,86 @@ class TestThinkingBudgetSentinel:
 
     def test_anthropic_handlers_forward_budget_to_chat_kwargs(self):
         """Pin the DCR-CRITICAL-1 fix: both Anthropic handlers must add
-        thinking_token_budget to chat_kwargs when the openai_request has
-        it set. A rebase that deletes this forwarding would make the
-        feature inert on /v1/messages while still emitting misleading
-        response headers."""
+        thinking_token_budget AND thinking_budget_message to chat_kwargs
+        when the openai_request has them set. A rebase that deletes this
+        forwarding would make the feature inert on /v1/messages while
+        still emitting misleading response headers.
+
+        Regex is intentionally lenient (matches intermediate-variable
+        refactors) to match the sibling sentinel's drift policy."""
         import inspect
         import re
 
         from vllm_mlx import server
 
-        # Non-streaming handler
-        create_src = inspect.getsource(server.create_anthropic_message)
-        assert re.search(
-            r'chat_kwargs\["thinking_token_budget"\]\s*=\s*openai_request\.thinking_token_budget',
-            create_src,
-        ), (
-            "create_anthropic_message regression: no longer forwards "
-            "thinking_token_budget to chat_kwargs — header will lie."
+        _tok_re = r'chat_kwargs\[["\']thinking_token_budget["\']\]\s*=\s*\w+'
+        _msg_re = r'chat_kwargs\[["\']thinking_budget_message["\']\]\s*=\s*\w+'
+
+        for fn_name in ("create_anthropic_message", "_stream_anthropic_messages"):
+            src = inspect.getsource(getattr(server, fn_name))
+            assert re.search(_tok_re, src), (
+                f"{fn_name} regression: no longer forwards thinking_token_budget "
+                f"to chat_kwargs — /v1/messages will be inert for budget requests."
+            )
+            assert re.search(_msg_re, src), (
+                f"{fn_name} regression: no longer forwards thinking_budget_message "
+                f"to chat_kwargs — wrap-up hint feature broken on /v1/messages."
+            )
+
+    def test_anthropic_handler_emits_budget_header(self):
+        """Pin the response-header emission. DCR Wave-2 CRITICAL T-1: if
+        someone deletes the `x-thinking-budget-applied` header line from
+        the Anthropic handler, the client has no signal about budget
+        enforcement even though the engine correctly applies or rejects.
+        Wave-1 sentinel caught forwarding deletion; this one catches
+        emission deletion.
+
+        Note: both streaming and non-streaming header logic lives in
+        `create_anthropic_message` (the outer handler builds the
+        StreamingResponse headers dict AND the non-streaming
+        Response/JSONResponse headers). `_stream_anthropic_messages` is
+        the generator that yields SSE event bodies — it doesn't set
+        HTTP headers.
+        """
+        import inspect
+
+        from vllm_mlx import server
+
+        src = inspect.getsource(server.create_anthropic_message)
+        # The header literal must appear at least twice: once for the
+        # streaming branch (StreamingResponse headers dict) and once for
+        # the non-streaming branch (Response headers dict).
+        occurrences = src.count("x-thinking-budget-applied")
+        assert occurrences >= 2, (
+            f"create_anthropic_message regression: x-thinking-budget-applied "
+            f"appears only {occurrences} time(s) — expected >=2 (streaming + "
+            f"non-streaming branches). Clients lose budget-enforcement signal."
         )
 
-        # Streaming generator
-        stream_src = inspect.getsource(server._stream_anthropic_messages)
-        assert re.search(
-            r'chat_kwargs\["thinking_token_budget"\]\s*=\s*openai_request\.thinking_token_budget',
-            stream_src,
-        ), (
-            "_stream_anthropic_messages regression: no longer forwards "
-            "thinking_token_budget to chat_kwargs."
+    def test_streaming_header_distinguishes_simple_engine(self):
+        """DCR Wave-2 CRITICAL O-1: SimpleEngine ignores budgets but
+        carries a reasoning_parser. _streaming_header_value must return
+        'false' when engine_supports_budget=False regardless of parser
+        presence, to avoid lying to streaming clients in simple mode."""
+        from vllm_mlx.server import _streaming_header_value
+
+        # Simple mode with a parser set: pre-fix this returned "true" (lied).
+        assert (
+            _streaming_header_value(
+                is_mllm=False,
+                reasoning_parser=object(),
+                engine_supports_budget=False,
+            )
+            == "false"
+        )
+        # BatchedEngine text path with parser: "true" (honest).
+        assert (
+            _streaming_header_value(
+                is_mllm=False,
+                reasoning_parser=object(),
+                engine_supports_budget=True,
+            )
+            == "true"
         )
 
     def test_attach_helper_builds_processor(self):
@@ -190,6 +243,24 @@ class TestThinkingBudgetSentinel:
         a = RequestOutput(request_id="x", thinking_budget_applied=True)
         b = RequestOutput(request_id="x", thinking_budget_applied=True)
         assert coll._merge_outputs(a, b).thinking_budget_applied is True
+
+    def test_merge_outputs_prefers_non_none(self):
+        """DCR Wave-1 CRITICAL-3: an abort-path RequestOutput may carry
+        thinking_budget_applied=None (request already popped from
+        scheduler tracking). The merge rule must prefer the non-None
+        value so a prior mid-stream True is not silently overwritten."""
+        from vllm_mlx.output_collector import RequestOutputCollector
+        from vllm_mlx.request import RequestOutput
+
+        coll = RequestOutputCollector()
+        # existing=True (happy path) + new=None (abort) → True preserved.
+        existing_true = RequestOutput(request_id="x", thinking_budget_applied=True)
+        new_none = RequestOutput(request_id="x", thinking_budget_applied=None)
+        assert coll._merge_outputs(existing_true, new_none).thinking_budget_applied is True
+        # Symmetric: existing=None + new=True → True wins.
+        existing_none = RequestOutput(request_id="x", thinking_budget_applied=None)
+        new_true = RequestOutput(request_id="x", thinking_budget_applied=True)
+        assert coll._merge_outputs(existing_none, new_true).thinking_budget_applied is True
 
     def test_insert_call_accepts_logits_processors(self):
         """CRITICAL-2 (pre-mortem S2): _BG_INIT_PARAMS is derived from

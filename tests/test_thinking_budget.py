@@ -56,3 +56,106 @@ class TestChatCompletionRequestThinkingBudget:
     def test_chat_template_kwargs_passthrough(self):
         req = self._base(chat_template_kwargs={"thinking_token_budget": 256})
         assert req.chat_template_kwargs == {"thinking_token_budget": 256}
+
+
+import mlx.core as mx
+
+
+def _make_processor(
+    budget=5,
+    start_ids=(100,),
+    end_ids=(200,),
+    message_ids=None,
+    prompt_ids=None,
+):
+    from vllm_mlx.logits_processors.thinking_budget import (
+        ThinkingTokenBudgetLogitsProcessor,
+    )
+
+    return ThinkingTokenBudgetLogitsProcessor(
+        budget=budget,
+        start_token_ids=list(start_ids),
+        end_token_ids=list(end_ids),
+        message_token_ids=list(message_ids) if message_ids else None,
+        prompt_token_ids=list(prompt_ids) if prompt_ids else None,
+    )
+
+
+def _forced_token(processor, tokens):
+    """Run the processor against a zero-logits tensor and return the
+    argmax (the token it's forcing), or None if nothing was forced."""
+    tok_arr = mx.array(tokens, dtype=mx.int32)
+    vocab = 300
+    logits = mx.zeros((1, vocab), dtype=mx.float32)
+    out = processor(tok_arr, logits)
+    forced = int(mx.argmax(out, axis=-1)[0])
+    # If the peak is barely above zero, nothing was forced.
+    if float(out[0, forced]) < 1e8:
+        return None
+    return forced
+
+
+class TestProcessorStateMachine:
+    def test_no_think_no_force(self):
+        """Without <think> in output, no forcing happens regardless of tokens."""
+        p = _make_processor(budget=3)
+        assert _forced_token(p, [1, 2, 3, 4, 5]) is None
+
+    def test_enters_think_and_forces_at_budget(self):
+        p = _make_processor(budget=3)
+        # Emit <think> then 3 thinking tokens — budget hit on the 3rd.
+        _forced_token(p, [100])             # enter think
+        _forced_token(p, [100, 1])          # count=1
+        _forced_token(p, [100, 1, 2])       # count=2
+        forced = _forced_token(p, [100, 1, 2, 3])  # count=3, should force
+        assert forced == 200
+
+    def test_budget_zero_forces_immediately(self):
+        p = _make_processor(budget=0)
+        forced = _forced_token(p, [100])  # <think> just emitted
+        assert forced == 200
+
+    def test_natural_end_no_force(self):
+        """Model closes </think> on its own — no force."""
+        p = _make_processor(budget=100)
+        _forced_token(p, [100])         # enter
+        _forced_token(p, [100, 1])      # thinking
+        _forced_token(p, [100, 1, 200]) # model closes
+        # After natural close, subsequent tokens produce no force.
+        assert _forced_token(p, [100, 1, 200, 5]) is None
+
+    def test_prompt_pre_injection_detected(self):
+        """Prompt has <think> at end; first output counts as thinking."""
+        p = _make_processor(budget=2, prompt_ids=[5, 6, 100])  # prompt ends in <think>
+        # Output: [1] counts as thinking token 1 (post-prompt-<think> is first think tok)
+        # Actually in processor init: think_count = len(prompt)-(last_start+1) = 3-(2+1)=0
+        # So first output is first thinking token → count=1. Budget=2 → hit on output token 2.
+        _forced_token(p, [1])       # think_count=1
+        forced = _forced_token(p, [1, 2])  # think_count=2, force
+        assert forced == 200
+
+    def test_multi_token_end_sequence(self):
+        """End delimiter is multiple tokens — processor forces each in turn."""
+        p = _make_processor(budget=1, end_ids=(200, 201, 202))
+        _forced_token(p, [100])          # enter think, count=0
+        forced1 = _forced_token(p, [100, 1])  # count=1, hit budget → force 200
+        assert forced1 == 200
+        forced2 = _forced_token(p, [100, 1, 200])  # force 201
+        assert forced2 == 201
+        forced3 = _forced_token(p, [100, 1, 200, 201])  # force 202
+        assert forced3 == 202
+        # After full sequence, no more forcing.
+        assert _forced_token(p, [100, 1, 200, 201, 202]) is None
+
+    def test_message_injection_prepends_message_tokens(self):
+        """thinking_budget_message tokenizes to tokens that force BEFORE end_ids."""
+        p = _make_processor(
+            budget=1, end_ids=(200,), message_ids=[50, 51]
+        )
+        _forced_token(p, [100])              # enter think
+        f1 = _forced_token(p, [100, 1])      # budget hit → first force = first message tok
+        assert f1 == 50
+        f2 = _forced_token(p, [100, 1, 50])  # second message tok
+        assert f2 == 51
+        f3 = _forced_token(p, [100, 1, 50, 51])  # then </think>
+        assert f3 == 200

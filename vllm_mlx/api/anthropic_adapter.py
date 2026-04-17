@@ -77,6 +77,30 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
+    # Resolve thinking budget from the two parse paths:
+    #   (a) top-level thinking_token_budget (vllm-mlx extension)
+    #   (b) Anthropic-native `thinking` dict: {"type": "enabled"|"disabled",
+    #       "budget_tokens": N}
+    # Top-level wins. For the nested form, honor type:
+    #   - type="disabled" → budget=0 (force close immediately)
+    #   - type="enabled"  → budget=budget_tokens (may be None — no cap)
+    #   - type=<anything else> → ignore (log WARN, no budget)
+    thinking_token_budget = request.thinking_token_budget
+    if thinking_token_budget is None and isinstance(request.thinking, dict):
+        thinking_type = request.thinking.get("type")
+        if thinking_type == "disabled":
+            thinking_token_budget = 0
+        elif thinking_type in ("enabled", None):
+            thinking_token_budget = request.thinking.get("budget_tokens")
+        else:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Anthropic request.thinking.type=%r not recognized; "
+                "ignoring thinking config. Expected 'enabled' or 'disabled'.",
+                thinking_type,
+            )
+
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -87,6 +111,8 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         stop=request.stop_sequences,
         tools=tools,
         tool_choice=tool_choice,
+        thinking_token_budget=thinking_token_budget,
+        thinking_budget_message=request.thinking_budget_message,
     )
 
 

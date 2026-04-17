@@ -192,6 +192,26 @@ def _streaming_header_value(*, is_mllm: bool, reasoning_parser) -> str:
     return "true"
 
 
+def _anthropic_budget_requested(anthropic_request) -> bool:
+    """Return True iff the Anthropic request asked for a thinking budget
+    via EITHER the vllm-mlx extension field `thinking_token_budget` OR
+    the Anthropic-native nested `thinking` dict (with `budget_tokens`
+    set or `type` being 'enabled'/'disabled').
+
+    Used by both streaming and non-streaming `/v1/messages` handlers to
+    decide whether to emit the `x-thinking-budget-applied` response header.
+    """
+    if getattr(anthropic_request, "thinking_token_budget", None) is not None:
+        return True
+    thinking = getattr(anthropic_request, "thinking", None)
+    if isinstance(thinking, dict):
+        if "budget_tokens" in thinking:
+            return True
+        if thinking.get("type") in ("enabled", "disabled"):
+            return True
+    return False
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -1695,16 +1715,19 @@ async def create_anthropic_message(
     openai_request = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
+        headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        if _anthropic_budget_requested(anthropic_request):
+            headers["x-thinking-budget-applied"] = _streaming_header_value(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
+            )
         return StreamingResponse(
             _disconnect_guard(
                 _stream_anthropic_messages(engine, openai_request, anthropic_request),
                 request,
             ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
+            headers=headers,
         )
 
     # Non-streaming: run inference through existing engine
@@ -1773,9 +1796,16 @@ async def create_anthropic_message(
 
     # Convert to Anthropic response
     anthropic_response = openai_to_anthropic(openai_response, _model_name)
+    _resp_headers = {}
+    if _anthropic_budget_requested(anthropic_request):
+        applied = getattr(output, "thinking_budget_applied", None)
+        _resp_headers["x-thinking-budget-applied"] = (
+            "true" if applied is True else "false"
+        )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
         media_type="application/json",
+        headers=_resp_headers or None,
     )
 
 

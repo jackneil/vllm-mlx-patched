@@ -347,3 +347,99 @@ class TestStreamingHeader:
 
     def test_text_with_parser_true(self):
         assert self._compute(is_mllm=False, reasoning_parser=object()) == "true"
+
+
+class TestAnthropicPlumbing:
+    """M3: /v1/messages accepts thinking_token_budget and plumbs it through
+    the OpenAI adapter."""
+
+    def _base(self, **overrides):
+        payload = {
+            "model": "qwen3",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}],
+            **overrides,
+        }
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+        return AnthropicRequest(**payload)
+
+    def test_top_level_field(self):
+        req = self._base(thinking_token_budget=512)
+        assert req.thinking_token_budget == 512
+
+    def test_thinking_nested_budget_tokens(self):
+        """Anthropic-native form: {"thinking": {"budget_tokens": N}}."""
+        req = self._base(thinking={"budget_tokens": 256})
+        assert req.thinking == {"budget_tokens": 256}
+
+    def test_adapter_translates_top_level(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(thinking_token_budget=512, thinking_budget_message="wrap")
+        openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget == 512
+        assert openai.thinking_budget_message == "wrap"
+
+    def test_adapter_translates_nested_thinking(self):
+        """Nested thinking.budget_tokens becomes OpenAI's
+        thinking_token_budget."""
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(thinking={"budget_tokens": 256})
+        openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget == 256
+
+    def test_adapter_top_level_wins_over_nested(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(
+            thinking_token_budget=1024,
+            thinking={"budget_tokens": 256},
+        )
+        openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget == 1024
+
+    def test_adapter_thinking_disabled_forces_zero(self):
+        """Anthropic type='disabled' means "don't think at all" —
+        map to budget=0 (our immediate-close semantics)."""
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(thinking={"type": "disabled", "budget_tokens": 1024})
+        openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget == 0  # disabled wins over budget_tokens
+
+    def test_adapter_thinking_enabled_uses_budget_tokens(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(thinking={"type": "enabled", "budget_tokens": 512})
+        openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget == 512
+
+    def test_adapter_unknown_type_ignores(self, caplog):
+        """Unknown type values are ignored with a WARN log, not silently
+        enforced."""
+        import logging
+
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+        req = self._base(thinking={"type": "unknown", "budget_tokens": 256})
+        with caplog.at_level(logging.WARNING):
+            openai = anthropic_to_openai(req)
+        assert openai.thinking_token_budget is None
+        assert any("not recognized" in rec.message for rec in caplog.records)
+
+    def test_anthropic_budget_requested_helper(self):
+        from vllm_mlx.server import _anthropic_budget_requested
+
+        req_no_budget = self._base()
+        req_top_level = self._base(thinking_token_budget=512)
+        req_nested_enabled = self._base(thinking={"type": "enabled", "budget_tokens": 256})
+        req_nested_disabled = self._base(thinking={"type": "disabled"})
+        req_nested_only_budget = self._base(thinking={"budget_tokens": 256})
+
+        assert _anthropic_budget_requested(req_no_budget) is False
+        assert _anthropic_budget_requested(req_top_level) is True
+        assert _anthropic_budget_requested(req_nested_enabled) is True
+        assert _anthropic_budget_requested(req_nested_disabled) is True
+        assert _anthropic_budget_requested(req_nested_only_budget) is True

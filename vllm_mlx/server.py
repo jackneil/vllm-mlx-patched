@@ -173,6 +173,25 @@ def _resolve_thinking_budget(top_level=None, template_kwargs=None):
     return budget, message
 
 
+def _streaming_header_value(*, is_mllm: bool, reasoning_parser) -> str:
+    """Streaming pre-flight: decide the x-thinking-budget-applied header
+    before the engine runs.
+
+    Returns "false" when the feature is known to no-op for this request:
+      - MLLM engines don't plumb logits_processors in v1
+      - Text engines without --reasoning-parser can't resolve delimiters
+
+    Returns "true" when the processor is likely to attach. False positives
+    remain possible (tokenizer fails mid-run) — the scheduler still emits
+    WARN + increments the noop counter in those cases, so alerting works.
+    """
+    if is_mllm:
+        return "false"
+    if reasoning_parser is None:
+        return "false"
+    return "true"
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -1497,14 +1516,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     if request.stream:
         # Pre-flight: streaming can't wait for output.thinking_budget_applied.
-        # If MLLM is routing (which doesn't support budget in v1), emit false;
-        # else optimistic true. The engine logs WARN + increments counter on
-        # the MLLM path, so a bogus "true" only happens if a non-MLLM no-op
-        # fires after this header is written — acceptable.
+        # Emit "false" for both known no-op cases — MLLM routing AND missing
+        # reasoning parser. Either mis-configuration is detectable up front.
         stream_headers = {}
         if budget_was_requested:
-            streaming_applied = (
-                "false" if getattr(engine, "_is_mllm", False) else "true"
+            streaming_applied = _streaming_header_value(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
             )
             stream_headers["x-thinking-budget-applied"] = streaming_applied
         return StreamingResponse(

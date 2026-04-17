@@ -328,3 +328,22 @@ class TestApplyPropagation:
             "BatchedEngine.stream_generate should reference "
             "thinking_budget_applied in both branches"
         )
+
+
+class TestStreamingHeader:
+    """The streaming path can't read output.thinking_budget_applied, so
+    it uses a pre-flight check. M1: check _reasoning_parser presence too."""
+
+    def _compute(self, is_mllm, reasoning_parser):
+        from vllm_mlx.server import _streaming_header_value
+
+        return _streaming_header_value(is_mllm=is_mllm, reasoning_parser=reasoning_parser)
+
+    def test_mllm_always_false(self):
+        assert self._compute(is_mllm=True, reasoning_parser=object()) == "false"
+
+    def test_text_no_parser_false(self):
+        assert self._compute(is_mllm=False, reasoning_parser=None) == "false"
+
+    def test_text_with_parser_true(self):
+        assert self._compute(is_mllm=False, reasoning_parser=object()) == "true"

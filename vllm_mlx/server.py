@@ -144,6 +144,35 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_thinking_budget(top_level=None, template_kwargs=None):
+    """Resolve (budget, message) from the two parse paths.
+
+    Precedence: top-level wins for each field INDEPENDENTLY. A top-level
+    None does NOT mask a template value — each field resolves separately.
+
+    Args:
+      top_level: dict-like with keys 'b' (budget) and 'm' (message),
+        or None. In production callers pass
+        {'b': request.thinking_token_budget, 'm': request.thinking_budget_message}.
+      template_kwargs: dict or None — ChatCompletionRequest.chat_template_kwargs.
+
+    Returns:
+      (budget_or_None, message_or_None)
+    """
+    top = top_level or {}
+    templ = template_kwargs if isinstance(template_kwargs, dict) else {}
+
+    budget = top.get("b")
+    if budget is None:
+        budget = templ.get("thinking_token_budget")
+
+    message = top.get("m")
+    if message is None:
+        message = templ.get("thinking_budget_message")
+
+    return budget, message
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -1438,17 +1467,53 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
+    # Thinking budget: resolve from both parse paths.
+    _budget, _msg = _resolve_thinking_budget(
+        top_level={
+            "b": request.thinking_token_budget,
+            "m": request.thinking_budget_message,
+        },
+        template_kwargs=request.chat_template_kwargs,
+    )
+    if _budget is not None:
+        chat_kwargs["thinking_token_budget"] = _budget
+    if _msg is not None:
+        chat_kwargs["thinking_budget_message"] = _msg
+
+    # Was a budget requested by the client? Used to decide whether to emit
+    # the x-thinking-budget-applied response header for both streaming and
+    # non-streaming paths.
+    budget_was_requested = (
+        request.thinking_token_budget is not None
+        or (
+            isinstance(request.chat_template_kwargs, dict)
+            and "thinking_token_budget" in request.chat_template_kwargs
+        )
+    )
+
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
+        # Pre-flight: streaming can't wait for output.thinking_budget_applied.
+        # If MLLM is routing (which doesn't support budget in v1), emit false;
+        # else optimistic true. The engine logs WARN + increments counter on
+        # the MLLM path, so a bogus "true" only happens if a non-MLLM no-op
+        # fires after this header is written — acceptable.
+        stream_headers = {}
+        if budget_was_requested:
+            streaming_applied = (
+                "false" if getattr(engine, "_is_mllm", False) else "true"
+            )
+            stream_headers["x-thinking-budget-applied"] = streaming_applied
         return StreamingResponse(
             _disconnect_guard(
                 stream_chat_completion(engine, messages, request, **chat_kwargs),
                 raw_request,
             ),
             media_type="text/event-stream",
+            headers=stream_headers or None,
         )
 
     # Non-streaming response with timing and timeout
@@ -1500,7 +1565,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-    return ChatCompletionResponse(
+    chat_response = ChatCompletionResponse(
         model=_model_name,
         choices=[
             ChatCompletionChoice(
@@ -1518,6 +1583,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
+
+    # Emit x-thinking-budget-applied when a budget was requested.
+    if budget_was_requested:
+        from fastapi.responses import JSONResponse
+
+        applied = getattr(output, "thinking_budget_applied", None)
+        return JSONResponse(
+            content=chat_response.model_dump(mode="json", exclude_none=True),
+            headers={"x-thinking-budget-applied": "true" if applied else "false"},
+        )
+
+    return chat_response
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:

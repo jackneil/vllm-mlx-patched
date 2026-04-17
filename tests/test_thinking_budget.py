@@ -220,3 +220,30 @@ class TestAttachProcessor:
         assert proc is not None
         # Force sequence includes message ids (50, 51) then end ids (200).
         assert proc._force_sequence == [50, 51, 200]
+
+
+class TestServerResolver:
+    def _resolve(self, top_level=None, template_kwargs=None):
+        from vllm_mlx.server import _resolve_thinking_budget
+
+        return _resolve_thinking_budget(top_level, template_kwargs)
+
+    def test_none(self):
+        assert self._resolve() == (None, None)
+
+    def test_top_level(self):
+        assert self._resolve(top_level={"b": 512, "m": "wrap"}) == (512, "wrap")
+
+    def test_template_kwargs_only(self):
+        assert self._resolve(
+            template_kwargs={"thinking_token_budget": 512, "thinking_budget_message": "wrap"}
+        ) == (512, "wrap")
+
+    def test_top_level_wins(self):
+        assert self._resolve(
+            top_level={"b": 1024, "m": None},
+            template_kwargs={"thinking_token_budget": 512, "thinking_budget_message": "wrap"},
+        ) == (1024, "wrap")  # budget from top, message fills from template
+
+    def test_zero_is_a_real_value(self):
+        assert self._resolve(top_level={"b": 0, "m": None}) == (0, None)

@@ -97,9 +97,12 @@ silently degrade to raw-text output.
      thinking_token_budget.
 
    `tests/test_thinking_budget_rebase_sentinel.py` fires in CI if any of
-   these drift. If a rebase brings an upstream-vLLM-compatible thinking
-   budget implementation, reconcile naming and drop our port — but keep
-   the sentinel.
+   these drift. The sentinel asserts BOTH existence (names exist) AND
+   wiring (propagation through the RequestOutput → GenerationOutput →
+   server-header chain; mlx_lm.BatchGenerator.insert accepts
+   logits_processors). If a rebase brings an upstream-vLLM-compatible
+   thinking budget implementation, reconcile naming and drop our port —
+   but keep the sentinel.
 
    API promise: `thinking_token_budget` and `thinking_budget_message`
    match the vllm-project/vllm PR #20859 (merged 2026-03-24) public

@@ -247,3 +247,13 @@ class TestServerResolver:
 
     def test_zero_is_a_real_value(self):
         assert self._resolve(top_level={"b": 0, "m": None}) == (0, None)
+
+
+class TestNoopCounter:
+    def test_counter_increments(self):
+        from vllm_mlx.metrics import thinking_budget_noop_total
+
+        before = thinking_budget_noop_total.value
+        thinking_budget_noop_total.inc()
+        thinking_budget_noop_total.inc(2)
+        assert thinking_budget_noop_total.value == before + 3

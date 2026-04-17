@@ -125,13 +125,19 @@ class TestProcessorStateMachine:
         assert _forced_token(p, [100, 1, 200, 5]) is None
 
     def test_prompt_pre_injection_detected(self):
-        """Prompt has <think> at end; first output counts as thinking."""
-        p = _make_processor(budget=2, prompt_ids=[5, 6, 100])  # prompt ends in <think>
-        # Output: [1] counts as thinking token 1 (post-prompt-<think> is first think tok)
-        # Actually in processor init: think_count = len(prompt)-(last_start+1) = 3-(2+1)=0
-        # So first output is first thinking token → count=1. Budget=2 → hit on output token 2.
-        _forced_token(p, [1])       # think_count=1
-        forced = _forced_token(p, [1, 2])  # think_count=2, force
+        """Prompt has <think> at end; first output counts as thinking.
+
+        mlx_lm.BatchGenerator passes FULL history (prompt + output). Test
+        inputs below include the prompt [5, 6, 100] followed by the
+        output tokens — matching the production contract.
+        """
+        prompt = [5, 6, 100]  # prompt ends in <think> (id 100)
+        p = _make_processor(budget=2, prompt_ids=prompt)
+        # In _init_from_prompt: think_count = 3 - (2+1) = 0 (post-<think> is empty).
+        # Step 1: output=[1] → think_count=1.
+        # Step 2: output=[1, 2] → think_count=2, budget hit, force.
+        _forced_token(p, prompt + [1])            # think_count=1
+        forced = _forced_token(p, prompt + [1, 2])  # think_count=2, force
         assert forced == 200
 
     def test_multi_token_end_sequence(self):

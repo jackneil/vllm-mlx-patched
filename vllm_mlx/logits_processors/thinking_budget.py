@@ -167,14 +167,11 @@ class ThinkingTokenBudgetLogitsProcessor:
         """
         # Convert to Python list for the state machine. mlx arrays don't
         # support the slicing/indexing idioms the state machine uses.
+        # mlx_lm.BatchGenerator contract: tokens is the FULL history
+        # (prompt + generated output). We slice by the recorded prompt
+        # length to get the output-only tail.
         token_list = tokens.tolist()
-        # BatchGenerator passes the full history (prompt + output). If we're
-        # given fewer tokens than the known prompt length, the caller is
-        # passing output-only tokens — support both conventions.
-        if len(token_list) >= self._prompt_len:
-            output = token_list[self._prompt_len :]
-        else:
-            output = token_list
+        output = token_list[self._prompt_len :]
 
         self._advance_state(output)
 

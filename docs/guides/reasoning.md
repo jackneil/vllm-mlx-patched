@@ -339,3 +339,15 @@ curl -i http://localhost:8000/v1/chat/completions ... | grep -i x-thinking-budge
 - `max_tokens`: applies independently. If `max_tokens=100` and `thinking_token_budget=500`, `max_tokens` wins — both limits fire, whichever is tighter.
 - `/no_think` / `enable_thinking=False`: compatible. `thinking_token_budget=0` is equivalent in behavior for models that respond to it.
 - Prefix caching: the forced tokens look identical to natural samples; no cache invalidation.
+
+### Thinking Token Budget Troubleshooting
+
+When `x-thinking-budget-applied: false` comes back but you set a budget, check the server logs for the WARN line. The specific sub-message tells you what to fix.
+
+| Server log snippet | Cause | Fix |
+|---|---|---|
+| `No reasoning parser configured` | Server started without `--reasoning-parser` | Restart with `vllm-mlx serve MODEL --reasoning-parser qwen3` (or `deepseek_r1`) |
+| `Parser qwen3 is configured but the tokenizer … could not encode <think>/</think>` | Tokenizer doesn't have single-token `<think>`/`</think>` | Check the model is a reasoning model (Qwen3, DeepSeek-R1). GPT-OSS and Gemma 4 use channel protocols, not `<think>` tags — not supported in v1. |
+| No WARN line but header still false | MLLM path | Budget enforcement for VLMs / audio models is a v2 follow-up. Send text-only requests to a non-VLM model to enable enforcement. |
+
+Alert on the log rate of `thinking_token_budget=… but processor could not be attached` — a non-zero rate means a configuration problem in production. The in-process counter `vllm_mlx.metrics.thinking_budget_noop_total` also increments for every no-op.

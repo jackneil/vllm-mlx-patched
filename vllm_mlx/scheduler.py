@@ -1690,18 +1690,39 @@ class Scheduler:
             request.logits_processors.append(tb_proc)
             request.thinking_budget_applied = True
         elif sp.thinking_token_budget is not None:
-            logger.warning(
-                "thinking_token_budget=%s requested for request %s but could "
-                "not attach processor (parser=%s, tokenizer=%s). Budget not "
-                "enforced; x-thinking-budget-applied header will be false.",
-                sp.thinking_token_budget,
-                request.request_id,
+            _parser_name = (
                 type(self._reasoning_parser).__name__
                 if self._reasoning_parser
-                else None,
+                else None
+            )
+            _tokenizer_name = (
                 type(self.tokenizer).__name__
                 if hasattr(self, "tokenizer")
-                else None,
+                else None
+            )
+            if _parser_name is None:
+                _hint = (
+                    "No reasoning parser configured. Start the server with "
+                    "--reasoning-parser qwen3 (or deepseek_r1) to enable "
+                    "budget enforcement."
+                )
+            else:
+                _hint = (
+                    f"Parser {_parser_name} is configured but the tokenizer "
+                    f"({_tokenizer_name}) could not encode <think>/</think> "
+                    "to single token IDs. The model may not support "
+                    "reasoning tags, or its tokenizer needs a model-specific "
+                    "parser. See "
+                    "docs/guides/reasoning.md#thinking-token-budget-troubleshooting "
+                    "for the diagnosis table."
+                )
+            logger.warning(
+                "thinking_token_budget=%s requested for request %s but "
+                "processor could not be attached. %s Budget not enforced; "
+                "x-thinking-budget-applied header will be false.",
+                sp.thinking_token_budget,
+                request.request_id,
+                _hint,
             )
             try:
                 from .metrics import thinking_budget_noop_total

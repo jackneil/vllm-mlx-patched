@@ -67,6 +67,48 @@ class TestThinkingBudgetSentinel:
         ro = RequestOutput(request_id="x")
         assert hasattr(ro, "thinking_budget_applied")
 
+    def test_generation_output_has_applied_field(self):
+        """Pin the api-surface dataclass: server.py reads
+        GenerationOutput.thinking_budget_applied via getattr(..., None).
+        A silent rename here would cause the x-thinking-budget-applied
+        header to return 'false' for every successful request (DCR
+        Scenario 3: 5% retry storm)."""
+        from vllm_mlx.engine.base import GenerationOutput
+
+        go = GenerationOutput(text="")
+        assert hasattr(go, "thinking_budget_applied")
+
+    def test_anthropic_handlers_forward_budget_to_chat_kwargs(self):
+        """Pin the DCR-CRITICAL-1 fix: both Anthropic handlers must add
+        thinking_token_budget to chat_kwargs when the openai_request has
+        it set. A rebase that deletes this forwarding would make the
+        feature inert on /v1/messages while still emitting misleading
+        response headers."""
+        import inspect
+        import re
+
+        from vllm_mlx import server
+
+        # Non-streaming handler
+        create_src = inspect.getsource(server.create_anthropic_message)
+        assert re.search(
+            r'chat_kwargs\["thinking_token_budget"\]\s*=\s*openai_request\.thinking_token_budget',
+            create_src,
+        ), (
+            "create_anthropic_message regression: no longer forwards "
+            "thinking_token_budget to chat_kwargs — header will lie."
+        )
+
+        # Streaming generator
+        stream_src = inspect.getsource(server._stream_anthropic_messages)
+        assert re.search(
+            r'chat_kwargs\["thinking_token_budget"\]\s*=\s*openai_request\.thinking_token_budget',
+            stream_src,
+        ), (
+            "_stream_anthropic_messages regression: no longer forwards "
+            "thinking_token_budget to chat_kwargs."
+        )
+
     def test_attach_helper_builds_processor(self):
         """Exercises the delimiter resolution + processor construction
         happy path with a minimal fake tokenizer/parser."""

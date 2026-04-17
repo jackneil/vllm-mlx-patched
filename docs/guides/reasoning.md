@@ -348,6 +348,7 @@ When `x-thinking-budget-applied: false` comes back but you set a budget, check t
 |---|---|---|
 | `No reasoning parser configured` | Server started without `--reasoning-parser` | Restart with `vllm-mlx serve MODEL --reasoning-parser qwen3` (or `deepseek_r1`) |
 | `Parser qwen3 is configured but the tokenizer … could not encode <think>/</think>` | Tokenizer doesn't have single-token `<think>`/`</think>` | Check the model is a reasoning model (Qwen3, DeepSeek-R1). GPT-OSS and Gemma 4 use channel protocols, not `<think>` tags — not supported in v1. |
-| No WARN line but header still false | MLLM path | Budget enforcement for VLMs / audio models is a v2 follow-up. Send text-only requests to a non-VLM model to enable enforcement. |
+| `BatchedEngine.<method>: thinking_token_budget=... requested for an MLLM request` | MLLM path | Budget enforcement for VLMs / audio models is a v2 follow-up. Send text-only requests to a non-VLM model to enable enforcement. |
+| `SimpleEngine.<method>: thinking_token_budget=... ignored in simple mode` | Server running in simple mode | Restart the server with `--continuous-batching`. Simple mode doesn't run the logits-processor pipeline. |
 
 Alert on the log rate of `thinking_token_budget=… but processor could not be attached` — a non-zero rate means a configuration problem in production. The in-process counter `vllm_mlx.metrics.thinking_budget_noop_total` also increments for every no-op.

@@ -1622,14 +1622,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         ),
     )
 
-    # Emit x-thinking-budget-applied when a budget was requested.
+    # Emit x-thinking-budget-applied when a budget was requested. Use
+    # explicit identity check (`is True`) so None never coerces to "false"
+    # accidentally — matches the Anthropic handler's idiom. A future refactor
+    # that sets applied to a non-bool truthy value would then fail the type
+    # check instead of silently passing through.
     if budget_was_requested:
         from fastapi.responses import JSONResponse
 
         applied = getattr(output, "thinking_budget_applied", None)
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
-            headers={"x-thinking-budget-applied": "true" if applied else "false"},
+            headers={
+                "x-thinking-budget-applied": "true" if applied is True else "false"
+            },
         )
 
     return chat_response
@@ -1744,6 +1750,15 @@ async def create_anthropic_message(
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Forward thinking-budget to the engine. anthropic_to_openai already
+    # translated the Anthropic `thinking` shape and the extension field
+    # onto openai_request — just pipe them into chat_kwargs the same way
+    # the OpenAI /v1/chat/completions handler does.
+    if openai_request.thinking_token_budget is not None:
+        chat_kwargs["thinking_token_budget"] = openai_request.thinking_token_budget
+    if openai_request.thinking_budget_message is not None:
+        chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -2014,6 +2029,15 @@ async def _stream_anthropic_messages(
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Forward thinking-budget into the engine — matches the non-streaming
+    # Anthropic handler and the OpenAI /v1/chat/completions handler. Without
+    # these two lines the streaming header pre-flight emits "true" while
+    # the engine never actually attaches the processor (the pre-DCR bug).
+    if openai_request.thinking_token_budget is not None:
+        chat_kwargs["thinking_token_budget"] = openai_request.thinking_token_budget
+    if openai_request.thinking_budget_message is not None:
+        chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
 
     # Emit message_start
     message_start = {

@@ -2089,6 +2089,7 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                thinking_budget_applied=request.thinking_budget_applied,
             )
 
             # Check if finished
@@ -2462,11 +2463,18 @@ class Scheduler:
                 # re-raising, which would cause infinite loop in engine_core.
                 aborted_ids = self._recover_from_generation_error()
                 for rid in aborted_ids:
+                    _req = self.requests.get(rid)
+                    # After _cleanup_request fires the request may already be
+                    # popped; fall through to None (server coerces to "false").
+                    _applied = (
+                        _req.thinking_budget_applied if _req is not None else None
+                    )
                     output.outputs.append(
                         RequestOutput(
                             request_id=rid,
                             finished=True,
                             finish_reason="error",
+                            thinking_budget_applied=_applied,
                         )
                     )
                 output.finished_request_ids = aborted_ids

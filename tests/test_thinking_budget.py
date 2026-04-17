@@ -257,3 +257,74 @@ class TestNoopCounter:
         thinking_budget_noop_total.inc()
         thinking_budget_noop_total.inc(2)
         assert thinking_budget_noop_total.value == before + 3
+
+
+class TestApplyPropagation:
+    """End-to-end: Request.thinking_budget_applied → RequestOutput →
+    GenerationOutput. This test caught the CRITICAL-1 regression that the
+    existence-only sentinel missed."""
+
+    def test_merge_preserves_applied(self):
+        from vllm_mlx.output_collector import RequestOutputCollector
+        from vllm_mlx.request import RequestOutput
+
+        collector = RequestOutputCollector()
+        existing = RequestOutput(
+            request_id="x",
+            new_text="hello",
+            thinking_budget_applied=True,
+        )
+        new = RequestOutput(
+            request_id="x",
+            new_text=" world",
+            thinking_budget_applied=True,
+        )
+        merged = collector._merge_outputs(existing, new)
+        assert merged.thinking_budget_applied is True
+
+    def test_merge_with_false_applied(self):
+        from vllm_mlx.output_collector import RequestOutputCollector
+        from vllm_mlx.request import RequestOutput
+
+        collector = RequestOutputCollector()
+        existing = RequestOutput(request_id="x", thinking_budget_applied=False)
+        new = RequestOutput(request_id="x", thinking_budget_applied=False)
+        assert collector._merge_outputs(existing, new).thinking_budget_applied is False
+
+    def test_scheduler_output_carries_applied_flag(self):
+        """Scheduler's output-producing method must copy
+        Request.thinking_budget_applied to the RequestOutput it produces."""
+        from vllm_mlx.request import Request, RequestOutput, SamplingParams
+        import inspect
+        # Read _process_batch_responses source (the method that constructs
+        # RequestOutput during the generation step); assert it references
+        # thinking_budget_applied so this test breaks if someone deletes the
+        # field propagation without replacing it with another mechanism.
+        from vllm_mlx.scheduler import Scheduler
+        source = inspect.getsource(Scheduler._process_batch_responses)
+        assert "thinking_budget_applied" in source, (
+            "Scheduler._process_batch_responses must reference thinking_budget_applied "
+            "or the server header will always be 'false'"
+        )
+
+    def test_batched_engine_text_generate_constructs_with_applied(self):
+        """BatchedEngine.generate text branch must set thinking_budget_applied
+        on its GenerationOutput (text branch, non-streaming)."""
+        import inspect
+        from vllm_mlx.engine.batched import BatchedEngine
+        source = inspect.getsource(BatchedEngine.generate)
+        # Verify both the text-branch construction (line ~570) AND the return
+        # reference output.thinking_budget_applied.
+        assert source.count("thinking_budget_applied") >= 2, (
+            "BatchedEngine.generate should reference thinking_budget_applied at "
+            "least twice (MLLM branch and text branch GenerationOutput)"
+        )
+
+    def test_batched_engine_text_stream_constructs_with_applied(self):
+        import inspect
+        from vllm_mlx.engine.batched import BatchedEngine
+        source = inspect.getsource(BatchedEngine.stream_generate)
+        assert source.count("thinking_budget_applied") >= 2, (
+            "BatchedEngine.stream_generate should reference "
+            "thinking_budget_applied in both branches"
+        )

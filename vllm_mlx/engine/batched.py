@@ -572,6 +572,10 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            # Propagate the scheduler's decision so the server can emit
+            # x-thinking-budget-applied correctly. None when no budget
+            # was requested; True/False otherwise.
+            thinking_budget_applied=output.thinking_budget_applied,
         )
 
     async def stream_generate(
@@ -664,6 +668,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                thinking_budget_applied=output.thinking_budget_applied,
             )
 
     async def chat(

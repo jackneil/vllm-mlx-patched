@@ -149,6 +149,9 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            # Carry the budget-applied flag through aggregation; the value
+            # doesn't change across a request's lifetime so always take `new`.
+            thinking_budget_applied=new.thinking_budget_applied,
         )
 
     def clear(self) -> None:

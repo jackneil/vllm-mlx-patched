@@ -1094,6 +1094,7 @@ class Scheduler:
         model: Any,
         tokenizer: Any,
         config: Optional[SchedulerConfig] = None,
+        reasoning_parser: Any = None,
     ):
         """
         Initialize the scheduler.
@@ -1102,10 +1103,15 @@ class Scheduler:
             model: The MLX model
             tokenizer: The tokenizer
             config: Scheduler configuration
+            reasoning_parser: Optional ReasoningParser instance. Required for
+                thinking-token-budget enforcement — the parser supplies
+                start_token / end_tokens (e.g. "<think>" / "</think>") that
+                the ThinkingTokenBudgetLogitsProcessor clamps.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
+        self._reasoning_parser = reasoning_parser
 
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
@@ -1662,6 +1668,52 @@ class Scheduler:
             logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
             return None
 
+    def _maybe_attach_thinking_budget(self, request: Request) -> None:
+        """Attach a ThinkingTokenBudgetLogitsProcessor to the request if its
+        sampling_params requested a budget and the environment supports it.
+
+        Sets ``request.thinking_budget_applied``:
+          - True  when processor was attached;
+          - False when budget was requested but could not be satisfied
+                  (logs WARN + increments the noop counter);
+          - None  when no budget was requested (default).
+        """
+        sp = request.sampling_params
+        tb_proc = _attach_thinking_budget_processor(
+            tokenizer=self.tokenizer,
+            reasoning_parser=self._reasoning_parser,
+            budget=sp.thinking_token_budget,
+            message=sp.thinking_budget_message,
+            prompt_token_ids=request.prompt_token_ids,
+        )
+        if tb_proc is not None:
+            request.logits_processors.append(tb_proc)
+            request.thinking_budget_applied = True
+        elif sp.thinking_token_budget is not None:
+            logger.warning(
+                "thinking_token_budget=%s requested for request %s but could "
+                "not attach processor (parser=%s, tokenizer=%s). Budget not "
+                "enforced; x-thinking-budget-applied header will be false.",
+                sp.thinking_token_budget,
+                request.request_id,
+                type(self._reasoning_parser).__name__
+                if self._reasoning_parser
+                else None,
+                type(self.tokenizer).__name__
+                if hasattr(self, "tokenizer")
+                else None,
+            )
+            try:
+                from .metrics import thinking_budget_noop_total
+
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                # Task 6 creates vllm_mlx.metrics; tolerate its absence.
+                pass
+            request.thinking_budget_applied = False
+        else:
+            request.thinking_budget_applied = None
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -1693,6 +1745,10 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Attach per-request thinking-token-budget processor (no-op when the
+        # request didn't set sampling_params.thinking_token_budget).
+        self._maybe_attach_thinking_budget(request)
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
@@ -1920,6 +1976,13 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Per-request logits_processors (e.g. thinking-budget). Only
+            # pass if non-empty — older mlx_lm versions may not accept the
+            # kwarg, so we use _insert_kwargs() to drop it gracefully.
+            insert_extra: Dict[str, Any] = {}
+            if request.logits_processors:
+                insert_extra["logits_processors"] = [list(request.logits_processors)]
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
@@ -1929,6 +1992,7 @@ class Scheduler:
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    **insert_extra,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1945,6 +2009,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        **insert_extra,
                     )
                 else:
                     raise

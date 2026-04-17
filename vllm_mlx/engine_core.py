@@ -53,6 +53,7 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
+        reasoning_parser: Any = None,
     ):
         """
         Initialize the engine.
@@ -65,6 +66,8 @@ class EngineCore:
             force_model_ownership: If True (default), forcibly take model ownership
                                    from any existing engine. If False, raises
                                    ModelOwnershipError if model is in use.
+            reasoning_parser: Optional ReasoningParser instance, forwarded to
+                the Scheduler for thinking-token-budget enforcement.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -72,6 +75,7 @@ class EngineCore:
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
+        self._reasoning_parser = reasoning_parser
 
         # Acquire model ownership
         registry = get_registry()
@@ -89,6 +93,7 @@ class EngineCore:
             model=model,
             tokenizer=tokenizer,
             config=scheduler_config,
+            reasoning_parser=reasoning_parser,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -622,8 +627,11 @@ class AsyncEngineCore:
         model: Any,
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
+        reasoning_parser: Any = None,
     ):
-        self.engine = EngineCore(model, tokenizer, config)
+        self.engine = EngineCore(
+            model, tokenizer, config, reasoning_parser=reasoning_parser
+        )
 
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()

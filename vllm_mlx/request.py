@@ -147,6 +147,18 @@ class Request:
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )
 
+    # Per-request logits processors (e.g. thinking-budget). Forwarded to
+    # mlx_lm.BatchGenerator.insert(logits_processors=[...]).
+    logits_processors: List[Any] = field(default_factory=list)
+
+    # Thinking-token-budget state:
+    #   True  = budget processor successfully attached.
+    #   False = budget requested but could not be enforced (MLLM path,
+    #           no reasoning parser, tokenizer rejected delimiters, etc.).
+    #   None  = no budget requested. Server reads this to emit
+    #           x-thinking-budget-applied response header (Task 5).
+    thinking_budget_applied: Optional[bool] = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""

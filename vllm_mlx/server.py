@@ -529,6 +529,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            reasoning_parser=_reasoning_parser,
         )
         if compile:
             _engine._compile_on_start = True
@@ -547,6 +548,7 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            reasoning_parser=_reasoning_parser,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

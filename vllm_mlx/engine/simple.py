@@ -271,10 +271,16 @@ class SimpleEngine(BaseEngine):
         # text branch). Accept the kwargs for API symmetry but warn when set.
         if thinking_token_budget is not None:
             logger.warning(
-                "SimpleEngine.generate: thinking_token_budget=%s ignored "
-                "(only BatchedEngine's text scheduler enforces it).",
+                "SimpleEngine.generate: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
                 thinking_token_budget,
             )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         async with self._generation_lock:
             # Run in thread pool to allow asyncio timeout to work
@@ -335,10 +341,16 @@ class SimpleEngine(BaseEngine):
 
         if thinking_token_budget is not None:
             logger.warning(
-                "SimpleEngine.stream_generate: thinking_token_budget=%s ignored "
-                "(only BatchedEngine's text scheduler enforces it).",
+                "SimpleEngine.stream_generate: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
                 thinking_token_budget,
             )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -481,10 +493,16 @@ class SimpleEngine(BaseEngine):
 
         if thinking_token_budget is not None:
             logger.warning(
-                "SimpleEngine.chat: thinking_token_budget=%s ignored "
-                "(only BatchedEngine's text scheduler enforces it).",
+                "SimpleEngine.chat: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
                 thinking_token_budget,
             )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -582,10 +600,16 @@ class SimpleEngine(BaseEngine):
 
         if thinking_token_budget is not None:
             logger.warning(
-                "SimpleEngine.stream_chat: thinking_token_budget=%s ignored "
-                "(only BatchedEngine's text scheduler enforces it).",
+                "SimpleEngine.stream_chat: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
                 thinking_token_budget,
             )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None

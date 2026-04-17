@@ -311,7 +311,9 @@ Without a message, the forced close can cut the model mid-sentence. Set `thinkin
 
 ### Supported models (v1)
 
-**Works today (text path):** Qwen3 and DeepSeek-R1 via the text engine (`SimpleEngine` / `vllm_mlx/scheduler.py`). Requires `--reasoning-parser qwen3` (or `deepseek_r1`).
+**Works today (text path, continuous-batching only):** Qwen3 and DeepSeek-R1 when the server runs in continuous-batching mode (`--continuous-batching`). Requires `--reasoning-parser qwen3` (or `deepseek_r1`). The LogitsProcessor attaches in `vllm_mlx/scheduler.py` which is only active under continuous batching.
+
+**Simple mode (single-user, default)**: `thinking_token_budget` is **silently logged and dropped**. To enforce the budget, start the server with `--continuous-batching`. If you need simple-mode enforcement, file an issue — this is a known v1 limitation.
 
 **Not supported in v1 (loud no-op):**
 - **MLLM / VLM models** (Qwen3-VL, Gemma 4, etc.) — served by `MLLMBatchGenerator` which does not yet wire `logits_processors`. Tracked as follow-up.

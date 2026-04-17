@@ -214,8 +214,10 @@ class ChatCompletionRequest(BaseModel):
     thinking_token_budget: int | None = None
 
     # Optional wrap-up hint injected before </think> when the budget is hit.
-    # Matches vllm PR #37112.
-    thinking_budget_message: str | None = None
+    # Matches vllm PR #37112. Capped at 2048 chars so a malicious client
+    # can't force the tokenizer to allocate an unbounded force-sequence
+    # on the decode hot path (DCR Wave-3 finding).
+    thinking_budget_message: str | None = Field(default=None, max_length=2048)
 
 
 class AssistantMessage(BaseModel):

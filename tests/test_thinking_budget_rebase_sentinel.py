@@ -106,6 +106,48 @@ class TestThinkingBudgetSentinel:
                 f"to chat_kwargs — wrap-up hint feature broken on /v1/messages."
             )
 
+    def test_openai_chat_completion_emits_budget_header(self):
+        """Pin the response-header emission on the OpenAI handler too.
+        DCR Wave-3: Wave-2 sentinel only covered the Anthropic handler,
+        but invariant #9 claims both chat-completion handlers emit the
+        header. Deleting the OpenAI emission silently passed all 63
+        tests before this assertion."""
+        import inspect
+
+        from vllm_mlx import server
+
+        src = inspect.getsource(server.create_chat_completion)
+        occurrences = src.count("x-thinking-budget-applied")
+        assert occurrences >= 2, (
+            f"create_chat_completion regression: x-thinking-budget-applied "
+            f"appears only {occurrences} time(s) — expected >=2 (streaming + "
+            f"non-streaming branches)."
+        )
+
+    def test_streaming_header_call_sites_bind_engine_type(self):
+        """Pin the Wave-2 O-1 call-site wiring. The helper _streaming_header_value
+        has `engine_supports_budget` as a required kwarg; both call sites
+        must pass `isinstance(engine, BatchedEngine)` so SimpleEngine gets
+        "false". A rebase that replaces this with a literal `True` would
+        re-introduce the Wave-2 CRITICAL (simple-mode streaming lies)
+        without any unit test failing."""
+        import inspect
+        import re
+
+        from vllm_mlx import server
+
+        pattern = (
+            r"engine_supports_budget\s*=\s*isinstance\(\s*engine\s*,"
+            r"\s*BatchedEngine\s*\)"
+        )
+        for fn_name in ("create_chat_completion", "create_anthropic_message"):
+            src = inspect.getsource(getattr(server, fn_name))
+            assert re.search(pattern, src), (
+                f"{fn_name} regression: _streaming_header_value is called "
+                f"without engine_supports_budget=isinstance(engine, "
+                f"BatchedEngine). SimpleEngine streaming will lie to clients."
+            )
+
     def test_anthropic_handler_emits_budget_header(self):
         """Pin the response-header emission. DCR Wave-2 CRITICAL T-1: if
         someone deletes the `x-thinking-budget-applied` header line from

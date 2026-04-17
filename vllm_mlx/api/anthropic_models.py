@@ -73,7 +73,9 @@ class AnthropicRequest(BaseModel):
     # Clients that target vLLM upstream's PR #20859 use this name.
     thinking_token_budget: int | None = None
     # Optional wrap-up hint injected before </think> when budget is hit.
-    thinking_budget_message: str | None = None
+    # Capped at 2048 chars — see ChatCompletionRequest for rationale
+    # (DoS prevention — DCR Wave-3 finding).
+    thinking_budget_message: str | None = Field(default=None, max_length=2048)
 
 
 # =============================================================================

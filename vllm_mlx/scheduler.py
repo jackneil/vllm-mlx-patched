@@ -63,6 +63,12 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
     return accepted
 
 
+# Upper bound on tokenized thinking_budget_message length. The Pydantic
+# field caps raw chars at 2048, but adversarial unicode can tokenize at
+# >1 token/byte for some BPE tokenizers. This is a defense-in-depth cap.
+_THINKING_MESSAGE_MAX_TOKENS = 512
+
+
 def _attach_thinking_budget_processor(
     *,
     tokenizer,
@@ -124,6 +130,18 @@ def _attach_thinking_budget_processor(
                 "</think> without a wrap-up hint",
                 message,
             )
+        elif len(message_ids) > _THINKING_MESSAGE_MAX_TOKENS:
+            # Defense in depth on top of the Pydantic max_length=2048 char
+            # cap: some tokenizers can emit >1 token per byte on adversarial
+            # input. Skip the message if it would force an unbounded
+            # sequence through the decode hot path.
+            logger.warning(
+                "thinking_budget_message tokenized to %d tokens (cap=%d); "
+                "dropping the wrap-up hint for request safety",
+                len(message_ids),
+                _THINKING_MESSAGE_MAX_TOKENS,
+            )
+            message_ids = None
 
     from .logits_processors import ThinkingTokenBudgetLogitsProcessor
 

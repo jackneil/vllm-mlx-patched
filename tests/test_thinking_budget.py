@@ -165,3 +165,58 @@ class TestProcessorStateMachine:
         assert f2 == 51
         f3 = _forced_token(p, [100, 1, 50, 51])  # then </think>
         assert f3 == 200
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer stand-in that encodes strings to fixed ids."""
+    _MAP = {
+        "<think>": [100],
+        "</think>": [200],
+        "Wrap it up.": [50, 51],
+    }
+
+    def encode(self, text, add_special_tokens=False):
+        return _FakeTokenizer._MAP[text]
+
+
+class _FakeParser:
+    start_token = "<think>"
+    end_tokens = ["</think>"]
+
+
+class TestAttachProcessor:
+    def _call(self, **overrides):
+        from vllm_mlx.scheduler import _attach_thinking_budget_processor
+
+        base = dict(
+            tokenizer=_FakeTokenizer(),
+            reasoning_parser=_FakeParser(),
+            budget=512,
+            message=None,
+            prompt_token_ids=None,
+        )
+        base.update(overrides)
+        return _attach_thinking_budget_processor(**base)
+
+    def test_returns_processor_when_valid(self):
+        proc = self._call()
+        assert proc is not None
+
+    def test_none_when_budget_is_none(self):
+        assert self._call(budget=None) is None
+
+    def test_none_when_no_parser(self):
+        assert self._call(reasoning_parser=None) is None
+
+    def test_none_when_start_tokenize_fails(self):
+        class BrokenTok:
+            def encode(self, text, add_special_tokens=False):
+                raise RuntimeError("oops")
+
+        assert self._call(tokenizer=BrokenTok()) is None
+
+    def test_message_tokenized_when_provided(self):
+        proc = self._call(message="Wrap it up.")
+        assert proc is not None
+        # Force sequence includes message ids (50, 51) then end ids (200).
+        assert proc._force_sequence == [50, 51, 200]

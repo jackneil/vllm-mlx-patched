@@ -62,6 +62,80 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
         )
     return accepted
 
+
+def _attach_thinking_budget_processor(
+    *,
+    tokenizer,
+    reasoning_parser,
+    budget,
+    message,
+    prompt_token_ids,
+):
+    """Construct a ThinkingTokenBudgetLogitsProcessor for a single request.
+
+    Returns None (a loud no-op — caller should log WARN and increment the
+    metric) when any of:
+      - budget is None
+      - reasoning_parser is None (no --reasoning-parser flag)
+      - tokenizer can't encode the start/end delimiters to a non-empty list
+
+    Returns the processor on success.
+    """
+    if budget is None:
+        return None
+    if reasoning_parser is None:
+        return None
+
+    start_str = getattr(reasoning_parser, "start_token", "<think>")
+    end_candidates = getattr(reasoning_parser, "end_tokens", ["</think>"])
+
+    def _encode(text):
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except Exception as e:
+            logger.debug(
+                "thinking_budget: tokenizer.encode(%r) raised %s", text, e
+            )
+            return None
+        if not isinstance(ids, list) or not ids:
+            return None
+        return ids
+
+    start_ids = _encode(start_str)
+    if start_ids is None:
+        return None
+
+    end_ids = None
+    for candidate in end_candidates:
+        enc = _encode(candidate)
+        if enc is not None:
+            end_ids = enc
+            break
+    if end_ids is None:
+        return None
+
+    message_ids = None
+    if message:
+        message_ids = _encode(message)
+        # Message tokenize failure is non-fatal — just skip the message.
+        if message_ids is None:
+            logger.warning(
+                "thinking_budget_message=%r failed to tokenize; forcing "
+                "</think> without a wrap-up hint",
+                message,
+            )
+
+    from .logits_processors import ThinkingTokenBudgetLogitsProcessor
+
+    return ThinkingTokenBudgetLogitsProcessor(
+        budget=budget,
+        start_token_ids=start_ids,
+        end_token_ids=end_ids,
+        message_token_ids=message_ids,
+        prompt_token_ids=prompt_token_ids,
+    )
+
+
 # Error patterns that indicate cache corruption
 CACHE_CORRUPTION_PATTERNS = [
     "'NoneType' object is not subscriptable",

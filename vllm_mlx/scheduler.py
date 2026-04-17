@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import inspect
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -32,6 +33,34 @@ logger = logging.getLogger(__name__)
 
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
+
+# Version-tolerant kwarg filter for mlx_lm.BatchGenerator. The upstream
+# API changes between mlx_lm releases (e.g. prompt_progress_callback was
+# once a constructor kwarg and is now set as an attribute post-construction).
+# Filtering via inspect.signature() lets vllm-mlx keep building against
+# newer and older mlx_lm releases without crashing.
+_BG_INIT_PARAMS: Set[str] = set(
+    inspect.signature(BatchGenerator.__init__).parameters.keys()
+)
+
+
+def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
+    """Filter kwargs to those accepted by BatchGenerator.__init__.
+
+    Drops (with a warning) any kwarg the installed mlx_lm doesn't accept.
+    Callers that need to wire up dropped kwargs should set them as
+    attributes on the constructed instance instead.
+    """
+    accepted = {k: v for k, v in kwargs.items() if k in _BG_INIT_PARAMS}
+    dropped = set(kwargs) - set(accepted)
+    if dropped:
+        logger.debug(
+            "BatchGenerator constructor does not accept %s in mlx_lm "
+            "version %s; set as attribute post-construction if needed.",
+            sorted(dropped),
+            getattr(__import__("mlx_lm"), "__version__", "unknown"),
+        )
+    return accepted
 
 # Error patterns that indicate cache corruption
 CACHE_CORRUPTION_PATTERNS = [
@@ -1151,15 +1180,22 @@ class Scheduler:
                 )
 
         bg = BatchGenerator(
-            model=self.model,
-            max_tokens=sampling_params.max_tokens,
-            stop_tokens=stop_tokens,
-            sampler=sampler,
-            prefill_batch_size=self.config.prefill_batch_size,
-            completion_batch_size=self.config.completion_batch_size,
-            prefill_step_size=self.config.prefill_step_size,
-            prompt_progress_callback=_prefill_progress,
+            **_bg_kwargs(
+                model=self.model,
+                max_tokens=sampling_params.max_tokens,
+                stop_tokens=stop_tokens,
+                sampler=sampler,
+                prefill_batch_size=self.config.prefill_batch_size,
+                completion_batch_size=self.config.completion_batch_size,
+                prefill_step_size=self.config.prefill_step_size,
+                prompt_progress_callback=_prefill_progress,
+            )
         )
+        # Always set the progress callback as an attribute. In older mlx_lm
+        # releases this was a constructor kwarg (filtered out above on
+        # newer releases); chunked-prefill installs below read it via
+        # self.prompt_progress_callback so it must exist either way.
+        bg.prompt_progress_callback = _prefill_progress
 
         # Install chunked prefill when explicitly configured OR when
         # memory-aware cache is active (needed for prefix_boundary saves

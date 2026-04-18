@@ -65,6 +65,17 @@ class AnthropicRequest(BaseModel):
     tool_choice: dict | None = None
     metadata: dict | None = None
     top_k: int | None = None
+    # Anthropic-native extended-thinking: {"thinking": {"budget_tokens": N}}.
+    # Takes precedence only over its absence — the top-level
+    # thinking_token_budget below wins when both are set.
+    thinking: dict | None = None
+    # vllm-mlx extension matching the OpenAI chat-completion surface.
+    # Clients that target vLLM upstream's PR #20859 use this name.
+    thinking_token_budget: int | None = None
+    # Optional wrap-up hint injected before </think> when budget is hit.
+    # Capped at 2048 chars — see ChatCompletionRequest for rationale
+    # (DoS prevention — DCR Wave-3 finding).
+    thinking_budget_message: str | None = Field(default=None, max_length=2048)
 
 
 # =============================================================================

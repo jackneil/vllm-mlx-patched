@@ -202,6 +202,23 @@ class ChatCompletionRequest(BaseModel):
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
 
+    # vLLM-compatible nested chat-template kwargs. Pulled as a secondary parse
+    # path for thinking_token_budget / thinking_budget_message (see server.py
+    # for precedence order).
+    chat_template_kwargs: dict | None = None
+
+    # Thinking token budget — caps tokens inside <think>…</think>. None = no cap.
+    # Sent via OpenAI extra_body={"thinking_token_budget": N}; the SDK flattens
+    # to a top-level field (same pattern as specprefill above). Matches
+    # vllm-project/vllm PR #20859 (merged 2026-03-24).
+    thinking_token_budget: int | None = None
+
+    # Optional wrap-up hint injected before </think> when the budget is hit.
+    # Matches vllm PR #37112. Capped at 2048 chars so a malicious client
+    # can't force the tokenizer to allocate an unbounded force-sequence
+    # on the decode hot path (DCR Wave-3 finding).
+    thinking_budget_message: str | None = Field(default=None, max_length=2048)
+
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""

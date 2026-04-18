@@ -138,6 +138,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        reasoning_parser: Any = None,
     ):
         """
         Initialize the batched engine.
@@ -148,12 +149,16 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            reasoning_parser: Optional ReasoningParser instance. Forwarded
+                through the engine/scheduler stack so the text scheduler can
+                attach thinking-token-budget logits processors.
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._reasoning_parser = reasoning_parser
 
         self._model = None
         self._processor = None  # For MLLM
@@ -179,6 +184,35 @@ class BatchedEngine(BaseEngine):
         if self._is_mllm and self._processor:
             return getattr(self._processor, "tokenizer", self._processor)
         return self._tokenizer
+
+    def _log_mllm_budget_noop(
+        self, thinking_token_budget: int | None, method: str
+    ) -> bool | None:
+        """Log WARN + increment noop counter when a thinking-token-budget
+        was requested on the MLLM path (which does not enforce it yet).
+
+        Returns the value that should be written to
+        ``GenerationOutput.thinking_budget_applied`` (False if a budget was
+        requested, None otherwise).
+        """
+        if thinking_token_budget is None:
+            return None
+        logger.warning(
+            "BatchedEngine.%s: thinking_token_budget=%s requested for an "
+            "MLLM request, but the MLLM path does not yet support it. "
+            "Budget will not be enforced; x-thinking-budget-applied header "
+            "will be false.",
+            method,
+            thinking_token_budget,
+        )
+        try:
+            from ..metrics import thinking_budget_noop_total
+
+            thinking_budget_noop_total.inc()
+        except ImportError:
+            # Task 6 creates vllm_mlx.metrics; tolerate its absence.
+            pass
+        return False
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
@@ -329,6 +363,7 @@ class BatchedEngine(BaseEngine):
             model=self._model,
             tokenizer=self._tokenizer,
             config=engine_config,
+            reasoning_parser=self._reasoning_parser,
         )
 
         await self._engine.engine.start()
@@ -459,6 +494,8 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -472,6 +509,13 @@ class BatchedEngine(BaseEngine):
             stop: Stop sequences
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
+            thinking_token_budget: Optional cap on tokens inside
+                <think>…</think>. Enforced in the text branch via the
+                scheduler's ThinkingTokenBudgetLogitsProcessor. The MLLM
+                branch does not yet support it and will log WARN + set
+                thinking_budget_applied=False on the output.
+            thinking_budget_message: Optional wrap-up hint emitted before
+                </think> when the budget is hit.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -484,6 +528,9 @@ class BatchedEngine(BaseEngine):
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
             # so text-only requests must also be routed here.
+            tb_applied = self._log_mllm_budget_noop(
+                thinking_token_budget, "generate"
+            )
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -498,6 +545,7 @@ class BatchedEngine(BaseEngine):
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
+                thinking_budget_applied=tb_applied,
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -508,6 +556,8 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            thinking_token_budget=thinking_token_budget,
+            thinking_budget_message=thinking_budget_message,
         )
 
         output = await self._engine.generate(
@@ -522,6 +572,10 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            # Propagate the scheduler's decision so the server can emit
+            # x-thinking-budget-applied correctly. None when no budget
+            # was requested; True/False otherwise.
+            thinking_budget_applied=output.thinking_budget_applied,
         )
 
     async def stream_generate(
@@ -533,6 +587,8 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -546,6 +602,9 @@ class BatchedEngine(BaseEngine):
             stop: Stop sequences
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
+            thinking_token_budget: Optional cap on <think>…</think> tokens
+                (enforced in the text branch; MLLM branch logs WARN).
+            thinking_budget_message: Optional wrap-up hint.
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -556,6 +615,9 @@ class BatchedEngine(BaseEngine):
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
+            tb_applied = self._log_mllm_budget_noop(
+                thinking_token_budget, "stream_generate"
+            )
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
@@ -573,6 +635,7 @@ class BatchedEngine(BaseEngine):
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
                     finish_reason=output.finish_reason,
+                    thinking_budget_applied=tb_applied,
                 )
             return
 
@@ -584,6 +647,8 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            thinking_token_budget=thinking_token_budget,
+            thinking_budget_message=thinking_budget_message,
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -603,6 +668,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                thinking_budget_applied=output.thinking_budget_applied,
             )
 
     async def chat(
@@ -614,6 +680,8 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -631,6 +699,10 @@ class BatchedEngine(BaseEngine):
             tools: Optional tool definitions
             images: Optional image URLs/paths
             videos: Optional video URLs/paths
+            thinking_token_budget: Optional cap on <think>…</think> tokens
+                (text branch enforces via logits processor; MLLM path logs
+                WARN and returns thinking_budget_applied=False).
+            thinking_budget_message: Optional wrap-up hint.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -662,6 +734,8 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            thinking_token_budget=thinking_token_budget,
+            thinking_budget_message=thinking_budget_message,
             **kwargs,
         )
 
@@ -725,6 +799,8 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -742,6 +818,10 @@ class BatchedEngine(BaseEngine):
             tools: Optional tool definitions
             images: Optional image URLs/paths
             videos: Optional video URLs/paths
+            thinking_token_budget: Optional cap on <think>…</think> tokens
+                (text branch enforces via logits processor; MLLM path logs
+                WARN and returns thinking_budget_applied=False on outputs).
+            thinking_budget_message: Optional wrap-up hint.
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -778,6 +858,8 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            thinking_token_budget=thinking_token_budget,
+            thinking_budget_message=thinking_budget_message,
             **kwargs,
         ):
             yield output

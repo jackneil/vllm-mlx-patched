@@ -60,12 +60,22 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Max tokens inside <think>…</think>. None = no cap. 0 = force close on first <think>.
+    # Matches vllm-project/vllm SamplingParams.thinking_token_budget (PR #20859, merged 2026-03-24).
+    thinking_token_budget: Optional[int] = None
+    # Optional wrap-up hint injected before </think> when the budget is hit.
+    # Mirrors vllm PR #37112. None = force </think> directly.
+    thinking_budget_message: Optional[str] = None
 
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
         if self.stop_token_ids is None:
             self.stop_token_ids = []
+        if self.thinking_token_budget is not None and self.thinking_token_budget < 0:
+            raise ValueError(
+                f"thinking_token_budget must be >= 0, got {self.thinking_token_budget}"
+            )
 
 
 @dataclass
@@ -136,6 +146,18 @@ class Request:
     cache_hit_type: Optional[str] = (
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )
+
+    # Per-request logits processors (e.g. thinking-budget). Forwarded to
+    # mlx_lm.BatchGenerator.insert(logits_processors=[...]).
+    logits_processors: List[Any] = field(default_factory=list)
+
+    # Thinking-token-budget state:
+    #   True  = budget processor successfully attached.
+    #   False = budget requested but could not be enforced (MLLM path,
+    #           no reasoning parser, tokenizer rejected delimiters, etc.).
+    #   None  = no budget requested. Server reads this to emit
+    #           x-thinking-budget-applied response header (Task 5).
+    thinking_budget_applied: Optional[bool] = None
 
     @property
     def num_output_tokens(self) -> int:
@@ -208,6 +230,12 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Thinking-token-budget state (mirrors Request.thinking_budget_applied):
+    #   True  = budget processor successfully attached.
+    #   False = budget requested but could not be enforced.
+    #   None  = no budget requested. Server reads this to emit the
+    #           x-thinking-budget-applied response header.
+    thinking_budget_applied: Optional[bool] = None
 
     @property
     def usage(self) -> Dict[str, int]:

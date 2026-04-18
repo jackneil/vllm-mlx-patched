@@ -62,6 +62,98 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
         )
     return accepted
 
+
+# Upper bound on tokenized thinking_budget_message length. The Pydantic
+# field caps raw chars at 2048, but adversarial unicode can tokenize at
+# >1 token/byte for some BPE tokenizers. This is a defense-in-depth cap.
+_THINKING_MESSAGE_MAX_TOKENS = 512
+
+
+def _attach_thinking_budget_processor(
+    *,
+    tokenizer,
+    reasoning_parser,
+    budget,
+    message,
+    prompt_token_ids,
+):
+    """Construct a ThinkingTokenBudgetLogitsProcessor for a single request.
+
+    Returns None (a loud no-op — caller should log WARN and increment the
+    metric) when any of:
+      - budget is None
+      - reasoning_parser is None (no --reasoning-parser flag)
+      - tokenizer can't encode the start/end delimiters to a non-empty list
+
+    Returns the processor on success.
+    """
+    if budget is None:
+        return None
+    if reasoning_parser is None:
+        return None
+
+    start_str = getattr(reasoning_parser, "start_token", "<think>")
+    end_candidates = getattr(reasoning_parser, "end_tokens", ["</think>"])
+
+    def _encode(text):
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except Exception as e:
+            logger.debug(
+                "thinking_budget: tokenizer.encode(%r) raised %s", text, e
+            )
+            return None
+        if not isinstance(ids, list) or not ids:
+            return None
+        return ids
+
+    start_ids = _encode(start_str)
+    if start_ids is None:
+        return None
+
+    end_ids = None
+    for candidate in end_candidates:
+        enc = _encode(candidate)
+        if enc is not None:
+            end_ids = enc
+            break
+    if end_ids is None:
+        return None
+
+    message_ids = None
+    if message:
+        message_ids = _encode(message)
+        # Message tokenize failure is non-fatal — just skip the message.
+        if message_ids is None:
+            logger.warning(
+                "thinking_budget_message=%r failed to tokenize; forcing "
+                "</think> without a wrap-up hint",
+                message,
+            )
+        elif len(message_ids) > _THINKING_MESSAGE_MAX_TOKENS:
+            # Defense in depth on top of the Pydantic max_length=2048 char
+            # cap: some tokenizers can emit >1 token per byte on adversarial
+            # input. Skip the message if it would force an unbounded
+            # sequence through the decode hot path.
+            logger.warning(
+                "thinking_budget_message tokenized to %d tokens (cap=%d); "
+                "dropping the wrap-up hint for request safety",
+                len(message_ids),
+                _THINKING_MESSAGE_MAX_TOKENS,
+            )
+            message_ids = None
+
+    from .logits_processors import ThinkingTokenBudgetLogitsProcessor
+
+    return ThinkingTokenBudgetLogitsProcessor(
+        budget=budget,
+        start_token_ids=start_ids,
+        end_token_ids=end_ids,
+        message_token_ids=message_ids,
+        prompt_token_ids=prompt_token_ids,
+    )
+
+
 # Error patterns that indicate cache corruption
 CACHE_CORRUPTION_PATTERNS = [
     "'NoneType' object is not subscriptable",
@@ -1020,6 +1112,7 @@ class Scheduler:
         model: Any,
         tokenizer: Any,
         config: Optional[SchedulerConfig] = None,
+        reasoning_parser: Any = None,
     ):
         """
         Initialize the scheduler.
@@ -1028,10 +1121,15 @@ class Scheduler:
             model: The MLX model
             tokenizer: The tokenizer
             config: Scheduler configuration
+            reasoning_parser: Optional ReasoningParser instance. Required for
+                thinking-token-budget enforcement — the parser supplies
+                start_token / end_tokens (e.g. "<think>" / "</think>") that
+                the ThinkingTokenBudgetLogitsProcessor clamps.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
+        self._reasoning_parser = reasoning_parser
 
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
@@ -1588,6 +1686,73 @@ class Scheduler:
             logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
             return None
 
+    def _maybe_attach_thinking_budget(self, request: Request) -> None:
+        """Attach a ThinkingTokenBudgetLogitsProcessor to the request if its
+        sampling_params requested a budget and the environment supports it.
+
+        Sets ``request.thinking_budget_applied``:
+          - True  when processor was attached;
+          - False when budget was requested but could not be satisfied
+                  (logs WARN + increments the noop counter);
+          - None  when no budget was requested (default).
+        """
+        sp = request.sampling_params
+        tb_proc = _attach_thinking_budget_processor(
+            tokenizer=self.tokenizer,
+            reasoning_parser=self._reasoning_parser,
+            budget=sp.thinking_token_budget,
+            message=sp.thinking_budget_message,
+            prompt_token_ids=request.prompt_token_ids,
+        )
+        if tb_proc is not None:
+            request.logits_processors.append(tb_proc)
+            request.thinking_budget_applied = True
+        elif sp.thinking_token_budget is not None:
+            _parser_name = (
+                type(self._reasoning_parser).__name__
+                if self._reasoning_parser
+                else None
+            )
+            _tokenizer_name = (
+                type(self.tokenizer).__name__
+                if hasattr(self, "tokenizer")
+                else None
+            )
+            if _parser_name is None:
+                _hint = (
+                    "No reasoning parser configured. Start the server with "
+                    "--reasoning-parser qwen3 (or deepseek_r1) to enable "
+                    "budget enforcement."
+                )
+            else:
+                _hint = (
+                    f"Parser {_parser_name} is configured but the tokenizer "
+                    f"({_tokenizer_name}) could not encode <think>/</think> "
+                    "to single token IDs. The model may not support "
+                    "reasoning tags, or its tokenizer needs a model-specific "
+                    "parser. See "
+                    "docs/guides/reasoning.md#thinking-token-budget-troubleshooting "
+                    "for the diagnosis table."
+                )
+            logger.warning(
+                "thinking_token_budget=%s requested for request %s but "
+                "processor could not be attached. %s Budget not enforced; "
+                "x-thinking-budget-applied header will be false.",
+                sp.thinking_token_budget,
+                request.request_id,
+                _hint,
+            )
+            try:
+                from .metrics import thinking_budget_noop_total
+
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                # Task 6 creates vllm_mlx.metrics; tolerate its absence.
+                pass
+            request.thinking_budget_applied = False
+        else:
+            request.thinking_budget_applied = None
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -1619,6 +1784,10 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Attach per-request thinking-token-budget processor (no-op when the
+        # request didn't set sampling_params.thinking_token_budget).
+        self._maybe_attach_thinking_budget(request)
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
@@ -1846,6 +2015,13 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Per-request logits_processors (e.g. thinking-budget). Only
+            # pass if non-empty — older mlx_lm versions may not accept the
+            # kwarg, so we use _insert_kwargs() to drop it gracefully.
+            insert_extra: Dict[str, Any] = {}
+            if request.logits_processors:
+                insert_extra["logits_processors"] = [list(request.logits_processors)]
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
@@ -1855,6 +2031,7 @@ class Scheduler:
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    **insert_extra,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1871,6 +2048,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        **insert_extra,
                     )
                 else:
                     raise
@@ -1950,6 +2128,7 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                thinking_budget_applied=request.thinking_budget_applied,
             )
 
             # Check if finished
@@ -2323,11 +2502,18 @@ class Scheduler:
                 # re-raising, which would cause infinite loop in engine_core.
                 aborted_ids = self._recover_from_generation_error()
                 for rid in aborted_ids:
+                    _req = self.requests.get(rid)
+                    # After _cleanup_request fires the request may already be
+                    # popped; fall through to None (server coerces to "false").
+                    _applied = (
+                        _req.thinking_budget_applied if _req is not None else None
+                    )
                     output.outputs.append(
                         RequestOutput(
                             request_id=rid,
                             finished=True,
                             finish_reason="error",
+                            thinking_budget_applied=_applied,
                         )
                     )
                 output.finished_request_ids = aborted_ids

@@ -61,6 +61,7 @@ class SimpleEngine(BaseEngine):
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
+        reasoning_parser: Any = None,
     ):
         """
         Initialize the simple engine.
@@ -83,6 +84,10 @@ class SimpleEngine(BaseEngine):
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
         self._prefill_step_size = prefill_step_size
+        # Stored for API symmetry with BatchedEngine; SimpleEngine wraps
+        # mlx_lm directly and does NOT invoke the scheduler's thinking-
+        # budget logits processor.
+        self._reasoning_parser = reasoning_parser
 
         # SpecPrefill config
         self._specprefill_enabled = specprefill_enabled
@@ -233,6 +238,8 @@ class SimpleEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -244,6 +251,13 @@ class SimpleEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
+            thinking_token_budget: Optional cap on tokens between <think>/</think>
+                (see SamplingParams.thinking_token_budget). SimpleEngine wraps
+                mlx_lm directly and does NOT currently enforce this budget —
+                accepting the kwarg makes the engine API symmetric with
+                BatchedEngine and with the public signature contract.
+            thinking_budget_message: Optional wrap-up hint. Same caveat as
+                thinking_token_budget for SimpleEngine.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -251,6 +265,22 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        # SimpleEngine wraps mlx_lm.generate directly — the thinking-budget
+        # logits processor is only installed by the Scheduler (BatchedEngine
+        # text branch). Accept the kwargs for API symmetry but warn when set.
+        if thinking_token_budget is not None:
+            logger.warning(
+                "SimpleEngine.generate: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
+                thinking_token_budget,
+            )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         async with self._generation_lock:
             # Run in thread pool to allow asyncio timeout to work
@@ -284,6 +314,8 @@ class SimpleEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -295,6 +327,10 @@ class SimpleEngine(BaseEngine):
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
+            thinking_token_budget: Optional cap on <think>…</think> tokens.
+                SimpleEngine bypasses the scheduler-based logits processor, so
+                the kwarg is accepted for API symmetry but not enforced here.
+            thinking_budget_message: Optional wrap-up hint. Same caveat.
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -302,6 +338,19 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        if thinking_token_budget is not None:
+            logger.warning(
+                "SimpleEngine.stream_generate: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
+                thinking_token_budget,
+            )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -416,6 +465,8 @@ class SimpleEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -429,6 +480,9 @@ class SimpleEngine(BaseEngine):
             tools: Optional tool definitions
             images: Optional image URLs/paths
             videos: Optional video URLs/paths
+            thinking_token_budget: Optional cap on <think>…</think> tokens.
+                Accepted for API symmetry; SimpleEngine does not enforce it.
+            thinking_budget_message: Optional wrap-up hint.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -436,6 +490,19 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        if thinking_token_budget is not None:
+            logger.warning(
+                "SimpleEngine.chat: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
+                thinking_token_budget,
+            )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -505,6 +572,8 @@ class SimpleEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        thinking_token_budget: int | None = None,
+        thinking_budget_message: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -518,6 +587,9 @@ class SimpleEngine(BaseEngine):
             tools: Optional tool definitions
             images: Optional image URLs/paths
             videos: Optional video URLs/paths
+            thinking_token_budget: Optional cap on <think>…</think> tokens.
+                Accepted for API symmetry; SimpleEngine does not enforce it.
+            thinking_budget_message: Optional wrap-up hint.
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -525,6 +597,19 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        if thinking_token_budget is not None:
+            logger.warning(
+                "SimpleEngine.stream_chat: thinking_token_budget=%s ignored in simple mode. "
+                "Restart with --continuous-batching to enforce. "
+                "See docs/guides/reasoning.md#thinking-token-budget-troubleshooting.",
+                thinking_token_budget,
+            )
+            try:
+                from ..metrics import thinking_budget_noop_total
+                thinking_budget_noop_total.inc()
+            except ImportError:
+                pass
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None

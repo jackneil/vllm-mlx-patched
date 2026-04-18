@@ -149,6 +149,16 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            # Carry the budget-applied flag through aggregation. Prefer a
+            # non-None value — an error/abort-path RequestOutput can set
+            # thinking_budget_applied=None (request was already popped from
+            # the scheduler's tracking dict) and we don't want that to
+            # overwrite a prior True from the mid-stream happy path.
+            thinking_budget_applied=(
+                new.thinking_budget_applied
+                if new.thinking_budget_applied is not None
+                else existing.thinking_budget_applied
+            ),
         )
 
     def clear(self) -> None:

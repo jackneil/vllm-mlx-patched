@@ -144,6 +144,80 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_thinking_budget(top_level=None, template_kwargs=None):
+    """Resolve (budget, message) from the two parse paths.
+
+    Precedence: top-level wins for each field INDEPENDENTLY. A top-level
+    None does NOT mask a template value — each field resolves separately.
+
+    Args:
+      top_level: dict-like with keys 'b' (budget) and 'm' (message),
+        or None. In production callers pass
+        {'b': request.thinking_token_budget, 'm': request.thinking_budget_message}.
+      template_kwargs: dict or None — ChatCompletionRequest.chat_template_kwargs.
+
+    Returns:
+      (budget_or_None, message_or_None)
+    """
+    top = top_level or {}
+    templ = template_kwargs if isinstance(template_kwargs, dict) else {}
+
+    budget = top.get("b")
+    if budget is None:
+        budget = templ.get("thinking_token_budget")
+
+    message = top.get("m")
+    if message is None:
+        message = templ.get("thinking_budget_message")
+
+    return budget, message
+
+
+def _streaming_header_value(
+    *, is_mllm: bool, reasoning_parser, engine_supports_budget: bool
+) -> str:
+    """Streaming pre-flight: decide the x-thinking-budget-applied header
+    before the engine runs.
+
+    Returns "false" when the feature is known to no-op for this request:
+      - MLLM engines don't plumb logits_processors in v1
+      - SimpleEngine (simple mode) ignores the budget entirely — the
+        logits-processor pipeline only runs under continuous batching
+      - Text engines without --reasoning-parser can't resolve delimiters
+
+    Returns "true" when the processor is likely to attach. False positives
+    remain possible (tokenizer fails mid-run) — the scheduler still emits
+    WARN + increments the noop counter in those cases, so alerting works.
+    """
+    if is_mllm:
+        return "false"
+    if not engine_supports_budget:
+        return "false"
+    if reasoning_parser is None:
+        return "false"
+    return "true"
+
+
+def _anthropic_budget_requested(anthropic_request) -> bool:
+    """Return True iff the Anthropic request asked for a thinking budget
+    via EITHER the vllm-mlx extension field `thinking_token_budget` OR
+    the Anthropic-native nested `thinking` dict (with `budget_tokens`
+    set or `type` being 'enabled'/'disabled').
+
+    Used by both streaming and non-streaming `/v1/messages` handlers to
+    decide whether to emit the `x-thinking-budget-applied` response header.
+    """
+    if getattr(anthropic_request, "thinking_token_budget", None) is not None:
+        return True
+    thinking = getattr(anthropic_request, "thinking", None)
+    if isinstance(thinking, dict):
+        if "budget_tokens" in thinking:
+            return True
+        if thinking.get("type") in ("enabled", "disabled"):
+            return True
+    return False
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -529,6 +603,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            reasoning_parser=_reasoning_parser,
         )
         if compile:
             _engine._compile_on_start = True
@@ -547,6 +622,7 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            reasoning_parser=_reasoning_parser,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -1436,17 +1512,53 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
+    # Thinking budget: resolve from both parse paths.
+    _budget, _msg = _resolve_thinking_budget(
+        top_level={
+            "b": request.thinking_token_budget,
+            "m": request.thinking_budget_message,
+        },
+        template_kwargs=request.chat_template_kwargs,
+    )
+    if _budget is not None:
+        chat_kwargs["thinking_token_budget"] = _budget
+    if _msg is not None:
+        chat_kwargs["thinking_budget_message"] = _msg
+
+    # Was a budget requested by the client? Used to decide whether to emit
+    # the x-thinking-budget-applied response header for both streaming and
+    # non-streaming paths.
+    budget_was_requested = (
+        request.thinking_token_budget is not None
+        or (
+            isinstance(request.chat_template_kwargs, dict)
+            and "thinking_token_budget" in request.chat_template_kwargs
+        )
+    )
+
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
+        # Pre-flight: streaming can't wait for output.thinking_budget_applied.
+        # Emit "false" for both known no-op cases — MLLM routing AND missing
+        # reasoning parser. Either mis-configuration is detectable up front.
+        stream_headers = {}
+        if budget_was_requested:
+            streaming_applied = _streaming_header_value(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
+            stream_headers["x-thinking-budget-applied"] = streaming_applied
         return StreamingResponse(
             _disconnect_guard(
                 stream_chat_completion(engine, messages, request, **chat_kwargs),
                 raw_request,
             ),
             media_type="text/event-stream",
+            headers=stream_headers or None,
         )
 
     # Non-streaming response with timing and timeout
@@ -1498,7 +1610,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-    return ChatCompletionResponse(
+    chat_response = ChatCompletionResponse(
         model=_model_name,
         choices=[
             ChatCompletionChoice(
@@ -1516,6 +1628,24 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
+
+    # Emit x-thinking-budget-applied when a budget was requested. Use
+    # explicit identity check (`is True`) so None never coerces to "false"
+    # accidentally — matches the Anthropic handler's idiom. A future refactor
+    # that sets applied to a non-bool truthy value would then fail the type
+    # check instead of silently passing through.
+    if budget_was_requested:
+        from fastapi.responses import JSONResponse
+
+        applied = getattr(output, "thinking_budget_applied", None)
+        return JSONResponse(
+            content=chat_response.model_dump(mode="json", exclude_none=True),
+            headers={
+                "x-thinking-budget-applied": "true" if applied is True else "false"
+            },
+        )
+
+    return chat_response
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
@@ -1598,16 +1728,20 @@ async def create_anthropic_message(
     openai_request = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
+        headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        if _anthropic_budget_requested(anthropic_request):
+            headers["x-thinking-budget-applied"] = _streaming_header_value(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
         return StreamingResponse(
             _disconnect_guard(
                 _stream_anthropic_messages(engine, openai_request, anthropic_request),
                 request,
             ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
+            headers=headers,
         )
 
     # Non-streaming: run inference through existing engine
@@ -1624,6 +1758,15 @@ async def create_anthropic_message(
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Forward thinking-budget to the engine. anthropic_to_openai already
+    # translated the Anthropic `thinking` shape and the extension field
+    # onto openai_request — just pipe them into chat_kwargs the same way
+    # the OpenAI /v1/chat/completions handler does.
+    if openai_request.thinking_token_budget is not None:
+        chat_kwargs["thinking_token_budget"] = openai_request.thinking_token_budget
+    if openai_request.thinking_budget_message is not None:
+        chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -1676,9 +1819,16 @@ async def create_anthropic_message(
 
     # Convert to Anthropic response
     anthropic_response = openai_to_anthropic(openai_response, _model_name)
+    _resp_headers = {}
+    if _anthropic_budget_requested(anthropic_request):
+        applied = getattr(output, "thinking_budget_applied", None)
+        _resp_headers["x-thinking-budget-applied"] = (
+            "true" if applied is True else "false"
+        )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
         media_type="application/json",
+        headers=_resp_headers or None,
     )
 
 
@@ -1887,6 +2037,15 @@ async def _stream_anthropic_messages(
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Forward thinking-budget into the engine — matches the non-streaming
+    # Anthropic handler and the OpenAI /v1/chat/completions handler. Without
+    # these two lines the streaming header pre-flight emits "true" while
+    # the engine never actually attaches the processor (the pre-DCR bug).
+    if openai_request.thinking_token_budget is not None:
+        chat_kwargs["thinking_token_budget"] = openai_request.thinking_token_budget
+    if openai_request.thinking_budget_message is not None:
+        chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
 
     # Emit message_start
     message_start = {

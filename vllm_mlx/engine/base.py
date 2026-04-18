@@ -25,6 +25,10 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # Thinking-token-budget state (set by BatchedEngine text branch /
+    # MLLM branch; read by server.py to emit x-thinking-budget-applied
+    # response header). None when no budget was requested.
+    thinking_budget_applied: bool | None = None
 
 
 class BaseEngine(ABC):

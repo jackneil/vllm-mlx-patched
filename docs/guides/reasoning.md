@@ -265,3 +265,91 @@ curl http://localhost:8000/v1/chat/completions \
 - [Supported Models](../reference/models.md) - Models that support reasoning
 - [Server Configuration](server.md) - All server options
 - [CLI Reference](../reference/cli.md) - Command line options
+
+## Thinking Token Budget
+
+A "thinking budget" caps how long a reasoning model (Qwen3, DeepSeek-R1, etc.) deliberates before starting its answer. When the budget is hit, the server **rewrites the model's next input** to close the thinking block — so the model actually flips into answer mode and compute is saved. This is a real speedup, not a client-side trick that hides tokens from you.
+
+The feature is a direct port of [vllm-project/vllm PR #20859](https://github.com/vllm-project/vllm/pull/20859) (merged 2026-03-24). API names match upstream exactly so clients are portable.
+
+### How to use
+
+```python
+# OpenAI SDK — preferred path
+client.chat.completions.create(
+    model="qwen3.5",
+    messages=[...],
+    extra_body={
+        "thinking_token_budget": 512,
+        "thinking_budget_message": "Wrap up and answer now.",  # optional hint
+    },
+)
+```
+
+```bash
+curl -X POST /v1/chat/completions -d '{
+  "model": "qwen3.5",
+  "messages": [...],
+  "thinking_token_budget": 512
+}'
+```
+
+### Preset guidance
+
+| Preset | Budget | Use case |
+|---|---|---|
+| `low` | 512 | Quick factual answers, code completions |
+| `medium` | 2048 | General Q&A with light reasoning |
+| `high` | 8192 | Hard problems, math, multi-step logic |
+| `auto` / unset | `null` | Model decides (default) |
+
+The budget is a ceiling, not a stimulant — a high budget *allows* long thinking; it does not force the model to produce it.
+
+### `thinking_budget_message` (graceful wrap-up)
+
+Without a message, the forced close can cut the model mid-sentence. Set `thinking_budget_message` to a short hint like `"Wrap up and answer now."` — the processor injects the tokenized hint **before** `</think>`, so the model reads it in its own context on the next step and writes a coherent transition into the answer phase. This approximates the Claude-like "finishes thinking gracefully" behavior from models that were not trained for budget awareness.
+
+### Supported models (v1)
+
+**Works today (text path, continuous-batching only):** Qwen3 and DeepSeek-R1 when the server runs in continuous-batching mode (`--continuous-batching`). Requires `--reasoning-parser qwen3` (or `deepseek_r1`). The LogitsProcessor attaches in `vllm_mlx/scheduler.py` which is only active under continuous batching.
+
+**Simple mode (single-user, default)**: `thinking_token_budget` is **silently logged and dropped**. To enforce the budget, start the server with `--continuous-batching`. If you need simple-mode enforcement, file an issue — this is a known v1 limitation.
+
+**Not supported in v1 (loud no-op):**
+- **MLLM / VLM models** (Qwen3-VL, Gemma 4, etc.) — served by `MLLMBatchGenerator` which does not yet wire `logits_processors`. Tracked as follow-up.
+- **GPT-OSS / Harmony** — channel-based protocol with no `<think>` pair; the processor's delimiter resolution fails and it's a no-op.
+- **Models without `--reasoning-parser`** configured.
+
+### Self-diagnosis
+
+Every response to a request that set `thinking_token_budget` carries a response header:
+
+```
+x-thinking-budget-applied: true
+```
+
+or `false` when the processor could not be attached. Plus a WARN log with request ID, parser class, and tokenizer class.
+
+```bash
+curl -i http://localhost:8000/v1/chat/completions ... | grep -i x-thinking-budget
+```
+
+### Interaction with other controls
+
+- `max_tokens`: applies independently. If `max_tokens=100` and `thinking_token_budget=500`, `max_tokens` wins — both limits fire, whichever is tighter.
+- `/no_think` / `enable_thinking=False`: compatible. `thinking_token_budget=0` is equivalent in behavior for models that respond to it.
+- Prefix caching: the forced tokens look identical to natural samples; no cache invalidation.
+
+### Thinking Token Budget Troubleshooting
+
+When `x-thinking-budget-applied: false` comes back but you set a budget, check the server logs for the WARN line. The specific sub-message tells you what to fix.
+
+| Server log snippet | Cause | Fix |
+|---|---|---|
+| `No reasoning parser configured` | Server started without `--reasoning-parser` | Restart with `vllm-mlx serve MODEL --reasoning-parser qwen3` (or `deepseek_r1`) |
+| `Parser qwen3 is configured but the tokenizer … could not encode <think>/</think>` | Tokenizer doesn't have single-token `<think>`/`</think>` | Check the model is a reasoning model (Qwen3, DeepSeek-R1). GPT-OSS and Gemma 4 use channel protocols, not `<think>` tags — not supported in v1. |
+| `BatchedEngine.<method>: thinking_token_budget=... requested for an MLLM request` | MLLM path | Budget enforcement for VLMs / audio models is a v2 follow-up. Send text-only requests to a non-VLM model to enable enforcement. |
+| `SimpleEngine.<method>: thinking_token_budget=... ignored in simple mode` | Server running in simple mode | Restart the server with `--continuous-batching`. Simple mode doesn't run the logits-processor pipeline. |
+| Streaming response has `x-thinking-budget-applied: true` AND a WARN line | Tokenizer encoded `<think>`/`</think>` at pre-flight but failed at per-request attach | The streaming header is pre-flight (emitted before the engine runs). Trust the WARN log + `thinking_budget_noop_total` counter over the streaming header when they disagree. Non-streaming headers are authoritative. |
+
+Alert on the log rate of `thinking_token_budget=… but processor could not be attached` — a non-zero rate means a configuration problem in production. The in-process counter `vllm_mlx.metrics.thinking_budget_noop_total` also increments for every no-op.

@@ -353,3 +353,30 @@ When `x-thinking-budget-applied: false` comes back but you set a budget, check t
 | Streaming response has `x-thinking-budget-applied: true` AND a WARN line | Tokenizer encoded `<think>`/`</think>` at pre-flight but failed at per-request attach | The streaming header is pre-flight (emitted before the engine runs). Trust the WARN log + `thinking_budget_noop_total` counter over the streaming header when they disagree. Non-streaming headers are authoritative. |
 
 Alert on the log rate of `thinking_token_budget=… but processor could not be attached` — a non-zero rate means a configuration problem in production. The in-process counter `vllm_mlx.metrics.thinking_budget_noop_total` also increments for every no-op.
+
+### Validating live servers across models
+
+For ad-hoc checks that a specific model honors the budget, use the matrix runner:
+
+```bash
+# Single model, inline args:
+python scripts/thinking_budget_matrix.py \
+    --url http://127.0.0.1:8099 \
+    --model mlx-community/Qwen3-0.6B-8bit \
+    --name qwen3-0.6b --family supported \
+    --out /tmp/report.md
+
+# Multi-model run from a config (see tests/data/thinking_budget_matrix.example.json):
+python scripts/thinking_budget_matrix.py --config matrix.json --out /tmp/report.md
+```
+
+The runner sweeps budgets (`None, 0, 64, 512, 2048`) against each server, emits a markdown table with per-cell timing/tokens/header, and runs family-appropriate pass/fail evaluation (e.g., "budget=0 reasoning ≤ budget=64 reasoning", "no-op family returns `header=false`"). Exit code is non-zero if any cell had an HTTP error.
+
+The same matrix drives the pytest integration suite — `tests/test_thinking_budget_matrix.py` asserts the invariants automatically. Run via:
+
+```bash
+THINKING_BUDGET_MATRIX=/path/to/matrix.json \
+    pytest tests/test_thinking_budget_matrix.py -m integration -v
+```
+
+Tests are marked `integration` and skipped by default (no running-server dependency at CI collect time).

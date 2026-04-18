@@ -135,7 +135,18 @@ def openai_to_anthropic(
     choice = response.choices[0] if response.choices else None
 
     if choice:
-        # Add text content
+        # Emit thinking block first when the reasoning parser populated .reasoning.
+        # Matches Anthropic's public API and the streaming path
+        # (server.py:1991-2032).
+        if choice.message.reasoning:
+            content.append(
+                AnthropicResponseContentBlock(
+                    type="thinking",
+                    thinking=choice.message.reasoning,
+                )
+            )
+
+        # Add text content (existing behavior).
         if choice.message.content:
             content.append(
                 AnthropicResponseContentBlock(

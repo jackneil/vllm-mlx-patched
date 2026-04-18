@@ -100,8 +100,12 @@ class AnthropicUsage(BaseModel):
 class AnthropicResponseContentBlock(BaseModel):
     """A content block in the Anthropic response."""
 
-    type: str  # "text" or "tool_use"
+    type: str  # "text" | "thinking" | "tool_use"
     text: str | None = None
+    # Populated when type == "thinking" — the reasoning content from the
+    # attached reasoning parser's extracted <think>...</think> span.
+    # Distinct from text so clients can segment reasoning from the answer.
+    thinking: str | None = None
     # tool_use fields
     id: str | None = None
     name: str | None = None

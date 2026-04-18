@@ -17,14 +17,20 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
 
-class EffortSource(StrEnum):
+class EffortSource(str, Enum):
     """Which input field produced the resolved budget. Emitted as the
-    `x-thinking-budget-source` response header."""
+    `x-thinking-budget-source` response header.
+
+    Subclasses ``(str, Enum)`` rather than ``StrEnum`` for Python 3.10 compat
+    (StrEnum is 3.11+ only). Behaviorally equivalent: ``EffortSource.DEFAULT
+    == "default"`` is True, and the server's header emission uses
+    ``source.value`` so the wire format is identical either way.
+    """
 
     TOP_LEVEL = "top_level"
     ANTHROPIC_THINKING_DISABLED = "anthropic_thinking_disabled"

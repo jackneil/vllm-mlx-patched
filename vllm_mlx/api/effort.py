@@ -122,7 +122,17 @@ def resolve_effort(
                 thinking_type,
             )
 
-    # 5. output_config.effort and 6. reasoning_effort handled in Tasks 3-4.
+    # 5. Anthropic output_config.effort (Claude Code wire format).
+    if isinstance(output_config, dict):
+        raw_effort = output_config.get("effort")
+        if raw_effort is not None:
+            resolved = _resolve_effort_string(
+                raw_effort, context_window, EffortSource.OUTPUT_CONFIG_EFFORT,
+            )
+            if resolved is not None:
+                return resolved
+
+    # 6. reasoning_effort handled in Task 4.
 
     # 7. Default.
     return ResolvedBudget(
@@ -131,3 +141,43 @@ def resolve_effort(
         max_tokens_floor=None,
         effort_label=None,
     )
+
+
+def _resolve_effort_string(
+    raw_effort: str,
+    context_window: int,
+    source: EffortSource,
+) -> ResolvedBudget | None:
+    """Look up an effort-style string in the table. Returns None if the string
+    is unknown (caller falls through to lower precedence / DEFAULT).
+
+    Preserves the raw client string in `effort_label` so the header reflects
+    what the client actually sent (e.g., "minimal" not "low").
+    """
+    canonical = _EFFORT_ALIASES.get(raw_effort, raw_effort)
+
+    if canonical == "max":
+        budget = min(context_window // 2, _MAX_BUDGET_CAP)
+        # max_tokens_floor: 2x budget, capped at 2x _MAX_BUDGET_CAP
+        floor = min(budget * 2, _MAX_BUDGET_CAP * 2)
+        return ResolvedBudget(
+            budget=budget,
+            source=source,
+            max_tokens_floor=floor,
+            effort_label=raw_effort,
+        )
+
+    if canonical in _EFFORT_TABLE:
+        budget, floor = _EFFORT_TABLE[canonical]
+        return ResolvedBudget(
+            budget=budget,
+            source=source,
+            max_tokens_floor=floor,
+            effort_label=raw_effort,
+        )
+
+    logger.warning(
+        "Unknown effort=%r (source=%s); falling through to DEFAULT.",
+        raw_effort, source,
+    )
+    return None

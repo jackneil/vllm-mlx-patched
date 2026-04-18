@@ -90,3 +90,94 @@ def test_default_when_no_signals():
     assert result.source == EffortSource.DEFAULT
     assert result.max_tokens_floor is None
     assert result.effort_label is None
+
+
+# -----------------------------------------------------------------------------
+# Precedence: Anthropic output_config.effort
+# -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("effort,expected_budget,expected_floor", [
+    ("low",    512,   2048),
+    ("medium", 2048,  4096),
+    ("high",   8192,  16384),
+    ("xhigh",  16384, 32768),
+])
+def test_output_config_effort_table_lookup(effort, expected_budget, expected_floor):
+    result = resolve_effort(output_config={"effort": effort})
+    assert result.budget == expected_budget
+    assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
+    assert result.max_tokens_floor == expected_floor
+    assert result.effort_label == effort
+
+
+def test_output_config_effort_max_with_small_context():
+    """max = min(context_window // 2, _MAX_BUDGET_CAP). 32k ctx → 16k budget."""
+    result = resolve_effort(
+        output_config={"effort": "max"},
+        context_window=32768,
+    )
+    assert result.budget == 16384
+    assert result.max_tokens_floor == 32768
+    assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
+    assert result.effort_label == "max"
+
+
+def test_output_config_effort_max_capped_at_65k():
+    """max = min(context_window // 2, 65536). 1M ctx → still 65536."""
+    result = resolve_effort(
+        output_config={"effort": "max"},
+        context_window=1_000_000,
+    )
+    assert result.budget == 65536
+    assert result.max_tokens_floor is not None
+    assert result.effort_label == "max"
+
+
+@pytest.mark.parametrize("alias,canonical", [
+    ("minimal", "low"),
+    ("normal",  "medium"),
+])
+def test_output_config_effort_synonyms(alias, canonical):
+    """minimal → low, normal → medium."""
+    result = resolve_effort(output_config={"effort": alias})
+    expected_budget, expected_floor = _EFFORT_TABLE[canonical]
+    assert result.budget == expected_budget
+    assert result.max_tokens_floor == expected_floor
+    assert result.effort_label == alias  # preserve the raw client string
+
+
+def test_output_config_effort_unknown_falls_through_to_default():
+    """Unknown effort string logs WARN, returns DEFAULT — does not error."""
+    result = resolve_effort(output_config={"effort": "absurdly_high"})
+    assert result.budget is None
+    assert result.source == EffortSource.DEFAULT
+
+
+def test_output_config_without_effort_key_is_default():
+    """output_config present but no effort key = default."""
+    result = resolve_effort(output_config={"other": "thing"})
+    assert result.budget is None
+    assert result.source == EffortSource.DEFAULT
+
+
+# -----------------------------------------------------------------------------
+# Precedence: output_config LOSES to higher-precedence signals
+# -----------------------------------------------------------------------------
+
+def test_output_config_effort_loses_to_top_level():
+    result = resolve_effort(
+        top_level_budget=111,
+        output_config={"effort": "max"},
+        context_window=32768,
+    )
+    assert result.budget == 111
+    assert result.source == EffortSource.TOP_LEVEL
+
+
+def test_output_config_effort_loses_to_thinking_enabled():
+    result = resolve_effort(
+        anthropic_thinking={"type": "enabled", "budget_tokens": 222},
+        output_config={"effort": "high"},
+    )
+    assert result.budget == 222
+    assert result.source == EffortSource.ANTHROPIC_THINKING_ENABLED

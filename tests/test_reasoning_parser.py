@@ -109,12 +109,19 @@ class TestQwen3Parser:
         assert reasoning is None
         assert content == output
 
-    def test_only_start_tag_no_reasoning(self, parser):
-        """Qwen3 requires both tags - missing end tag means no reasoning."""
+    def test_only_start_tag_truncated_reasoning(self, parser):
+        """Truncated thinking (budget/max_tokens cut before </think>) must be
+        surfaced as reasoning, not leaked into content.
+
+        Regression: Qwen3 used to short-circuit `(None, text)` when </think>
+        was missing, causing `<think>[thinking...]` to appear as user-facing
+        content when thinking_token_budget / max_tokens truncated the emission
+        before the closing tag was produced.
+        """
         output = "<think>Started thinking but never finished"
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        assert reasoning == "Started thinking but never finished"
+        assert content is None
 
     def test_only_end_tag_implicit_mode(self, parser):
         """Qwen3 supports implicit mode - when <think> is in prompt, only </think> in output."""
@@ -652,13 +659,12 @@ class TestQwen3SpecificCases:
         assert reasoning == "some text"
         assert content == "more text"
 
-        # Only start tag - no </think> means model is still generating
-        # Qwen3 requires </think> to extract reasoning (treats as pure content until then)
+        # Only start tag - truncated thinking (budget/max_tokens hit before </think>)
+        # MUST surface as reasoning, not leak into content.
         output2 = "<think>incomplete reasoning"
         reasoning, content = parser.extract_reasoning(output2)
-        # No </think> = no reasoning extraction, entire output is content
-        assert reasoning is None
-        assert content == output2
+        assert reasoning == "incomplete reasoning"
+        assert content is None
 
     def test_qwen3_empty_think_tags(self, parser):
         """Test empty think tags."""

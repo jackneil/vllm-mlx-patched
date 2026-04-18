@@ -109,6 +109,27 @@ silently degrade to raw-text output.
    contract. Any client that uses vLLM upstream's field names works
    unchanged against vllm-mlx.
 
+10. **mlx_lm >= 0.31.2 `BatchGenerator` split batches.**
+    vllm_mlx requires `mlx_lm.generate.BatchGenerator` to expose
+    `_prompt_batch` and `_generation_batch` (the 0.31.2+ structure).
+    The pre-0.31.2 single `active_batch` attribute is no longer
+    supported. The helper `vllm_mlx.scheduler._active_batches(bg)` is
+    the canonical way to access active batches — direct references to
+    `bg.active_batch`, `bg._prompt_batch`, or `bg._generation_batch`
+    are forbidden outside the helper itself (and inside
+    `_install_mtp` / `_install_chunked_prefill`, which remain as
+    legacy code gated at their call sites; see `_ALLOWLIST_FUNCS`
+    in `tests/test_mlx_lm_api_contract.py` for the exact allowlist).
+    The sentinel at `tests/test_mlx_lm_api_contract.py` walks
+    `scheduler.py`'s AST to enforce this.
+    `Scheduler._create_batch_generator` fails fast at startup with
+    `RuntimeError` if the installed mlx_lm does not expose
+    `_generation_batch`, and logs
+    `"[BatchGenerator] invariant #10 upheld"` on success.
+    MTP (`_install_mtp`) is version-gated at the call site and emits
+    a WARN on 0.31.2+ — speculative decoding is disabled there until
+    the MTP port lands in a follow-up plan.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

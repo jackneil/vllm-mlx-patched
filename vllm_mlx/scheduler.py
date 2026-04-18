@@ -43,6 +43,13 @@ _BG_INIT_PARAMS: Set[str] = set(
     inspect.signature(BatchGenerator.__init__).parameters.keys()
 )
 
+# One-shot flag for the invariant-#10 startup breadcrumb. Set to True
+# after the first successful `_create_batch_generator` call. Subsequent
+# recreations (e.g. on sampler-params change, scheduler.py:1523) skip
+# the INFO log so `grep "invariant #10 upheld"` returns exactly one
+# match per running server.
+_INVARIANT_10_LOGGED: bool = False
+
 
 def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
     """Filter kwargs to those accepted by BatchGenerator.__init__.
@@ -1358,6 +1365,38 @@ class Scheduler:
                 prompt_progress_callback=_prefill_progress,
             )
         )
+        # mlx_lm API contract (pinned by UPSTREAM_PIN.md invariant #10):
+        # 0.31.2+ splits the single `active_batch` slot into
+        # _prompt_batch + _generation_batch. Fail fast with a clear,
+        # version-identified message if the installed mlx_lm is too old,
+        # rather than AttributeError-ing on every engine step mid-decode.
+        if not hasattr(bg, "_generation_batch"):
+            import mlx_lm as _mlx_lm_mod
+            _installed_v = getattr(_mlx_lm_mod, "__version__", "unknown")
+            raise RuntimeError(
+                "vllm_mlx requires mlx_lm >= 0.31.2 (BatchGenerator must "
+                "expose _prompt_batch + _generation_batch). "
+                f"Installed mlx_lm version: {_installed_v}. "
+                "Upgrade with: pip install -U 'mlx-lm>=0.31.2'  "
+                "(or pin vllm_mlx to a release compatible with your "
+                "mlx_lm)."
+            )
+        # Positive-signal breadcrumb: surface the invariant upheld in
+        # the log so on-call engineers can distinguish a fixed server
+        # from a stale backup running pre-fix code. Grep for
+        # "invariant #10 upheld" to confirm this server has the fix.
+        # Gated by a module-level flag so it fires exactly ONCE per
+        # process lifetime — recreation on sampler-params change would
+        # otherwise spam the log.
+        global _INVARIANT_10_LOGGED
+        if not _INVARIANT_10_LOGGED:
+            import mlx_lm as _mlx_lm_mod
+            logger.info(
+                "[BatchGenerator] invariant #10 upheld (mlx_lm %s split "
+                "_prompt_batch + _generation_batch detected)",
+                getattr(_mlx_lm_mod, "__version__", "unknown"),
+            )
+            _INVARIANT_10_LOGGED = True
         # Always set the progress callback as an attribute. In older mlx_lm
         # releases this was a constructor kwarg (filtered out above on
         # newer releases); chunked-prefill installs below read it via

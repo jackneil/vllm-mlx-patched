@@ -142,6 +142,38 @@ class TestProcessorStateMachine:
         forced = _forced_token(p, [1, 2])  # think_count=2, force
         assert forced == 200
 
+    def test_budget_zero_with_prompt_injected_think_forces_on_first_step(self):
+        """Regression: when the chat template pre-injects ``<think>`` into
+        the prompt (e.g. Qwen3.6/Qwen3.5) AND budget=0, the processor
+        must force ``</think>`` on the VERY FIRST generation step — not
+        leak the model's freely-sampled token through.
+
+        Bug found post-PR #7 on live Qwen3.6-35B: prompt ends in
+        ``...<|im_start|>assistant\\n<think>\\n``. _init_from_prompt
+        correctly detects prompt-side ``<think>`` and sets
+        ``_in_end=True`` at construction. But the old ``_advance_state``
+        advanced ``_end_count`` on arrival of ANY new token, so the
+        model's first (unbiased) sample was incorrectly counted as the
+        forced ``</think>``, leaving ``_in_end=False`` and never actually
+        biasing the logits.
+
+        This test pins: budget=0 + prompt ending in <think> + first
+        __call__ with any generated token must force ``</think>``.
+        """
+        prompt = [5, 6, 100]  # prompt ends with <think> (id 100)
+        p = _make_processor(budget=0, prompt_ids=prompt)
+        # After init: _in_end=True (budget=0 + <think> in prompt).
+        # Step 1: the model's logits pass through the processor before
+        # sampling. The processor must bias </think> (id 200) on this
+        # very first call — the first generated token should be forced.
+        forced = _forced_token(p, [99])  # 99 = arbitrary model sample
+        assert forced == 200, (
+            f"budget=0 with prompt-injected <think> must force </think> "
+            f"on step 1; got forced={forced}. "
+            f"Likely regression: _advance_state is incrementing _end_count "
+            f"on non-force-sequence tokens."
+        )
+
     def test_tokens_arg_is_generated_only_not_prompt_plus_output(self):
         """Regression: mlx_lm.generate.BatchGenerator 0.31+ passes ONLY the
         generated tokens (TokenBuffer seeded empty), NOT prompt + generated.

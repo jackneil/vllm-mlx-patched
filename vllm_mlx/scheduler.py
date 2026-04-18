@@ -70,7 +70,7 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
     return accepted
 
 
-def _active_batches(bg):
+def _active_batches(bg) -> list:
     """Return non-empty currently-active mlx_lm BatchGenerator batches.
 
     mlx_lm >= 0.31.2 replaced the single ``active_batch`` slot with
@@ -88,6 +88,13 @@ def _active_batches(bg):
         Zero, one, or two batch objects with ``len(batch) > 0``. Batches
         are returned in prompt-first order (prompt batch if active,
         then generation batch if active).
+
+    Note for refactors
+    ------------------
+    Callers iterate the returned list (e.g. ``for batch in
+    _active_batches(bg): ...``) and may also inspect truthiness. Do NOT
+    convert this to a generator — callers rely on list semantics for
+    repeat iteration and the batches are O(1) small (max 2 items).
     """
     out = []
     for name in ("_prompt_batch", "_generation_batch"):
@@ -736,6 +743,17 @@ def _install_mtp(
     DO NOT remove or weaken the version gate at the call site without
     first porting _mtp_step and _mtp_next to the split-batch API. If
     you do, every decode step will crash with AttributeError on 0.31.2+.
+
+    DO NOT delete this function in a cleanup PR without ALSO removing
+    the still-live caller at Scheduler._create_batch_generator (the
+    ``_install_mtp(bg, ...)`` line inside the `if self.config.enable_mtp:`
+    block) — grep for ``_install_mtp(`` to find it. The call site is
+    gated on ``hasattr(bg, "_generation_batch")``; under mlx_lm < 0.31.2
+    the startup assertion prevents reaching that branch, but under any
+    pinned-older install you would break MTP with a ``NameError``.
+
+    Canonical access to split batches: ``_active_batches(bg)`` defined
+    at the top of this module.
 
     -----
 

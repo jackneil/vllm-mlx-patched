@@ -300,6 +300,52 @@ def _save_prefix_cache_to_disk() -> None:
         logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
 
 
+class _PrefixCacheEndpointAdapter:
+    """Thin adapter that exposes .clear() and .get_stats() for HTTP endpoints.
+
+    The real prefix cache (MemoryAwarePrefixCache / PrefixCacheManager /
+    BlockAwarePrefixCache) lives on the scheduler and is not directly exposed
+    by BatchedEngine. This adapter bridges the gap so GET /v1/cache/stats and
+    DELETE /v1/cache can operate on it uniformly.
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+
+    def _scheduler(self):
+        # BatchedEngine._engine is an AsyncEngineCore; its .engine is the core
+        # engine that owns the scheduler.
+        core = getattr(self._engine, "_engine", None)
+        if core is None:
+            return None
+        inner = getattr(core, "engine", None) or core
+        return getattr(inner, "scheduler", None)
+
+    def get_stats(self):
+        """Return whichever cache-tier stats the scheduler reports."""
+        scheduler = self._scheduler()
+        if scheduler is None:
+            return None
+        # Prefer explicit get_cache_stats(); fall back to inspecting cache objs.
+        if hasattr(scheduler, "get_cache_stats"):
+            return scheduler.get_cache_stats()
+        for attr in ("memory_aware_cache", "block_aware_cache", "prefix_cache"):
+            cache = getattr(scheduler, attr, None)
+            if cache is not None and hasattr(cache, "get_stats"):
+                return cache.get_stats()
+        return None
+
+    def clear(self):
+        """Clear every prefix cache tier the scheduler holds."""
+        scheduler = self._scheduler()
+        if scheduler is None:
+            return
+        for attr in ("memory_aware_cache", "block_aware_cache", "prefix_cache"):
+            cache = getattr(scheduler, attr, None)
+            if cache is not None and hasattr(cache, "clear"):
+                cache.clear()
+
+
 def _get_cache_dir() -> str:
     """Get cache persistence directory based on actual model path."""
     # Use _model_path (actual model path) not _model_name (which may be overridden
@@ -330,6 +376,15 @@ async def lifespan(app: FastAPI):
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
+
+    # Expose prefix cache to HTTP endpoints via app.state. The adapter is safe
+    # to attach unconditionally — it no-ops when no scheduler / cache tier is
+    # actually present. Endpoints still use getattr(..., None) defensively so
+    # a missing attribute (in tests that clear state) is handled gracefully.
+    if _engine is not None:
+        app.state.prefix_cache = _PrefixCacheEndpointAdapter(_engine)
+    else:
+        app.state.prefix_cache = None
 
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
@@ -757,7 +812,23 @@ async def status():
 
 @app.get("/v1/cache/stats")
 async def cache_stats():
-    """Get cache statistics for debugging and monitoring."""
+    """Get cache statistics for debugging and monitoring.
+
+    Surfaces whichever cache tiers are actually present on this server:
+    - LLM prefix cache (MemoryAwarePrefixCache) when running an LLM
+    - mlx_vlm multimodal tiers (KV / pixel-values / PIL) when running a VLM
+    """
+    stats: dict[str, object] = {}
+
+    # LLM prefix cache stats — only present when the engine exposes one.
+    prefix_cache = getattr(app.state, "prefix_cache", None)
+    if prefix_cache is not None:
+        try:
+            stats["llm_prefix_cache"] = prefix_cache.get_stats()
+        except Exception as e:
+            stats["llm_prefix_cache_error"] = str(e)
+
+    # mlx_vlm multimodal stats — only importable when serving a VLM.
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
@@ -765,18 +836,33 @@ async def cache_stats():
             get_pixel_values_cache_stats,
         )
 
-        return {
-            "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
-            "pixel_values_cache": get_pixel_values_cache_stats(),
-            "pil_image_cache": get_pil_cache_stats(),
-        }
+        stats["multimodal_kv_cache"] = get_multimodal_kv_cache_stats()
+        stats["pixel_values_cache"] = get_pixel_values_cache_stats()
+        stats["pil_image_cache"] = get_pil_cache_stats()
     except ImportError:
-        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+        pass  # not a VLM server; not an error
+
+    if not stats:
+        return {"error": "No cache tiers present"}
+    return stats
 
 
 @app.delete("/v1/cache")
 async def clear_cache():
-    """Clear all caches."""
+    """Clear all caches held by this server (LLM prefix + mlx_vlm tiers)."""
+    cleared: list[str] = []
+    errors: list[str] = []
+
+    # LLM prefix cache (MemoryAwarePrefixCache) — only present when configured.
+    prefix_cache = getattr(app.state, "prefix_cache", None)
+    if prefix_cache is not None:
+        try:
+            prefix_cache.clear()
+            cleared.append("llm_prefix")
+        except Exception as e:
+            errors.append(f"llm_prefix: {e}")
+
+    # mlx_vlm multimodal caches — only importable when serving a VLM.
     try:
         from mlx_vlm.utils import (
             clear_multimodal_kv_cache,
@@ -785,12 +871,15 @@ async def clear_cache():
 
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
-        return {
-            "status": "cleared",
-            "caches": ["multimodal_kv", "pixel_values", "pil_image"],
-        }
+        cleared.extend(["multimodal_kv", "pixel_values", "pil_image"])
     except ImportError:
-        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+        pass  # not a VLM server; not an error
+
+    return {
+        "status": "cleared" if cleared else "noop",
+        "caches": cleared,
+        "errors": errors or None,
+    }
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])

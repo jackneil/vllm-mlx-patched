@@ -127,18 +127,49 @@ class TestProcessorStateMachine:
     def test_prompt_pre_injection_detected(self):
         """Prompt has <think> at end; first output counts as thinking.
 
-        mlx_lm.BatchGenerator passes FULL history (prompt + output). Test
-        inputs below include the prompt [5, 6, 100] followed by the
-        output tokens — matching the production contract.
+        mlx_lm.BatchGenerator passes ONLY GENERATED tokens to the
+        processor (0.31+). The processor uses ``prompt_token_ids`` at
+        construction time to detect implicit-think mode, then counts
+        generated tokens against the budget.
         """
         prompt = [5, 6, 100]  # prompt ends in <think> (id 100)
         p = _make_processor(budget=2, prompt_ids=prompt)
-        # In _init_from_prompt: think_count = 3 - (2+1) = 0 (post-<think> is empty).
-        # Step 1: output=[1] → think_count=1.
-        # Step 2: output=[1, 2] → think_count=2, budget hit, force.
-        _forced_token(p, prompt + [1])            # think_count=1
-        forced = _forced_token(p, prompt + [1, 2])  # think_count=2, force
+        # _init_from_prompt: prompt ends with <think> → _in_think=True,
+        # _think_count = 3 - (2+1) = 0 (no tokens after <think> in prompt).
+        # Step 1: generated=[1] → _think_count=1.
+        # Step 2: generated=[1, 2] → _think_count=2, budget hit, force.
+        _forced_token(p, [1])            # think_count=1
+        forced = _forced_token(p, [1, 2])  # think_count=2, force
         assert forced == 200
+
+    def test_tokens_arg_is_generated_only_not_prompt_plus_output(self):
+        """Regression: mlx_lm.generate.BatchGenerator 0.31+ passes ONLY the
+        generated tokens (TokenBuffer seeded empty), NOT prompt + generated.
+        If the processor slices by ``_prompt_len`` it skips past the actual
+        output and never sees ``<think>``, silently disabling enforcement.
+
+        This test passes generated-only tokens of length less than the
+        (meaningful) prompt_ids length. Under the broken contract, the
+        slice ``token_list[prompt_len:]`` would yield an empty list and
+        budget=0 would never fire. Under the correct contract, ``<think>``
+        at position 0 of generated output triggers the budget check and
+        forces ``</think>`` on the next step.
+        """
+        # prompt_ids carries 5 tokens of context for the processor's
+        # constructor (no <think> at end, so _init_from_prompt stays in
+        # not-thinking state). The state machine in __call__ must ignore
+        # prompt_len when examining the `tokens` arg — which is
+        # generated-only.
+        p = _make_processor(budget=0, prompt_ids=[10, 11, 12, 13, 14])
+        # Generated=[<think>]: state enters thinking, budget=0 hits
+        # immediately, force should fire on THIS call.
+        forced = _forced_token(p, [100])
+        assert forced == 200, (
+            f"budget=0 failed to force </think> after <think> in generated "
+            f"output; got forced={forced}. Likely regression of the "
+            f"prompt_len slicing bug — the processor is examining "
+            f"output[prompt_len:] and never seeing <think> at position 0."
+        )
 
     def test_multi_token_end_sequence(self):
         """End delimiter is multiple tokens — processor forces each in turn."""

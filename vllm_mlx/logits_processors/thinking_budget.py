@@ -161,17 +161,21 @@ class ThinkingTokenBudgetLogitsProcessor:
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """Return modified logits.
 
-        `tokens` is the FULL token history for this request (prompt + output)
-        as an mx.array of ints. We separate prompt from output by the
-        recorded prompt length.
+        `tokens` contract (mlx_lm.generate.BatchGenerator, 0.31+):
+        ``tokens`` is a per-request TokenBuffer view containing ONLY the
+        tokens generated so far (it is seeded empty and grows one token
+        per decode step). It does **not** include the prompt. Accordingly
+        we do not slice by ``_prompt_len`` — the whole buffer is the
+        "output" the state machine needs to scan.
+
+        Note: earlier mlx_lm versions passed prompt + generated here;
+        if you rebase against a version that reverts that behavior, the
+        state machine will mis-count prompt tokens as thinking tokens
+        unless this method is updated in concert.
         """
         # Convert to Python list for the state machine. mlx arrays don't
         # support the slicing/indexing idioms the state machine uses.
-        # mlx_lm.BatchGenerator contract: tokens is the FULL history
-        # (prompt + generated output). We slice by the recorded prompt
-        # length to get the output-only tail.
-        token_list = tokens.tolist()
-        output = token_list[self._prompt_len :]
+        output = tokens.tolist()
 
         self._advance_state(output)
 

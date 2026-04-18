@@ -119,7 +119,30 @@ Since the code isn't shared, alignment is done at three layers:
 
 - **Upstream vllm-mlx may at some point merge a subset of upstream vLLM's v1 engine** (the platform-plugin hook exists for this). If/when that happens, this repo's `vllm_mlx/plugin.py` and `vllm_platform.py` are the integration point. Until then, we run standalone.
 - **Apple's `mlx-lm` could absorb more of what `vllm_mlx/scheduler.py` does** (continuous batching at the mlx-lm layer). The `_bg_kwargs` filter (`vllm_mlx/scheduler.py:42-63`) exists because mlx-lm's `BatchGenerator` signature moves between releases — we're already tolerant of that churn.
-- **`thinking_token_budget` on the MLLM path** is the first follow-up to the current feature branch: plumb `logits_processors` through `MLLMBatchGenerator._step()` so the feature works for VLMs too.
+- **`thinking_token_budget` on the MLLM path** is the first follow-up to the current feature branch. See "Extending thinking_token_budget to MLLM" below.
+
+## Extending thinking_token_budget to MLLM
+
+`thinking_token_budget` enforcement is text-only today (by design). The VLM / audio path is a loud no-op: the server logs a WARN, increments `metrics.thinking_budget_noop_total`, and emits `x-thinking-budget-applied: false`. This is an **internal patch**, not an mlx_lm fork — the generator that needs the hook lives in this repo.
+
+**Where the gap is:** `vllm_mlx/mllm_batch_generator.py:MLLMBatchGenerator` (lines 252, 386 `insert`, 906 `next`) owns its own sampler (`self.sampler`, line 334) and samples directly from `logits` / `logprobs` at two sites (lines 670 for prefill, 773 for decode). It does **not** accept a per-request `logits_processors` kwarg on `insert()` the way mlx_lm's text `BatchGenerator` does, and there is no per-request pre-sample hook that `MLLMScheduler` could populate.
+
+**Minimum patch (three files, additive):**
+
+1. **`vllm_mlx/mllm_batch_generator.py`** — extend `insert()` signature to accept `logits_processors: Optional[List[Callable]] = None` per request, store them on the per-request state keyed by `uid`, and apply them immediately before the sampler at the two sample sites (lines 670 and 773). Shape contract: `processor(tokens: mx.array, logits: mx.array) -> mx.array`, same as the text path's mlx_lm `BatchGenerator` contract.
+
+2. **`vllm_mlx/mllm_scheduler.py`** — in the request admit path (analogous to `Scheduler._maybe_attach_thinking_budget` at `scheduler.py:1689`), call `_attach_thinking_budget_processor` and pass the returned processor into `MLLMBatchGenerator.insert(..., logits_processors=[proc])`. The helper at `scheduler.py:72` is already generator-agnostic — it only needs tokenizer + reasoning parser + budget + optional message.
+
+3. **`vllm_mlx/engine/batched.py`** — remove the MLLM early-out in the budget-WARN path (currently increments `thinking_budget_noop_total` for all MLLM requests). Gate it on whether the reasoning parser's start/end delimiters are single-token for the MLLM's tokenizer (the same pre-flight check the text path runs via `_streaming_header_value`'s `engine_supports_budget` flag).
+
+**Tests to add alongside:**
+- Unit: `MLLMBatchGenerator.insert(logits_processors=[...])` stores per-request processors and applies them before `self.sampler` at both sites.
+- Sentinel: extend `tests/test_thinking_budget_rebase_sentinel.py` with an MLLM-path sentinel that asserts the processor is attached when a VLM request sets `thinking_token_budget` and the parser resolves to single-token delimiters.
+- Integration (gated): add an MLLM cell to `tests/test_thinking_budget_integration.py` to exercise the end-to-end flow.
+
+**Rebase risk:** LOW. `MLLMBatchGenerator` is a repo-local class — upstream mlx_lm has nothing equivalent, so this won't conflict on rebase against `waybarrios/vllm-mlx`. Document as invariant #10 in `UPSTREAM_PIN.md` once landed. The only cross-cutting concern is that the reasoning parser property contract (invariant #5) must hold for VLM tokenizers; today it does for Qwen3-VL (single-token `<think>`/`</think>`). Gemma 4 VLMs use a channel protocol and won't benefit from this port — same limitation as GPT-OSS on text.
+
+**Scope estimate:** one afternoon. The processor, scheduler attach helper, metric, header emission, and WARN plumbing all exist. Only the hook inside `MLLMBatchGenerator._step()` is missing.
 
 ## References
 

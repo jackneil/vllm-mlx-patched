@@ -426,3 +426,133 @@ def test_anthropic_messages_path_honors_budget(spec: ModelSpec) -> None:
     # Soft latency check — Anthropic path shouldn't be dramatically
     # slower than OpenAI.
     assert elapsed < _TIMEOUT_SEC * 0.5
+
+
+# ----- Provider-effort-unification: new input dialects ----------------
+#
+# These rows pin the end-to-end wiring of the resolver introduced in the
+# provider-effort-unification branch. Each case sends a distinct dialect
+# (output_config.effort low/medium/high/xhigh, thinking.adaptive,
+# top-level precedence over effort, OpenAI reasoning_effort) and asserts
+# on the two new response headers:
+#   x-thinking-budget-source   — which input field won precedence
+#   x-thinking-budget-resolved — the int (or "none") the resolver produced
+#
+# Unit coverage lives in tests/test_effort_resolver.py and
+# tests/test_thinking_budget_headers.py; this file is the HTTP-layer
+# smoke test that ties Pydantic validation → resolver → header emission
+# together against a live server.
+
+_MESSAGES_DIALECT_CASES: list[tuple[dict, str, str]] = [
+    # (body_patch, expected_source, expected_budget_str)
+    ({"output_config": {"effort": "low"}},    "output_config_effort",        "512"),
+    ({"output_config": {"effort": "medium"}}, "output_config_effort",        "2048"),
+    ({"output_config": {"effort": "high"}},   "output_config_effort",        "8192"),
+    ({"output_config": {"effort": "xhigh"}},  "output_config_effort",        "16384"),
+    ({"thinking": {"type": "adaptive"}},      "anthropic_thinking_adaptive", "none"),
+    # top-level budget MUST win even when effort="max" is also sent.
+    ({
+        "thinking_token_budget": 777,
+        "output_config": {"effort": "max"},
+    },                                         "top_level",                   "777"),
+]
+
+
+def _dialect_ids(case: tuple[dict, str, str]) -> str:
+    return case[1]
+
+
+@pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
+@pytest.mark.parametrize(
+    "body_patch,expected_source,expected_budget_str",
+    _MESSAGES_DIALECT_CASES,
+    ids=[c[1] for c in _MESSAGES_DIALECT_CASES],
+)
+def test_messages_header_matrix(
+    spec: ModelSpec,
+    body_patch: dict,
+    expected_source: str,
+    expected_budget_str: str,
+) -> None:
+    """HTTP-level matrix: every new Anthropic input dialect produces the
+    documented source + resolved header values against a live server.
+
+    This does NOT assert on generation behavior — just that the request
+    parsed, reached the resolver, and the resolver's answer rode back
+    out on the response headers. Generation-behavior invariants live in
+    the tests above (ordering, budget=0 latency, etc.).
+    """
+    _require_matrix()
+
+    body: dict[str, Any] = {
+        "model": spec.model,
+        "messages": [{"role": "user", "content": PROMPT_TRIVIAL}],
+        "max_tokens": 32,
+        "temperature": 0.3,
+        **body_patch,
+    }
+    resp = requests.post(
+        f"{spec.url}/v1/messages",
+        json=body,
+        timeout=_TIMEOUT_SEC,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert resp.headers.get("x-thinking-budget-source") == expected_source, (
+        f"{spec.name}: dialect={body_patch!r} — expected source="
+        f"{expected_source!r}, got "
+        f"{resp.headers.get('x-thinking-budget-source')!r}"
+    )
+    assert resp.headers.get("x-thinking-budget-resolved") == expected_budget_str, (
+        f"{spec.name}: dialect={body_patch!r} — expected resolved="
+        f"{expected_budget_str!r}, got "
+        f"{resp.headers.get('x-thinking-budget-resolved')!r}"
+    )
+
+
+@pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
+@pytest.mark.parametrize(
+    "reasoning_effort,expected_budget_str",
+    [
+        ("low",    "512"),
+        ("medium", "2048"),
+        ("high",   "8192"),
+    ],
+)
+def test_chat_completions_reasoning_effort(
+    spec: ModelSpec,
+    reasoning_effort: str,
+    expected_budget_str: str,
+) -> None:
+    """OpenAI reasoning_effort round-trips end-to-end.
+
+    The /v1/chat/completions path accepts reasoning_effort natively;
+    this pins that it flows through ChatCompletionRequest → resolver →
+    response headers with the documented budget values.
+    """
+    _require_matrix()
+
+    body: dict[str, Any] = {
+        "model": spec.model,
+        "messages": [{"role": "user", "content": PROMPT_TRIVIAL}],
+        "max_tokens": 32,
+        "temperature": 0.3,
+        "reasoning_effort": reasoning_effort,
+    }
+    resp = requests.post(
+        f"{spec.url}/v1/chat/completions",
+        json=body,
+        timeout=_TIMEOUT_SEC,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert resp.headers.get("x-thinking-budget-source") == "reasoning_effort", (
+        f"{spec.name}: reasoning_effort={reasoning_effort!r} — expected "
+        f"source=reasoning_effort, got "
+        f"{resp.headers.get('x-thinking-budget-source')!r}"
+    )
+    assert resp.headers.get("x-thinking-budget-resolved") == expected_budget_str, (
+        f"{spec.name}: reasoning_effort={reasoning_effort!r} — expected "
+        f"resolved={expected_budget_str!r}, got "
+        f"{resp.headers.get('x-thinking-budget-resolved')!r}"
+    )

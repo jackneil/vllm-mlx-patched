@@ -94,6 +94,9 @@ class Cell:
     max_tokens: int
     completion_tokens: int | None
     prompt_tokens: int | None
+    reasoning_chars: int  # separated so budget enforcement is visible
+    content_chars: int
+    finish_reason: str | None
     elapsed_s: float
     tokens_per_sec: float
     header: str | None
@@ -173,6 +176,9 @@ def _run_cell(
             max_tokens=max_tokens,
             completion_tokens=None,
             prompt_tokens=None,
+            reasoning_chars=0,
+            content_chars=0,
+            finish_reason=None,
             elapsed_s=0.0,
             tokens_per_sec=0.0,
             header=None,
@@ -185,6 +191,8 @@ def _run_cell(
     msg = choice.get("message") or {}
     usage = data.get("usage") or {}
     comp_toks = usage.get("completion_tokens") or 0
+    reasoning_raw = msg.get("reasoning") or ""
+    content_raw = msg.get("content") or ""
     combined = _combined_output(msg)
     correct = _check_answer(combined, task.answer_patterns)
     tps = (comp_toks / elapsed) if elapsed > 0 else 0.0
@@ -195,6 +203,9 @@ def _run_cell(
         task_kind=task.kind,
         budget_label=budget_label,
         budget_val=budget_val,
+        reasoning_chars=len(reasoning_raw),
+        content_chars=len(content_raw),
+        finish_reason=choice.get("finish_reason"),
         max_tokens=max_tokens,
         completion_tokens=comp_toks,
         prompt_tokens=usage.get("prompt_tokens"),
@@ -261,9 +272,10 @@ def _log_cell(c: Cell) -> None:
         return
     verdict = "✓" if c.correct else "✗"
     print(
-        f"{verdict} tokens={c.completion_tokens:>4} "
+        f"{verdict} tok={c.completion_tokens:>4} "
+        f"r_c={c.reasoning_chars:>5} c_c={c.content_chars:>5} "
         f"t={c.elapsed_s:>5.1f}s tps={c.tokens_per_sec:>5.1f} "
-        f"hdr={c.header!s:<5} "
+        f"fin={c.finish_reason!s:<6} hdr={c.header!s:<5} "
         f"out={c.output_first_60!r}",
         file=sys.stderr,
     )
@@ -292,16 +304,16 @@ def _make_markdown(cells: list[Cell]) -> str:
         lines.append(f"## {name}")
         lines.append("")
         lines.append(
-            "| task | budget | header | correct | tokens | elapsed | tok/s | output preview |"
+            "| task | budget | header | ✓ | tokens | r_chars | c_chars | finish | elapsed | tok/s | preview |"
         )
         lines.append(
-            "|------|--------|--------|---------|--------|---------|-------|-----------------|"
+            "|------|--------|--------|---|--------|---------|---------|--------|---------|-------|---------|"
         )
         for c in group:
             err = c.error or ""
             if err:
                 lines.append(
-                    f"| {c.task_id} | {c.budget_label} | — | ⚠ | — | — | — | "
+                    f"| {c.task_id} | {c.budget_label} | — | ⚠ | — | — | — | — | — | — | "
                     f"ERR: {err[:50]} |"
                 )
                 continue
@@ -309,8 +321,8 @@ def _make_markdown(cells: list[Cell]) -> str:
             preview = c.output_first_60.replace("|", "\\|")
             lines.append(
                 f"| {c.task_id} | {c.budget_label} | `{c.header}` | {mark} | "
-                f"{c.completion_tokens} | {c.elapsed_s}s | "
-                f"{c.tokens_per_sec} | `{preview}` |"
+                f"{c.completion_tokens} | {c.reasoning_chars} | {c.content_chars} | "
+                f"{c.finish_reason} | {c.elapsed_s}s | {c.tokens_per_sec} | `{preview}` |"
             )
         lines.append("")
 
@@ -318,31 +330,45 @@ def _make_markdown(cells: list[Cell]) -> str:
     lines.append("## Summary across all models")
     lines.append("")
     lines.append(
-        "| model | budget | cells | correct | avg tokens | avg elapsed | avg tok/s | header pattern |"
+        "**Budget enforcement signal:** compare `avg r_chars` (reasoning chars)"
+        " across `off` / `low` / `high` / `none`. A working budget should"
+        " produce monotonically increasing reasoning: `off < low < high`,"
+        " with `none` roughly matching `high` (natural length)."
+    )
+    lines.append("")
+    lines.append(
+        "| model | budget | cells | ✓ | avg tokens | avg r_chars | avg c_chars | avg elapsed | avg tok/s | header |"
     )
     lines.append(
-        "|-------|--------|-------|---------|------------|-------------|-----------|---------------|"
+        "|-------|--------|-------|---|------------|-------------|-------------|-------------|-----------|--------|"
     )
     for name, group in by_model.items():
         by_budget: dict[str, list[Cell]] = {}
         for c in group:
             by_budget.setdefault(c.budget_label, []).append(c)
-        for label, cells_in in by_budget.items():
+        # Order budgets consistently: off, low, high, none
+        order = ["off", "low", "high", "none"]
+        for label in order:
+            if label not in by_budget:
+                continue
+            cells_in = by_budget[label]
             ok = [c for c in cells_in if not c.error]
             if not ok:
                 lines.append(
-                    f"| {name} | {label} | {len(cells_in)} | - | - | - | - | all errors |"
+                    f"| {name} | {label} | {len(cells_in)} | - | - | - | - | - | - | all errors |"
                 )
                 continue
             n_correct = sum(1 for c in ok if c.correct)
             avg_toks = sum(c.completion_tokens or 0 for c in ok) / len(ok)
+            avg_r = sum(c.reasoning_chars for c in ok) / len(ok)
+            avg_c = sum(c.content_chars for c in ok) / len(ok)
             avg_elapsed = sum(c.elapsed_s for c in ok) / len(ok)
             avg_tps = sum(c.tokens_per_sec for c in ok) / len(ok)
             headers_seen = sorted(set(c.header or "absent" for c in ok))
             lines.append(
                 f"| {name} | {label} | {len(ok)} | {n_correct}/{len(ok)} | "
-                f"{avg_toks:.0f} | {avg_elapsed:.1f}s | "
-                f"{avg_tps:.1f} | {','.join(headers_seen)} |"
+                f"{avg_toks:.0f} | {avg_r:.0f} | {avg_c:.0f} | "
+                f"{avg_elapsed:.1f}s | {avg_tps:.1f} | {','.join(headers_seen)} |"
             )
     lines.append("")
     return "\n".join(lines)

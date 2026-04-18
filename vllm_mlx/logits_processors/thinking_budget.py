@@ -99,7 +99,18 @@ class ThinkingTokenBudgetLogitsProcessor:
                 self._end_count = 0
 
     def _advance_state(self, output: List[int]) -> None:
-        """Update state from the full output-tokens list (excludes prompt)."""
+        """Update think-tracking state from the full output-tokens list.
+
+        Does NOT manage ``_end_count`` — that counter is advanced inside
+        ``__call__`` at the moment of forcing, so the force-sequence is
+        always in lockstep with the tokens we actually bias. (Previously
+        this method would increment ``_end_count`` on arrival of ANY new
+        token, which caused a subtle off-by-one when ``_init_from_prompt``
+        set ``_in_end=True`` before the first ``__call__``: the model's
+        first freely-sampled token was miscounted as part of the force
+        sequence, so ``</think>`` never actually got biased. See
+        ``test_budget_zero_with_prompt_injected_think_forces_on_first_step``.)
+        """
         cur_len = len(output)
         if cur_len <= self._prev_output_len:
             return
@@ -108,13 +119,9 @@ class ThinkingTokenBudgetLogitsProcessor:
         self._prev_output_len = cur_len
 
         if self._in_end:
-            # We are emitting the force sequence. Advance by len(new_tokens).
-            self._end_count += len(new_tokens)
-            if self._end_count >= len(self._force_sequence):
-                # Full sequence emitted — leave end mode and reset.
-                self._in_end = False
-                self._end_count = 0
-                self._think_count = 0
+            # End-mode accounting is owned by __call__ now. Don't touch
+            # _end_count here. Returning early preserves the old "when
+            # we're forcing, skip think-state scanning" behavior.
             return
 
         # Scan the recent output window for start/end occurrences.
@@ -181,8 +188,18 @@ class ThinkingTokenBudgetLogitsProcessor:
 
         if self._in_end and self._end_count < len(self._force_sequence):
             forced_id = self._force_sequence[self._end_count]
-            # +1e9 on the forced id; sampler's argmax / softmax picks it.
-            # Use mx.scatter-style update: add a one-hot bias vector.
+            # Advance the force-sequence counter IN LOCKSTEP with the
+            # bias. mlx_lm will sample the biased logits and on the NEXT
+            # __call__ the forced token appears in ``output`` — but we
+            # deliberately do NOT re-count it there (see _advance_state's
+            # docstring). This keeps the force sequence synchronized even
+            # when ``_in_end`` was set by ``_init_from_prompt`` before
+            # any __call__ has run.
+            self._end_count += 1
+            if self._end_count >= len(self._force_sequence):
+                self._in_end = False
+                self._end_count = 0
+                self._think_count = 0
             vocab = logits.shape[-1]
             bias = mx.zeros(vocab, dtype=logits.dtype)
             bias[forced_id] = _FORCE_BIAS

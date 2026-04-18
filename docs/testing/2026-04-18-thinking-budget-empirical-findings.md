@@ -78,19 +78,17 @@ Server ran with temporary `__call__` logging enabled. Found:
 
 ## Quirks — deeper analysis
 
-### Quirk #1: reasoning parser doesn't split when no message is set (T2, T6)
+### Quirk #1: reasoning parser leaked truncated `<think>` into content ✅ FIXED
 
-**Symptom:** with `thinking_token_budget=64` (no message), the response's `reasoning` field is empty and `content` contains the full output including the literal `<think>` tag.
+**Symptom:** with `thinking_token_budget=64` (no message), the response's `reasoning` field was empty and `content` contained the full output including the literal `<think>` tag.
 
-**Hypothesis:** the force-emitted `</think>` token arrives in a streaming-detokenizer state the parser's state machine didn't expect. Specifically:
-- Normal generation: model emits `<think>`, streams tokens, emits `</think>`, streams answer. Parser sees predictable transition.
-- Force-emitted close: bias pushes `</think>` logit to +1e9 mid-sentence. The parser sees it but the surrounding context (reasoning text before + answer text after) isn't on clean token boundaries, so the parser may treat the whole thing as content.
+**Root cause:** `Qwen3ReasoningParser.extract_reasoning` short-circuited to `(None, full_text)` whenever `</think>` was absent from the output. When budget (or `max_tokens`) cut generation before the close tag could be emitted, the partial reasoning + literal `<think>` tag leaked into the user-visible `content` field.
 
-**Reproducibility:** happens on ~30% of runs. A follow-up probe at budget=40 / max_tokens=200 extracted cleanly. Suspect model-output variation.
+**Fix (commit `55d25cf` on `main`):** only short-circuit to pure-content when NEITHER tag is present. If `<think>` is present but `</think>` is missing, fall through to the base class's Case 3 which returns `(reasoning=content_after_<think>, content=None)` — the correct behavior for truncated thinking.
 
-**Fix hypothesis:** the streaming reasoning parser's `extract_reasoning_streaming` has a `start_in_prev`/`end_in_delta` state-machine that assumes end token appears in a separate delta from the preceding reasoning content. When budget forces `</think>` within the same step as trailing reasoning tokens, it may mis-route. Not urgent — using `thinking_budget_message` avoids it entirely (T5 clean).
+**Regression coverage:** `tests/test_reasoning_parser.py::TestQwen3Parser::test_only_start_tag_truncated_reasoning` + `TestQwen3SpecificCases::test_qwen3_implicit_mode_support` both pin the fixed behavior.
 
-**Severity:** LOW. Workaround: always set `thinking_budget_message`. Track for a v2 fix.
+**Severity at discovery:** LOW with workaround (set `thinking_budget_message`). Now resolved; workaround no longer required.
 
 ### Quirk #2: T3 timeout with budget=256 (not reproduced)
 
@@ -114,7 +112,7 @@ Server ran with temporary `__call__` logging enabled. Found:
 
 ## Known limitations (from PR #2 + discovered here)
 
-- Reasoning parser occasionally fails to split `<think>` tags when budget forces close without a message (Quirk #1)
+- ~~Reasoning parser occasionally fails to split `<think>` tags when budget forces close without a message (Quirk #1)~~ — fixed in commit `55d25cf`
 - Intermittent decode slowdown at large budgets (Quirk #2)
 - MLLM path no enforcement (by design)
 - SimpleEngine no enforcement (by design — requires `--continuous-batching`)
@@ -124,9 +122,9 @@ Server ran with temporary `__call__` logging enabled. Found:
 
 1. **Merge PR #3 first** (`fix/mlx-lm-0.31-api-drift`). Without it, text+continuous-batching doesn't work — any PR #2 verification is blocked.
 2. **Merge PR #2** after PR #3. Core feature works empirically.
-3. **Document Quirk #1** in `docs/guides/reasoning.md`: "For cleanest output, set `thinking_budget_message` when using `thinking_token_budget`."
-4. **Track Quirk #2** as tech debt; optimize `_find_last_subsequence` in a follow-up.
-5. **Arena integration**: the arena proxy should add a `thinking_token_budget` slider that maps to low=512/med=2048/high=8192 and always sets `thinking_budget_message="Wrap up and answer now."` to avoid Quirk #1.
+3. ~~**Document Quirk #1** in `docs/guides/reasoning.md`: "For cleanest output, set `thinking_budget_message` when using `thinking_token_budget`."~~ — fixed at parser level; no doc workaround needed.
+4. **Track Quirk #2** as tech debt. Note: `_find_last_subsequence` already operates on a windowed slice in steady-state (`len(recent) ≈ 1 + max(start_len, end_len)`), so the O(n·m) concern was overstated. Residual slowdown at budget=256 remains unexplained.
+5. **Arena integration**: the arena proxy can add a `thinking_token_budget` slider mapped to low=512/med=2048/high=8192. `thinking_budget_message` is now optional (set it for graceful wrap-up UX, not for output correctness).
 
 ## Infrastructure actions taken today
 

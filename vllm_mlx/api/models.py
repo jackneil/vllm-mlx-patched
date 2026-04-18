@@ -219,6 +219,13 @@ class ChatCompletionRequest(BaseModel):
     # on the decode hot path (DCR Wave-3 finding).
     thinking_budget_message: str | None = Field(default=None, max_length=2048)
 
+    # OpenAI-native reasoning effort knob for o1/o3-family clients. Normalized
+    # through vllm_mlx.api.effort.resolve_effort. Accepted values include
+    # "low" | "medium" | "high" per OpenAI spec, plus "xhigh" | "max" and
+    # the synonyms "minimal" | "normal" via the shared effort table.
+    # Unknown strings WARN and fall through to DEFAULT rather than erroring.
+    reasoning_effort: str | None = None
+
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""

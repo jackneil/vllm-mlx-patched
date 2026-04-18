@@ -63,6 +63,33 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
     return accepted
 
 
+def _active_batches(bg):
+    """Return non-empty currently-active mlx_lm BatchGenerator batches.
+
+    mlx_lm >= 0.31.2 replaced the single ``active_batch`` slot with
+    split ``_prompt_batch`` (prefill) and ``_generation_batch`` (decode)
+    attributes. Either or both may be non-empty during pipelined work.
+    This helper is the canonical access point — direct references to
+    the removed ``bg.active_batch`` attribute are forbidden, and direct
+    access to ``bg._prompt_batch`` or ``bg._generation_batch`` outside
+    this helper is also forbidden (pinned by ``UPSTREAM_PIN.md``
+    invariant #10 and ``tests/test_mlx_lm_api_contract.py``).
+
+    Returns
+    -------
+    list
+        Zero, one, or two batch objects with ``len(batch) > 0``. Batches
+        are returned in prompt-first order (prompt batch if active,
+        then generation batch if active).
+    """
+    out = []
+    for name in ("_prompt_batch", "_generation_batch"):
+        b = getattr(bg, name, None)
+        if b is not None and len(b) > 0:
+            out.append(b)
+    return out
+
+
 # Upper bound on tokenized thinking_budget_message length. The Pydantic
 # field caps raw chars at 2048, but adversarial unicode can tokenize at
 # >1 token/byte for some BPE tokenizers. This is a defense-in-depth cap.
@@ -2533,15 +2560,16 @@ class Scheduler:
 
         self._step_count += 1
         if self._step_count % effective_interval == 0:
-            # Evaluate batch tokens to collapse lazy concatenation chains
-            if (
-                self.batch_generator is not None
-                and self.batch_generator.active_batch is not None
-                and hasattr(self.batch_generator.active_batch, "tokens")
-            ):
-                tokens = self.batch_generator.active_batch.tokens
-                if tokens:
-                    mx.eval(*tokens)
+            # Collapse lazy concatenation chains on active batch tokens.
+            # In mlx_lm 0.31.2+ the BatchGenerator exposes prompt +
+            # generation batches separately; either or both may be
+            # active during pipelined work. See _active_batches() at
+            # top of module.
+            if self.batch_generator is not None:
+                for batch in _active_batches(self.batch_generator):
+                    tokens = getattr(batch, "tokens", None)
+                    if tokens:
+                        mx.eval(*tokens)
             mx.clear_cache()
 
         # Periodically log memory stats for monitoring

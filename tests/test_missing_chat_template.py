@@ -8,7 +8,6 @@ a plain-text prompt format instead of crashing.
 """
 
 
-
 class FakeProcessorNoTemplate:
     """Simulates a HuggingFace processor with no chat_template set."""
 
@@ -25,10 +24,14 @@ class FakeProcessorNoTemplate:
 class FakeProcessorWithTemplate:
     """Simulates a working processor for comparison."""
 
-    chat_template = "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}"
+    chat_template = (
+        "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}"
+    )
 
     def apply_chat_template(self, messages, **kwargs):
-        return "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        return (
+            "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        )
 
 
 class TestBatchedEngineChatTemplateFallback:

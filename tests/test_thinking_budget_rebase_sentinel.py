@@ -111,17 +111,22 @@ class TestThinkingBudgetSentinel:
         DCR Wave-3: Wave-2 sentinel only covered the Anthropic handler,
         but invariant #9 claims both chat-completion handlers emit the
         header. Deleting the OpenAI emission silently passed all 63
-        tests before this assertion."""
+        tests before this assertion.
+
+        Task 9 refactored emission to go through `_build_thinking_budget_headers`,
+        which also emits x-thinking-budget-resolved/source/max-tokens-floor.
+        The sentinel now counts calls to that helper (>=2 = streaming +
+        non-streaming branches)."""
         import inspect
 
         from vllm_mlx import server
 
         src = inspect.getsource(server.create_chat_completion)
-        occurrences = src.count("x-thinking-budget-applied")
+        occurrences = src.count("_build_thinking_budget_headers")
         assert occurrences >= 2, (
-            f"create_chat_completion regression: x-thinking-budget-applied "
+            f"create_chat_completion regression: _build_thinking_budget_headers "
             f"appears only {occurrences} time(s) — expected >=2 (streaming + "
-            f"non-streaming branches)."
+            f"non-streaming branches). Clients lose budget-enforcement signal."
         )
 
     def test_streaming_header_call_sites_bind_engine_type(self):
@@ -162,18 +167,23 @@ class TestThinkingBudgetSentinel:
         Response/JSONResponse headers). `_stream_anthropic_messages` is
         the generator that yields SSE event bodies — it doesn't set
         HTTP headers.
+
+        Task 9 refactored emission to go through `_build_thinking_budget_headers`,
+        which also emits x-thinking-budget-resolved/source/max-tokens-floor.
+        The sentinel now counts calls to that helper (>=2 = streaming +
+        non-streaming branches).
         """
         import inspect
 
         from vllm_mlx import server
 
         src = inspect.getsource(server.create_anthropic_message)
-        # The header literal must appear at least twice: once for the
+        # The helper call must appear at least twice: once for the
         # streaming branch (StreamingResponse headers dict) and once for
         # the non-streaming branch (Response headers dict).
-        occurrences = src.count("x-thinking-budget-applied")
+        occurrences = src.count("_build_thinking_budget_headers")
         assert occurrences >= 2, (
-            f"create_anthropic_message regression: x-thinking-budget-applied "
+            f"create_anthropic_message regression: _build_thinking_budget_headers "
             f"appears only {occurrences} time(s) — expected >=2 (streaming + "
             f"non-streaming branches). Clients lose budget-enforcement signal."
         )

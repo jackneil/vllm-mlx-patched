@@ -60,6 +60,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -196,6 +197,38 @@ def _streaming_header_value(
     if reasoning_parser is None:
         return "false"
     return "true"
+
+
+def _build_thinking_budget_headers(
+    resolved: ResolvedBudget,
+    applied: bool | None,
+) -> dict[str, str]:
+    """Build the four x-thinking-budget-* response headers from a ResolvedBudget.
+
+    `applied` is the pre-existing bool/None the emission sites were computing
+    before this change (based on whether the logits processor attached and the
+    family can enforce). It stays separate because applied = "did it actually
+    work" != resolved = "what did we decide to try."
+    """
+    headers: dict[str, str] = {}
+
+    # 1. x-thinking-budget-applied (existing header, unchanged semantics).
+    if applied is not None:
+        headers["x-thinking-budget-applied"] = "true" if applied else "false"
+
+    # 2. x-thinking-budget-resolved — the int (or "none") the resolver produced.
+    headers["x-thinking-budget-resolved"] = (
+        str(resolved.budget) if resolved.budget is not None else "none"
+    )
+
+    # 3. x-thinking-budget-source — which field won precedence.
+    headers["x-thinking-budget-source"] = resolved.source.value
+
+    # 4. x-thinking-budget-max-tokens-floor — recommended min max_tokens.
+    if resolved.max_tokens_floor is not None:
+        headers["x-thinking-budget-max-tokens-floor"] = str(resolved.max_tokens_floor)
+
+    return headers
 
 
 def _anthropic_budget_requested(anthropic_request) -> bool:
@@ -1562,6 +1595,30 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
     )
 
+    # Resolve thinking budget from all provider-dialect signals. This also
+    # wires OpenAI `reasoning_effort` into the engine path (previously only
+    # the Anthropic adapter called the resolver).
+    # TODO(context_window): thread from loaded model config.
+    _resolved_budget = resolve_effort(
+        top_level_budget=request.thinking_token_budget,
+        anthropic_thinking=None,        # not on OpenAI path
+        output_config=None,             # not on OpenAI path
+        reasoning_effort=request.reasoning_effort,
+        context_window=131072,
+    )
+    # If reasoning_effort supplied a budget and top-level did not, propagate
+    # the resolved value downstream so the engine sees it.
+    if (
+        request.thinking_token_budget is None
+        and _resolved_budget.budget is not None
+        and _resolved_budget.source != EffortSource.DEFAULT
+    ):
+        request.thinking_token_budget = _resolved_budget.budget
+        chat_kwargs["thinking_token_budget"] = _resolved_budget.budget
+        # A resolved budget from reasoning_effort also counts as "requested"
+        # for header-emission purposes.
+        budget_was_requested = True
+
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
@@ -1577,7 +1634,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
             )
-            stream_headers["x-thinking-budget-applied"] = streaming_applied
+            stream_headers.update(
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=(streaming_applied == "true"),
+                )
+            )
+        elif _resolved_budget.source != EffortSource.DEFAULT:
+            # Resolver produced a non-default value (e.g. reasoning_effort)
+            # even though budget_was_requested is False. Emit diagnostic
+            # headers but skip x-thinking-budget-applied (applied=None).
+            stream_headers.update(
+                _build_thinking_budget_headers(_resolved_budget, applied=None)
+            )
         return StreamingResponse(
             _disconnect_guard(
                 stream_chat_completion(engine, messages, request, **chat_kwargs),
@@ -1666,9 +1735,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         applied = getattr(output, "thinking_budget_applied", None)
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
-            headers={
-                "x-thinking-budget-applied": "true" if applied is True else "false"
-            },
+            headers=_build_thinking_budget_headers(
+                _resolved_budget,
+                applied=(applied is True),
+            ),
+        )
+
+    # Resolver produced a non-default value (e.g. from reasoning_effort) but
+    # budget_was_requested was False — surface diagnostic headers so callers
+    # see what the resolver chose, without claiming enforcement status.
+    if _resolved_budget.source != EffortSource.DEFAULT:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            content=chat_response.model_dump(mode="json", exclude_none=True),
+            headers=_build_thinking_budget_headers(_resolved_budget, applied=None),
         )
 
     return chat_response
@@ -1750,19 +1831,33 @@ async def create_anthropic_message(
     )
     logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
-    # Convert Anthropic request -> OpenAI request. The adapter now returns
-    # a (ChatCompletionRequest, ResolvedBudget) tuple; Task 9 will wire the
-    # resolved budget into x-thinking-* response headers at this site.
-    # TODO(Task 9): plumb real context_window from the loaded model config.
+    # Convert Anthropic request -> OpenAI request. The adapter returns
+    # a (ChatCompletionRequest, ResolvedBudget) tuple; we wire the resolved
+    # budget into x-thinking-* response headers at both emission sites below.
+    # TODO(context_window): plumb real context_window from the loaded model
+    # config (the adapter defaults to 131072 today).
     openai_request, _resolved_budget = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
         if _anthropic_budget_requested(anthropic_request):
-            headers["x-thinking-budget-applied"] = _streaming_header_value(
+            streaming_applied = _streaming_header_value(
                 is_mllm=getattr(engine, "_is_mllm", False),
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
+            headers.update(
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=(streaming_applied == "true"),
+                )
+            )
+        elif _resolved_budget.source != EffortSource.DEFAULT:
+            # Resolver produced a non-default value (e.g. output_config.effort)
+            # without a nested thinking dict / top-level budget — surface
+            # diagnostic headers without claiming enforcement status.
+            headers.update(
+                _build_thinking_budget_headers(_resolved_budget, applied=None)
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -1848,11 +1943,21 @@ async def create_anthropic_message(
 
     # Convert to Anthropic response
     anthropic_response = openai_to_anthropic(openai_response, _model_name)
-    _resp_headers = {}
+    _resp_headers: dict[str, str] = {}
     if _anthropic_budget_requested(anthropic_request):
         applied = getattr(output, "thinking_budget_applied", None)
-        _resp_headers["x-thinking-budget-applied"] = (
-            "true" if applied is True else "false"
+        _resp_headers.update(
+            _build_thinking_budget_headers(
+                _resolved_budget,
+                applied=(applied is True),
+            )
+        )
+    elif _resolved_budget.source != EffortSource.DEFAULT:
+        # Resolver produced a non-default value (e.g. output_config.effort)
+        # without a nested thinking dict / top-level budget — surface
+        # diagnostic headers without claiming enforcement status.
+        _resp_headers.update(
+            _build_thinking_budget_headers(_resolved_budget, applied=None)
         )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),

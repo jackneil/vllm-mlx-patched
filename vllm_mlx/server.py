@@ -1525,6 +1525,32 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if _msg is not None:
         chat_kwargs["thinking_budget_message"] = _msg
 
+    # Sizing guardrail: thinking_token_budget must fit inside max_tokens
+    # with headroom for user-facing content. Without this check, a client
+    # can set budget=8192 + max_tokens=1024 and the model will self-truncate
+    # mid-thinking, producing garbage/cut-off answers that look worse than
+    # no thinking at all. We WARN rather than reject because some clients
+    # legitimately want reasoning-heavy output with minimal content.
+    _MIN_CONTENT_HEADROOM = 256  # reasonable short-answer floor
+    if _budget is not None and _budget > 0 and request.max_tokens is not None:
+        if request.max_tokens <= _budget:
+            logger.warning(
+                "thinking_token_budget=%d >= max_tokens=%d — impossible to "
+                "honor both; thinking will consume the entire generation "
+                "window and content will be truncated or empty. Set "
+                "max_tokens >= thinking_token_budget + %d for content "
+                "headroom.",
+                _budget, request.max_tokens, _MIN_CONTENT_HEADROOM,
+            )
+        elif request.max_tokens - _budget < _MIN_CONTENT_HEADROOM:
+            logger.warning(
+                "thinking_token_budget=%d leaves only %d tokens of content "
+                "headroom under max_tokens=%d. Response content may be "
+                "truncated. Set max_tokens >= %d for safer sizing.",
+                _budget, request.max_tokens - _budget, request.max_tokens,
+                _budget + _MIN_CONTENT_HEADROOM,
+            )
+
     # Was a budget requested by the client? Used to decide whether to emit
     # the x-thinking-budget-applied response header for both streaming and
     # non-streaming paths.

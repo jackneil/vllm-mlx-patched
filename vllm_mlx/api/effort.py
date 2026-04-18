@@ -132,7 +132,13 @@ def resolve_effort(
             if resolved is not None:
                 return resolved
 
-    # 6. reasoning_effort handled in Task 4.
+    # 6. OpenAI reasoning_effort.
+    if reasoning_effort is not None:
+        resolved = _resolve_effort_string(
+            reasoning_effort, context_window, EffortSource.REASONING_EFFORT,
+        )
+        if resolved is not None:
+            return resolved
 
     # 7. Default.
     return ResolvedBudget(

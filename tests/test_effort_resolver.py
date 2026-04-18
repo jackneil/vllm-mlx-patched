@@ -181,3 +181,45 @@ def test_output_config_effort_loses_to_thinking_enabled():
     )
     assert result.budget == 222
     assert result.source == EffortSource.ANTHROPIC_THINKING_ENABLED
+
+
+# -----------------------------------------------------------------------------
+# Precedence: OpenAI reasoning_effort
+# -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("effort,expected_budget", [
+    ("low",    512),
+    ("medium", 2048),
+    ("high",   8192),
+])
+def test_reasoning_effort_openai_levels(effort, expected_budget):
+    result = resolve_effort(reasoning_effort=effort)
+    assert result.budget == expected_budget
+    assert result.source == EffortSource.REASONING_EFFORT
+    assert result.effort_label == effort
+
+
+def test_reasoning_effort_accepts_xhigh_via_same_table():
+    """Permissive: OpenAI spec only defines low/medium/high, but we accept
+    xhigh from OpenAI-extension clients via the same table."""
+    result = resolve_effort(reasoning_effort="xhigh")
+    assert result.budget == 16384
+    assert result.source == EffortSource.REASONING_EFFORT
+
+
+def test_reasoning_effort_unknown_falls_through_to_default():
+    result = resolve_effort(reasoning_effort="bogus")
+    assert result.source == EffortSource.DEFAULT
+    assert result.budget is None
+
+
+def test_reasoning_effort_loses_to_output_config():
+    """output_config.effort comes first in precedence (Anthropic-path caller),
+    reasoning_effort is OpenAI-path only — but the resolver doesn't know the
+    path, so precedence decides."""
+    result = resolve_effort(
+        output_config={"effort": "low"},
+        reasoning_effort="high",
+    )
+    assert result.budget == 512
+    assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT

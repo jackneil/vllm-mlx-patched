@@ -60,6 +60,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -198,6 +199,38 @@ def _streaming_header_value(
     return "true"
 
 
+def _build_thinking_budget_headers(
+    resolved: ResolvedBudget,
+    applied: bool | None,
+) -> dict[str, str]:
+    """Build the four x-thinking-budget-* response headers from a ResolvedBudget.
+
+    `applied` is the pre-existing bool/None the emission sites were computing
+    before this change (based on whether the logits processor attached and the
+    family can enforce). It stays separate because applied = "did it actually
+    work" != resolved = "what did we decide to try."
+    """
+    headers: dict[str, str] = {}
+
+    # 1. x-thinking-budget-applied (existing header, unchanged semantics).
+    if applied is not None:
+        headers["x-thinking-budget-applied"] = "true" if applied else "false"
+
+    # 2. x-thinking-budget-resolved — the int (or "none") the resolver produced.
+    headers["x-thinking-budget-resolved"] = (
+        str(resolved.budget) if resolved.budget is not None else "none"
+    )
+
+    # 3. x-thinking-budget-source — which field won precedence.
+    headers["x-thinking-budget-source"] = resolved.source.value
+
+    # 4. x-thinking-budget-max-tokens-floor — recommended min max_tokens.
+    if resolved.max_tokens_floor is not None:
+        headers["x-thinking-budget-max-tokens-floor"] = str(resolved.max_tokens_floor)
+
+    return headers
+
+
 def _anthropic_budget_requested(anthropic_request) -> bool:
     """Return True iff the Anthropic request asked for a thinking budget
     via EITHER the vllm-mlx extension field `thinking_token_budget` OR
@@ -267,6 +300,52 @@ def _save_prefix_cache_to_disk() -> None:
         logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
 
 
+class _PrefixCacheEndpointAdapter:
+    """Thin adapter that exposes .clear() and .get_stats() for HTTP endpoints.
+
+    The real prefix cache (MemoryAwarePrefixCache / PrefixCacheManager /
+    BlockAwarePrefixCache) lives on the scheduler and is not directly exposed
+    by BatchedEngine. This adapter bridges the gap so GET /v1/cache/stats and
+    DELETE /v1/cache can operate on it uniformly.
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+
+    def _scheduler(self):
+        # BatchedEngine._engine is an AsyncEngineCore; its .engine is the core
+        # engine that owns the scheduler.
+        core = getattr(self._engine, "_engine", None)
+        if core is None:
+            return None
+        inner = getattr(core, "engine", None) or core
+        return getattr(inner, "scheduler", None)
+
+    def get_stats(self):
+        """Return whichever cache-tier stats the scheduler reports."""
+        scheduler = self._scheduler()
+        if scheduler is None:
+            return None
+        # Prefer explicit get_cache_stats(); fall back to inspecting cache objs.
+        if hasattr(scheduler, "get_cache_stats"):
+            return scheduler.get_cache_stats()
+        for attr in ("memory_aware_cache", "block_aware_cache", "prefix_cache"):
+            cache = getattr(scheduler, attr, None)
+            if cache is not None and hasattr(cache, "get_stats"):
+                return cache.get_stats()
+        return None
+
+    def clear(self):
+        """Clear every prefix cache tier the scheduler holds."""
+        scheduler = self._scheduler()
+        if scheduler is None:
+            return
+        for attr in ("memory_aware_cache", "block_aware_cache", "prefix_cache"):
+            cache = getattr(scheduler, attr, None)
+            if cache is not None and hasattr(cache, "clear"):
+                cache.clear()
+
+
 def _get_cache_dir() -> str:
     """Get cache persistence directory based on actual model path."""
     # Use _model_path (actual model path) not _model_name (which may be overridden
@@ -297,6 +376,15 @@ async def lifespan(app: FastAPI):
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
+
+    # Expose prefix cache to HTTP endpoints via app.state. The adapter is safe
+    # to attach unconditionally — it no-ops when no scheduler / cache tier is
+    # actually present. Endpoints still use getattr(..., None) defensively so
+    # a missing attribute (in tests that clear state) is handled gracefully.
+    if _engine is not None:
+        app.state.prefix_cache = _PrefixCacheEndpointAdapter(_engine)
+    else:
+        app.state.prefix_cache = None
 
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
@@ -464,9 +552,7 @@ def _parse_tool_calls_with_parser(
             tokenizer = _engine._tokenizer
         parser = parser_cls(tokenizer)
     except Exception as e:
-        logger.warning(
-            f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
-        )
+        logger.warning(f"Failed to initialize tool parser '{_tool_call_parser}': {e}")
         logger.warning("Falling back to generic parser")
         return parse_tool_calls(output_text, request_dict)
 
@@ -724,7 +810,23 @@ async def status():
 
 @app.get("/v1/cache/stats")
 async def cache_stats():
-    """Get cache statistics for debugging and monitoring."""
+    """Get cache statistics for debugging and monitoring.
+
+    Surfaces whichever cache tiers are actually present on this server:
+    - LLM prefix cache (MemoryAwarePrefixCache) when running an LLM
+    - mlx_vlm multimodal tiers (KV / pixel-values / PIL) when running a VLM
+    """
+    stats: dict[str, object] = {}
+
+    # LLM prefix cache stats — only present when the engine exposes one.
+    prefix_cache = getattr(app.state, "prefix_cache", None)
+    if prefix_cache is not None:
+        try:
+            stats["llm_prefix_cache"] = prefix_cache.get_stats()
+        except Exception as e:
+            stats["llm_prefix_cache_error"] = str(e)
+
+    # mlx_vlm multimodal stats — only importable when serving a VLM.
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
@@ -732,18 +834,33 @@ async def cache_stats():
             get_pixel_values_cache_stats,
         )
 
-        return {
-            "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
-            "pixel_values_cache": get_pixel_values_cache_stats(),
-            "pil_image_cache": get_pil_cache_stats(),
-        }
+        stats["multimodal_kv_cache"] = get_multimodal_kv_cache_stats()
+        stats["pixel_values_cache"] = get_pixel_values_cache_stats()
+        stats["pil_image_cache"] = get_pil_cache_stats()
     except ImportError:
-        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+        pass  # not a VLM server; not an error
+
+    if not stats:
+        return {"error": "No cache tiers present"}
+    return stats
 
 
 @app.delete("/v1/cache")
 async def clear_cache():
-    """Clear all caches."""
+    """Clear all caches held by this server (LLM prefix + mlx_vlm tiers)."""
+    cleared: list[str] = []
+    errors: list[str] = []
+
+    # LLM prefix cache (MemoryAwarePrefixCache) — only present when configured.
+    prefix_cache = getattr(app.state, "prefix_cache", None)
+    if prefix_cache is not None:
+        try:
+            prefix_cache.clear()
+            cleared.append("llm_prefix")
+        except Exception as e:
+            errors.append(f"llm_prefix: {e}")
+
+    # mlx_vlm multimodal caches — only importable when serving a VLM.
     try:
         from mlx_vlm.utils import (
             clear_multimodal_kv_cache,
@@ -752,12 +869,15 @@ async def clear_cache():
 
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
-        return {
-            "status": "cleared",
-            "caches": ["multimodal_kv", "pixel_values", "pil_image"],
-        }
+        cleared.extend(["multimodal_kv", "pixel_values", "pil_image"])
     except ImportError:
-        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+        pass  # not a VLM server; not an error
+
+    return {
+        "status": "cleared" if cleared else "noop",
+        "caches": cleared,
+        "errors": errors or None,
+    }
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
@@ -1540,27 +1660,52 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 "window and content will be truncated or empty. Set "
                 "max_tokens >= thinking_token_budget + %d for content "
                 "headroom.",
-                _budget, request.max_tokens, _MIN_CONTENT_HEADROOM,
+                _budget,
+                request.max_tokens,
+                _MIN_CONTENT_HEADROOM,
             )
         elif request.max_tokens - _budget < _MIN_CONTENT_HEADROOM:
             logger.warning(
                 "thinking_token_budget=%d leaves only %d tokens of content "
                 "headroom under max_tokens=%d. Response content may be "
                 "truncated. Set max_tokens >= %d for safer sizing.",
-                _budget, request.max_tokens - _budget, request.max_tokens,
+                _budget,
+                request.max_tokens - _budget,
+                request.max_tokens,
                 _budget + _MIN_CONTENT_HEADROOM,
             )
 
     # Was a budget requested by the client? Used to decide whether to emit
     # the x-thinking-budget-applied response header for both streaming and
     # non-streaming paths.
-    budget_was_requested = (
-        request.thinking_token_budget is not None
-        or (
-            isinstance(request.chat_template_kwargs, dict)
-            and "thinking_token_budget" in request.chat_template_kwargs
-        )
+    budget_was_requested = request.thinking_token_budget is not None or (
+        isinstance(request.chat_template_kwargs, dict)
+        and "thinking_token_budget" in request.chat_template_kwargs
     )
+
+    # Resolve thinking budget from all provider-dialect signals. This also
+    # wires OpenAI `reasoning_effort` into the engine path (previously only
+    # the Anthropic adapter called the resolver).
+    # TODO(context_window): thread from loaded model config.
+    _resolved_budget = resolve_effort(
+        top_level_budget=request.thinking_token_budget,
+        anthropic_thinking=None,  # not on OpenAI path
+        output_config=None,  # not on OpenAI path
+        reasoning_effort=request.reasoning_effort,
+        context_window=131072,
+    )
+    # If reasoning_effort supplied a budget and top-level did not, propagate
+    # the resolved value downstream so the engine sees it.
+    if (
+        request.thinking_token_budget is None
+        and _resolved_budget.budget is not None
+        and _resolved_budget.source != EffortSource.DEFAULT
+    ):
+        request.thinking_token_budget = _resolved_budget.budget
+        chat_kwargs["thinking_token_budget"] = _resolved_budget.budget
+        # A resolved budget from reasoning_effort also counts as "requested"
+        # for header-emission purposes.
+        budget_was_requested = True
 
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
@@ -1577,7 +1722,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
             )
-            stream_headers["x-thinking-budget-applied"] = streaming_applied
+            stream_headers.update(
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=(streaming_applied == "true"),
+                )
+            )
+        elif _resolved_budget.source != EffortSource.DEFAULT:
+            # Resolver produced a non-default value (e.g. reasoning_effort)
+            # even though budget_was_requested is False. Emit diagnostic
+            # headers but skip x-thinking-budget-applied (applied=None).
+            stream_headers.update(
+                _build_thinking_budget_headers(_resolved_budget, applied=None)
+            )
         return StreamingResponse(
             _disconnect_guard(
                 stream_chat_completion(engine, messages, request, **chat_kwargs),
@@ -1666,9 +1823,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         applied = getattr(output, "thinking_budget_applied", None)
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
-            headers={
-                "x-thinking-budget-applied": "true" if applied is True else "false"
-            },
+            headers=_build_thinking_budget_headers(
+                _resolved_budget,
+                applied=(applied is True),
+            ),
+        )
+
+    # Resolver produced a non-default value (e.g. from reasoning_effort) but
+    # budget_was_requested was False — surface diagnostic headers so callers
+    # see what the resolver chose, without claiming enforcement status.
+    if _resolved_budget.source != EffortSource.DEFAULT:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            content=chat_response.model_dump(mode="json", exclude_none=True),
+            headers=_build_thinking_budget_headers(_resolved_budget, applied=None),
         )
 
     return chat_response
@@ -1750,16 +1919,33 @@ async def create_anthropic_message(
     )
     logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
-    # Convert Anthropic request -> OpenAI request
-    openai_request = anthropic_to_openai(anthropic_request)
+    # Convert Anthropic request -> OpenAI request. The adapter returns
+    # a (ChatCompletionRequest, ResolvedBudget) tuple; we wire the resolved
+    # budget into x-thinking-* response headers at both emission sites below.
+    # TODO(context_window): plumb real context_window from the loaded model
+    # config (the adapter defaults to 131072 today).
+    openai_request, _resolved_budget = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
         if _anthropic_budget_requested(anthropic_request):
-            headers["x-thinking-budget-applied"] = _streaming_header_value(
+            streaming_applied = _streaming_header_value(
                 is_mllm=getattr(engine, "_is_mllm", False),
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
+            headers.update(
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=(streaming_applied == "true"),
+                )
+            )
+        elif _resolved_budget.source != EffortSource.DEFAULT:
+            # Resolver produced a non-default value (e.g. output_config.effort)
+            # without a nested thinking dict / top-level budget — surface
+            # diagnostic headers without claiming enforcement status.
+            headers.update(
+                _build_thinking_budget_headers(_resolved_budget, applied=None)
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -1845,11 +2031,21 @@ async def create_anthropic_message(
 
     # Convert to Anthropic response
     anthropic_response = openai_to_anthropic(openai_response, _model_name)
-    _resp_headers = {}
+    _resp_headers: dict[str, str] = {}
     if _anthropic_budget_requested(anthropic_request):
         applied = getattr(output, "thinking_budget_applied", None)
-        _resp_headers["x-thinking-budget-applied"] = (
-            "true" if applied is True else "false"
+        _resp_headers.update(
+            _build_thinking_budget_headers(
+                _resolved_budget,
+                applied=(applied is True),
+            )
+        )
+    elif _resolved_budget.source != EffortSource.DEFAULT:
+        # Resolver produced a non-default value (e.g. output_config.effort)
+        # without a nested thinking dict / top-level budget — surface
+        # diagnostic headers without claiming enforcement status.
+        _resp_headers.update(
+            _build_thinking_budget_headers(_resolved_budget, applied=None)
         )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
@@ -2119,7 +2315,8 @@ async def _stream_anthropic_messages(
             "Reasoning parser %s missing expected properties %r — upstream API "
             "drift? Falling back to default router (reasoning blocks will not "
             "be routed for this parser).",
-            type(_rp).__name__, _EXPECTED_PROPS,
+            type(_rp).__name__,
+            _EXPECTED_PROPS,
         )
         _start_token = "<think>"
         _end_tokens = ["</think>"]
@@ -2136,7 +2333,11 @@ async def _stream_anthropic_messages(
 
     logger.info(
         "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",
-        _parser_label, _start_token, _end_tokens, _channel_strip, _starts_thinking,
+        _parser_label,
+        _start_token,
+        _end_tokens,
+        _channel_strip,
+        _starts_thinking,
     )
 
     think_router = StreamingThinkRouter(
@@ -2330,12 +2531,16 @@ def _process_streaming_tool_delta(
     function -- a bug fix here fixes both paths.
     """
     if tool_parser is None or content is None:
-        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
     # Fast path: skip parsing until '<' seen
     if not tool_markup_possible and "<" not in content:
         tool_accumulated_text += content
-        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
     if not tool_markup_possible:
         tool_markup_possible = True
@@ -2346,12 +2551,18 @@ def _process_streaming_tool_delta(
     )
 
     if tool_result is None:
-        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            None, tool_accumulated_text, tool_markup_possible, False, None
+        )
     elif "tool_calls" in tool_result:
-        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, True, tool_result)
+        return ToolDeltaResult(
+            None, tool_accumulated_text, tool_markup_possible, True, tool_result
+        )
     else:
         new_content = tool_result.get("content", "")
-        return ToolDeltaResult(new_content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            new_content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
 
 async def stream_chat_completion(
@@ -2408,7 +2619,11 @@ async def stream_chat_completion(
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
     # tool_choice="none" prevents tool_parser init, which also guards the
     # streaming fallback block (it checks `if tool_parser`).
-    if _enable_auto_tool_choice and _tool_call_parser and getattr(request, "tool_choice", None) != "none":
+    if (
+        _enable_auto_tool_choice
+        and _tool_call_parser
+        and getattr(request, "tool_choice", None) != "none"
+    ):
         # Create per-request parser instance to avoid concurrency corruption
         try:
             parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
@@ -2488,9 +2703,7 @@ async def stream_chat_completion(
                         finish_reason=(
                             "tool_calls"
                             if (output.finished and tool_calls_detected)
-                            else (
-                                output.finish_reason if output.finished else None
-                            )
+                            else (output.finish_reason if output.finished else None)
                         ),
                     )
                 ],
@@ -2564,7 +2777,10 @@ async def stream_chat_completion(
         tool_parser
         and tool_accumulated_text
         and not tool_calls_detected
-        and ("<tool_call>" in tool_accumulated_text or "<|tool_call>" in tool_accumulated_text)
+        and (
+            "<tool_call>" in tool_accumulated_text
+            or "<|tool_call>" in tool_accumulated_text
+        )
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:

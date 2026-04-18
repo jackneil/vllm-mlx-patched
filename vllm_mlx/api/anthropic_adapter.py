@@ -19,6 +19,7 @@ from .anthropic_models import (
     AnthropicToolDef,
     AnthropicUsage,
 )
+from .effort import ResolvedBudget, resolve_effort
 from .models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -27,7 +28,10 @@ from .models import (
 )
 
 
-def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
+def anthropic_to_openai(
+    request: AnthropicRequest,
+    context_window: int = 131072,
+) -> tuple[ChatCompletionRequest, ResolvedBudget]:
     """
     Convert an Anthropic Messages API request to OpenAI Chat Completions format.
 
@@ -37,11 +41,18 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     - tool_use/tool_result → OpenAI tool_calls/tool messages
     - Anthropic tools → OpenAI tools
 
+    Returns a (ChatCompletionRequest, ResolvedBudget) tuple so the caller
+    can emit resolver-derived response headers. The ChatCompletionRequest's
+    thinking_token_budget is populated from the resolver; callers should
+    not read request.thinking_token_budget directly after this returns.
+
     Args:
         request: Anthropic Messages API request
+        context_window: model context window used for dynamic effort sizing
+            (e.g., "max" effort scales with ctx). Default 131072 when unknown.
 
     Returns:
-        OpenAI ChatCompletionRequest
+        (ChatCompletionRequest, ResolvedBudget)
     """
     messages = []
 
@@ -77,31 +88,19 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
-    # Resolve thinking budget from the two parse paths:
-    #   (a) top-level thinking_token_budget (vllm-mlx extension)
-    #   (b) Anthropic-native `thinking` dict: {"type": "enabled"|"disabled",
-    #       "budget_tokens": N}
-    # Top-level wins. For the nested form, honor type:
-    #   - type="disabled" → budget=0 (force close immediately)
-    #   - type="enabled"  → budget=budget_tokens (may be None — no cap)
-    #   - type=<anything else> → ignore (log WARN, no budget)
-    thinking_token_budget = request.thinking_token_budget
-    if thinking_token_budget is None and isinstance(request.thinking, dict):
-        thinking_type = request.thinking.get("type")
-        if thinking_type == "disabled":
-            thinking_token_budget = 0
-        elif thinking_type in ("enabled", None):
-            thinking_token_budget = request.thinking.get("budget_tokens")
-        else:
-            import logging
+    # Resolve thinking budget via the shared resolver. Replaces the old
+    # inline thinking.type + thinking_token_budget resolution block.
+    # The resolver handles top-level vs Anthropic `thinking` (including
+    # "adaptive") vs output_config.effort precedence.
+    resolved = resolve_effort(
+        top_level_budget=request.thinking_token_budget,
+        anthropic_thinking=request.thinking,
+        output_config=request.output_config,
+        reasoning_effort=None,  # not on the Anthropic path
+        context_window=context_window,
+    )
 
-            logging.getLogger(__name__).warning(
-                "Anthropic request.thinking.type=%r not recognized; "
-                "ignoring thinking config. Expected 'enabled' or 'disabled'.",
-                thinking_type,
-            )
-
-    return ChatCompletionRequest(
+    openai_req = ChatCompletionRequest(
         model=request.model,
         messages=messages,
         max_tokens=request.max_tokens,
@@ -111,9 +110,11 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         stop=request.stop_sequences,
         tools=tools,
         tool_choice=tool_choice,
-        thinking_token_budget=thinking_token_budget,
+        thinking_token_budget=resolved.budget,
         thinking_budget_message=request.thinking_budget_message,
     )
+
+    return openai_req, resolved
 
 
 def openai_to_anthropic(
@@ -134,7 +135,18 @@ def openai_to_anthropic(
     choice = response.choices[0] if response.choices else None
 
     if choice:
-        # Add text content
+        # Emit thinking block first when the reasoning parser populated .reasoning.
+        # Matches Anthropic's public API and the streaming path
+        # (server.py:1991-2032).
+        if choice.message.reasoning:
+            content.append(
+                AnthropicResponseContentBlock(
+                    type="thinking",
+                    thinking=choice.message.reasoning,
+                )
+            )
+
+        # Add text content (existing behavior).
         if choice.message.content:
             content.append(
                 AnthropicResponseContentBlock(

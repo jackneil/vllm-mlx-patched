@@ -3,7 +3,6 @@
 
 import mlx.core as mx
 import mlx.nn as nn
-import pytest
 
 from vllm_mlx.compile import apply_compile, is_compiled
 

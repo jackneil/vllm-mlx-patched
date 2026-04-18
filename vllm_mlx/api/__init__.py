@@ -75,6 +75,12 @@ from .tool_calling import (
     build_json_system_prompt,
 )
 
+from .effort import (
+    EffortSource,
+    ResolvedBudget,
+    resolve_effort,
+)
+
 __all__ = [
     # Models
     "ImageUrl",
@@ -130,4 +136,8 @@ __all__ = [
     "validate_json_schema",
     "extract_json_from_text",
     "build_json_system_prompt",
+    # Effort / budget resolver
+    "EffortSource",
+    "ResolvedBudget",
+    "resolve_effort",
 ]

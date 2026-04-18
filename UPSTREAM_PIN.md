@@ -130,6 +130,32 @@ silently degrade to raw-text output.
     a WARN on 0.31.2+ — speculative decoding is disabled there until
     the MTP port lands in a follow-up plan.
 
+### Invariant 11: Effort resolver is the single source of truth
+
+Any code path that reads `thinking_token_budget`, `thinking`, `output_config`, or `reasoning_effort` MUST call `vllm_mlx.api.effort.resolve_effort` — either directly (for OpenAI `/v1/chat/completions` endpoint) or via `anthropic_to_openai` (for `/v1/messages` endpoint, which returns a `(ChatCompletionRequest, ResolvedBudget)` tuple).
+
+Adding a new provider dialect means extending `EffortSource` + the resolver. It does NOT mean adding parallel resolution logic in an adapter, the server handler, or the logits processor.
+
+Test guard: `tests/test_effort_resolver.py` + `tests/test_anthropic_adapter_effort.py`.
+
+### Invariant 12: Four-header contract on budget-resolved responses
+
+Every chat-completion or messages response that went through the resolver MUST emit:
+- `x-thinking-budget-applied` (`true` | `false`, absent when no budget requested)
+- `x-thinking-budget-resolved` (int as string, or `"none"`)
+- `x-thinking-budget-source` (one of the `EffortSource` enum values)
+- `x-thinking-budget-max-tokens-floor` (int as string, absent when source=default or budget=0)
+
+Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` forwards the `x-thinking-` prefix to clients. Arena's admin UI reads these headers to show a per-request "effort honored" indicator.
+
+Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py`.
+
+### Invariant 13: Non-streaming Anthropic thinking-block ordering
+
+`vllm_mlx.api.anthropic_adapter.openai_to_anthropic` MUST emit a `type: "thinking"` content block BEFORE the `type: "text"` content block when `choice.message.reasoning` is populated. The ordering matches Anthropic's public API and the streaming path (`server.py:1991-2032`).
+
+Test guard: `tests/test_anthropic_adapter_thinking_block.py`.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

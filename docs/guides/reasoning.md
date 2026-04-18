@@ -2,6 +2,10 @@
 
 vllm-mlx supports reasoning models that show their thinking process before giving an answer. Models like Qwen3 and DeepSeek-R1 wrap their reasoning in `<think>...</think>` tags, and vllm-mlx can parse these tags to separate the reasoning from the final response.
 
+## See also
+
+- **[Effort and thinking budget](./effort-and-budget.md)** — full reference for the `thinking_token_budget` / `reasoning_effort` / `output_config.effort` / `thinking` knobs, their precedence, and per-family enforceability.
+
 ## Why Use Reasoning Parsing?
 
 When a reasoning model generates output, it typically looks like this:

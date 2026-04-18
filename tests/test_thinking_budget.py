@@ -13,7 +13,9 @@ class TestSamplingParamsThinkingBudget:
         assert sp.thinking_budget_message is None
 
     def test_accepts_values(self):
-        sp = SamplingParams(thinking_token_budget=512, thinking_budget_message="Wrap it up.")
+        sp = SamplingParams(
+            thinking_token_budget=512, thinking_budget_message="Wrap it up."
+        )
         assert sp.thinking_token_budget == 512
         assert sp.thinking_budget_message == "Wrap it up."
 
@@ -104,9 +106,9 @@ class TestProcessorStateMachine:
     def test_enters_think_and_forces_at_budget(self):
         p = _make_processor(budget=3)
         # Emit <think> then 3 thinking tokens — budget hit on the 3rd.
-        _forced_token(p, [100])             # enter think
-        _forced_token(p, [100, 1])          # count=1
-        _forced_token(p, [100, 1, 2])       # count=2
+        _forced_token(p, [100])  # enter think
+        _forced_token(p, [100, 1])  # count=1
+        _forced_token(p, [100, 1, 2])  # count=2
         forced = _forced_token(p, [100, 1, 2, 3])  # count=3, should force
         assert forced == 200
 
@@ -118,9 +120,9 @@ class TestProcessorStateMachine:
     def test_natural_end_no_force(self):
         """Model closes </think> on its own — no force."""
         p = _make_processor(budget=100)
-        _forced_token(p, [100])         # enter
-        _forced_token(p, [100, 1])      # thinking
-        _forced_token(p, [100, 1, 200]) # model closes
+        _forced_token(p, [100])  # enter
+        _forced_token(p, [100, 1])  # thinking
+        _forced_token(p, [100, 1, 200])  # model closes
         # After natural close, subsequent tokens produce no force.
         assert _forced_token(p, [100, 1, 200, 5]) is None
 
@@ -138,7 +140,7 @@ class TestProcessorStateMachine:
         # _think_count = 3 - (2+1) = 0 (no tokens after <think> in prompt).
         # Step 1: generated=[1] → _think_count=1.
         # Step 2: generated=[1, 2] → _think_count=2, budget hit, force.
-        _forced_token(p, [1])            # think_count=1
+        _forced_token(p, [1])  # think_count=1
         forced = _forced_token(p, [1, 2])  # think_count=2, force
         assert forced == 200
 
@@ -206,7 +208,7 @@ class TestProcessorStateMachine:
     def test_multi_token_end_sequence(self):
         """End delimiter is multiple tokens — processor forces each in turn."""
         p = _make_processor(budget=1, end_ids=(200, 201, 202))
-        _forced_token(p, [100])          # enter think, count=0
+        _forced_token(p, [100])  # enter think, count=0
         forced1 = _forced_token(p, [100, 1])  # count=1, hit budget → force 200
         assert forced1 == 200
         forced2 = _forced_token(p, [100, 1, 200])  # force 201
@@ -218,11 +220,9 @@ class TestProcessorStateMachine:
 
     def test_message_injection_prepends_message_tokens(self):
         """thinking_budget_message tokenizes to tokens that force BEFORE end_ids."""
-        p = _make_processor(
-            budget=1, end_ids=(200,), message_ids=[50, 51]
-        )
-        _forced_token(p, [100])              # enter think
-        f1 = _forced_token(p, [100, 1])      # budget hit → first force = first message tok
+        p = _make_processor(budget=1, end_ids=(200,), message_ids=[50, 51])
+        _forced_token(p, [100])  # enter think
+        f1 = _forced_token(p, [100, 1])  # budget hit → first force = first message tok
         assert f1 == 50
         f2 = _forced_token(p, [100, 1, 50])  # second message tok
         assert f2 == 51
@@ -232,6 +232,7 @@ class TestProcessorStateMachine:
 
 class _FakeTokenizer:
     """Minimal tokenizer stand-in that encodes strings to fixed ids."""
+
     _MAP = {
         "<think>": [100],
         "</think>": [200],
@@ -299,14 +300,23 @@ class TestServerResolver:
 
     def test_template_kwargs_only(self):
         assert self._resolve(
-            template_kwargs={"thinking_token_budget": 512, "thinking_budget_message": "wrap"}
+            template_kwargs={
+                "thinking_token_budget": 512,
+                "thinking_budget_message": "wrap",
+            }
         ) == (512, "wrap")
 
     def test_top_level_wins(self):
         assert self._resolve(
             top_level={"b": 1024, "m": None},
-            template_kwargs={"thinking_token_budget": 512, "thinking_budget_message": "wrap"},
-        ) == (1024, "wrap")  # budget from top, message fills from template
+            template_kwargs={
+                "thinking_token_budget": 512,
+                "thinking_budget_message": "wrap",
+            },
+        ) == (
+            1024,
+            "wrap",
+        )  # budget from top, message fills from template
 
     def test_zero_is_a_real_value(self):
         assert self._resolve(top_level={"b": 0, "m": None}) == (0, None)
@@ -357,13 +367,14 @@ class TestApplyPropagation:
     def test_scheduler_output_carries_applied_flag(self):
         """Scheduler's output-producing method must copy
         Request.thinking_budget_applied to the RequestOutput it produces."""
-        from vllm_mlx.request import Request, RequestOutput, SamplingParams
         import inspect
+
         # Read _process_batch_responses source (the method that constructs
         # RequestOutput during the generation step); assert it references
         # thinking_budget_applied so this test breaks if someone deletes the
         # field propagation without replacing it with another mechanism.
         from vllm_mlx.scheduler import Scheduler
+
         source = inspect.getsource(Scheduler._process_batch_responses)
         assert "thinking_budget_applied" in source, (
             "Scheduler._process_batch_responses must reference thinking_budget_applied "
@@ -375,6 +386,7 @@ class TestApplyPropagation:
         on its GenerationOutput (text branch, non-streaming)."""
         import inspect
         from vllm_mlx.engine.batched import BatchedEngine
+
         source = inspect.getsource(BatchedEngine.generate)
         # Verify both the text-branch construction (line ~570) AND the return
         # reference output.thinking_budget_applied.
@@ -386,6 +398,7 @@ class TestApplyPropagation:
     def test_batched_engine_text_stream_constructs_with_applied(self):
         import inspect
         from vllm_mlx.engine.batched import BatchedEngine
+
         source = inspect.getsource(BatchedEngine.stream_generate)
         assert source.count("thinking_budget_applied") >= 2, (
             "BatchedEngine.stream_generate should reference "
@@ -458,7 +471,7 @@ class TestAnthropicPlumbing:
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking_token_budget=512, thinking_budget_message="wrap")
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 512
         assert openai.thinking_budget_message == "wrap"
 
@@ -467,8 +480,13 @@ class TestAnthropicPlumbing:
         thinking_token_budget."""
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
-        req = self._base(thinking={"budget_tokens": 256})
-        openai = anthropic_to_openai(req)
+        # Post-Task 6: the shared effort resolver is strict about
+        # `thinking.type` — it must be one of "enabled"/"disabled"/"adaptive".
+        # Bare {"budget_tokens": N} with no type falls through to DEFAULT.
+        # Anthropic's own API already requires `type` on the thinking dict,
+        # so this matches the upstream contract.
+        req = self._base(thinking={"type": "enabled", "budget_tokens": 256})
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 256
 
     def test_adapter_top_level_wins_over_nested(self):
@@ -478,7 +496,7 @@ class TestAnthropicPlumbing:
             thinking_token_budget=1024,
             thinking={"budget_tokens": 256},
         )
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 1024
 
     def test_adapter_thinking_disabled_forces_zero(self):
@@ -487,14 +505,14 @@ class TestAnthropicPlumbing:
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking={"type": "disabled", "budget_tokens": 1024})
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 0  # disabled wins over budget_tokens
 
     def test_adapter_thinking_enabled_uses_budget_tokens(self):
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking={"type": "enabled", "budget_tokens": 512})
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 512
 
     def test_adapter_unknown_type_ignores(self, caplog):
@@ -506,16 +524,24 @@ class TestAnthropicPlumbing:
 
         req = self._base(thinking={"type": "unknown", "budget_tokens": 256})
         with caplog.at_level(logging.WARNING):
-            openai = anthropic_to_openai(req)
+            openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget is None
-        assert any("not recognized" in rec.message for rec in caplog.records)
+        # Resolver logs "Unknown anthropic_thinking.type=..." and falls through
+        # to DEFAULT (budget None). Match on "Unknown" + "thinking" to stay
+        # tolerant of small log-message wording changes.
+        assert any(
+            "Unknown" in rec.message and "thinking" in rec.message
+            for rec in caplog.records
+        )
 
     def test_anthropic_budget_requested_helper(self):
         from vllm_mlx.server import _anthropic_budget_requested
 
         req_no_budget = self._base()
         req_top_level = self._base(thinking_token_budget=512)
-        req_nested_enabled = self._base(thinking={"type": "enabled", "budget_tokens": 256})
+        req_nested_enabled = self._base(
+            thinking={"type": "enabled", "budget_tokens": 256}
+        )
         req_nested_disabled = self._base(thinking={"type": "disabled"})
         req_nested_only_budget = self._base(thinking={"budget_tokens": 256})
 
@@ -544,11 +570,11 @@ class TestMessageTokenCoincidence:
             end_ids=(200,),
             message_ids=[50, 51],
         )
-        _forced_token(p, [100])                # <think>
-        _forced_token(p, [100, 1])             # count=1
-        _forced_token(p, [100, 1, 50])         # count=2, natural 50
-        _forced_token(p, [100, 1, 50, 2])      # count=3
-        _forced_token(p, [100, 1, 50, 2, 3])   # count=4
+        _forced_token(p, [100])  # <think>
+        _forced_token(p, [100, 1])  # count=1
+        _forced_token(p, [100, 1, 50])  # count=2, natural 50
+        _forced_token(p, [100, 1, 50, 2])  # count=3
+        _forced_token(p, [100, 1, 50, 2, 3])  # count=4
         # count=5 hits budget, force sequence begins with token 50
         forced1 = _forced_token(p, [100, 1, 50, 2, 3, 4])
         assert forced1 == 50
@@ -563,9 +589,9 @@ class TestMessageTokenCoincidence:
         while thinking, the processor exits think mode — model closed on
         its own. Subsequent tokens must NOT be forced."""
         p = _make_processor(budget=100, end_ids=(200,))
-        _forced_token(p, [100])              # <think>
-        _forced_token(p, [100, 1])           # count=1
-        _forced_token(p, [100, 1, 200])      # model closed
+        _forced_token(p, [100])  # <think>
+        _forced_token(p, [100, 1])  # count=1
+        _forced_token(p, [100, 1, 200])  # model closed
         # Post-close: no force regardless of counter
         assert _forced_token(p, [100, 1, 200, 5]) is None
         assert _forced_token(p, [100, 1, 200, 5, 6]) is None

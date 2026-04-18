@@ -709,6 +709,29 @@ def _install_mtp(
     optimistic: bool = False,
 ) -> None:
     """
+    LEGACY DEAD CODE as of 2026-04-18.
+
+    Under mlx_lm >= 0.31.2 (see UPSTREAM_PIN.md invariant #10) this
+    function is NEVER CALLED: Scheduler._create_batch_generator gates
+    the call site with ``hasattr(bg, "_generation_batch")`` and logs a
+    WARN instead. Under mlx_lm < 0.31.2 the startup assertion in
+    _create_batch_generator raises RuntimeError before this function
+    can be reached. Therefore this function's body runs on NO supported
+    mlx_lm version.
+
+    It is retained source-visible (rather than deleted) so the MTP
+    port for 0.31.2+ can use the closure scaffolding as a reference.
+    The closures inside (_mtp_step, _mtp_next) contain references to
+    the removed ``active_batch`` attribute; those references are
+    explicitly allowlisted in tests/test_mlx_lm_api_contract.py under
+    _ALLOWLIST_FUNCS.
+
+    DO NOT remove or weaken the version gate at the call site without
+    first porting _mtp_step and _mtp_next to the split-batch API. If
+    you do, every decode step will crash with AttributeError on 0.31.2+.
+
+    -----
+
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
     with always-advance strategy for hybrid MambaCache + KVCache.
 
@@ -1373,12 +1396,31 @@ class Scheduler:
         # Install MTP if the model supports it
         if self.config.enable_mtp:
             if hasattr(self.model, "mtp") and self.model.mtp is not None:
-                _install_mtp(
-                    bg,
-                    model=self.model,
-                    num_draft_tokens=self.config.mtp_num_draft_tokens,
-                    optimistic=self.config.mtp_optimistic,
-                )
+                # mlx_lm 0.31.2+ replaced BatchGenerator.active_batch
+                # with split _prompt_batch + _generation_batch. The
+                # closures inside _install_mtp (_mtp_step, _mtp_next)
+                # still reference the old single-slot API and would
+                # crash on every decode step. Keep them dead under
+                # 0.31.2+ until a proper MTP port lands. Loud WARN so
+                # operators know MTP is not active.
+                if hasattr(bg, "_generation_batch"):
+                    logger.warning(
+                        "[MTP] Requested but not installed under mlx_lm "
+                        "0.31.2+ (BatchGenerator split batches require an "
+                        "MTP closure rewrite that has not shipped yet). "
+                        "Decode will run WITHOUT speculative draft "
+                        "acceleration. See UPSTREAM_PIN.md invariant #10 "
+                        "for contract status, and the LEGACY DEAD CODE "
+                        "docstring at vllm_mlx/scheduler.py::_install_mtp "
+                        "for the closures that need porting."
+                    )
+                else:
+                    _install_mtp(
+                        bg,
+                        model=self.model,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                        optimistic=self.config.mtp_optimistic,
+                    )
             else:
                 logger.warning(
                     "[MTP] --enable-mtp is set but model has no MTP head "

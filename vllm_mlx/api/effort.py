@@ -80,7 +80,51 @@ def resolve_effort(
 
     See module docstring for precedence order.
     """
-    # Scaffold: just return DEFAULT. Tasks 2-4 fill in the real logic.
+    # 1. Top-level explicit budget wins over everything.
+    if top_level_budget is not None:
+        return ResolvedBudget(
+            budget=top_level_budget,
+            source=EffortSource.TOP_LEVEL,
+            max_tokens_floor=None,
+            effort_label=None,
+        )
+
+    # 2. Anthropic thinking dict.
+    if isinstance(anthropic_thinking, dict):
+        thinking_type = anthropic_thinking.get("type")
+        if thinking_type == "disabled":
+            return ResolvedBudget(
+                budget=0,
+                source=EffortSource.ANTHROPIC_THINKING_DISABLED,
+                max_tokens_floor=None,
+                effort_label=None,
+            )
+        if thinking_type == "enabled":
+            return ResolvedBudget(
+                budget=anthropic_thinking.get("budget_tokens"),
+                source=EffortSource.ANTHROPIC_THINKING_ENABLED,
+                max_tokens_floor=None,
+                effort_label=None,
+            )
+        if thinking_type == "adaptive":
+            return ResolvedBudget(
+                budget=None,
+                source=EffortSource.ANTHROPIC_THINKING_ADAPTIVE,
+                max_tokens_floor=None,
+                effort_label=None,
+            )
+        if thinking_type is not None:
+            # Unknown type — log and fall through to lower-precedence signals
+            # or to DEFAULT. Matches the old adapter's WARN-on-unknown.
+            logger.warning(
+                "Unknown anthropic_thinking.type=%r; falling through to "
+                "lower-precedence signals or default.",
+                thinking_type,
+            )
+
+    # 5. output_config.effort and 6. reasoning_effort handled in Tasks 3-4.
+
+    # 7. Default.
     return ResolvedBudget(
         budget=None,
         source=EffortSource.DEFAULT,

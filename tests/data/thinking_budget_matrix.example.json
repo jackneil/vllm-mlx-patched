@@ -1,0 +1,23 @@
+[
+  {
+    "name": "qwen3-0.6b",
+    "url": "http://127.0.0.1:8099",
+    "model": "mlx-community/Qwen3-0.6B-8bit",
+    "family": "supported",
+    "parser": "qwen3"
+  },
+  {
+    "name": "qwen3-arena",
+    "url": "http://127.0.0.1:8003",
+    "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+    "family": "noop-simple",
+    "parser": "qwen3"
+  },
+  {
+    "name": "gemma-4-31b",
+    "url": "http://127.0.0.1:8000",
+    "model": "mlx-community/gemma-4-31b-it-4bit",
+    "family": "noop-mllm",
+    "parser": "gemma4"
+  }
+]

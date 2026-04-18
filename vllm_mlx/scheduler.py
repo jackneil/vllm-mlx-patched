@@ -43,6 +43,13 @@ _BG_INIT_PARAMS: Set[str] = set(
     inspect.signature(BatchGenerator.__init__).parameters.keys()
 )
 
+# One-shot flag for the invariant-#10 startup breadcrumb. Set to True
+# after the first successful `_create_batch_generator` call. Subsequent
+# recreations (e.g. on sampler-params change, scheduler.py:1523) skip
+# the INFO log so `grep "invariant #10 upheld"` returns exactly one
+# match per running server.
+_INVARIANT_10_LOGGED: bool = False
+
 
 def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
     """Filter kwargs to those accepted by BatchGenerator.__init__.
@@ -61,6 +68,40 @@ def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
             getattr(__import__("mlx_lm"), "__version__", "unknown"),
         )
     return accepted
+
+
+def _active_batches(bg) -> list:
+    """Return non-empty currently-active mlx_lm BatchGenerator batches.
+
+    mlx_lm >= 0.31.2 replaced the single ``active_batch`` slot with
+    split ``_prompt_batch`` (prefill) and ``_generation_batch`` (decode)
+    attributes. Either or both may be non-empty during pipelined work.
+    This helper is the canonical access point — direct references to
+    the removed ``bg.active_batch`` attribute are forbidden, and direct
+    access to ``bg._prompt_batch`` or ``bg._generation_batch`` outside
+    this helper is also forbidden (pinned by ``UPSTREAM_PIN.md``
+    invariant #10 and ``tests/test_mlx_lm_api_contract.py``).
+
+    Returns
+    -------
+    list
+        Zero, one, or two batch objects with ``len(batch) > 0``. Batches
+        are returned in prompt-first order (prompt batch if active,
+        then generation batch if active).
+
+    Note for refactors
+    ------------------
+    Callers iterate the returned list (e.g. ``for batch in
+    _active_batches(bg): ...``) and may also inspect truthiness. Do NOT
+    convert this to a generator — callers rely on list semantics for
+    repeat iteration and the batches are O(1) small (max 2 items).
+    """
+    out = []
+    for name in ("_prompt_batch", "_generation_batch"):
+        b = getattr(bg, name, None)
+        if b is not None and len(b) > 0:
+            out.append(b)
+    return out
 
 
 # Upper bound on tokenized thinking_budget_message length. The Pydantic
@@ -682,6 +723,40 @@ def _install_mtp(
     optimistic: bool = False,
 ) -> None:
     """
+    LEGACY DEAD CODE as of 2026-04-18.
+
+    Under mlx_lm >= 0.31.2 (see UPSTREAM_PIN.md invariant #10) this
+    function is NEVER CALLED: Scheduler._create_batch_generator gates
+    the call site with ``hasattr(bg, "_generation_batch")`` and logs a
+    WARN instead. Under mlx_lm < 0.31.2 the startup assertion in
+    _create_batch_generator raises RuntimeError before this function
+    can be reached. Therefore this function's body runs on NO supported
+    mlx_lm version.
+
+    It is retained source-visible (rather than deleted) so the MTP
+    port for 0.31.2+ can use the closure scaffolding as a reference.
+    The closures inside (_mtp_step, _mtp_next) contain references to
+    the removed ``active_batch`` attribute; those references are
+    explicitly allowlisted in tests/test_mlx_lm_api_contract.py under
+    _ALLOWLIST_FUNCS.
+
+    DO NOT remove or weaken the version gate at the call site without
+    first porting _mtp_step and _mtp_next to the split-batch API. If
+    you do, every decode step will crash with AttributeError on 0.31.2+.
+
+    DO NOT delete this function in a cleanup PR without ALSO removing
+    the still-live caller at Scheduler._create_batch_generator (the
+    ``_install_mtp(bg, ...)`` line inside the `if self.config.enable_mtp:`
+    block) — grep for ``_install_mtp(`` to find it. The call site is
+    gated on ``hasattr(bg, "_generation_batch")``; under mlx_lm < 0.31.2
+    the startup assertion prevents reaching that branch, but under any
+    pinned-older install you would break MTP with a ``NameError``.
+
+    Canonical access to split batches: ``_active_batches(bg)`` defined
+    at the top of this module.
+
+    -----
+
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
     with always-advance strategy for hybrid MambaCache + KVCache.
 
@@ -1308,6 +1383,38 @@ class Scheduler:
                 prompt_progress_callback=_prefill_progress,
             )
         )
+        # mlx_lm API contract (pinned by UPSTREAM_PIN.md invariant #10):
+        # 0.31.2+ splits the single `active_batch` slot into
+        # _prompt_batch + _generation_batch. Fail fast with a clear,
+        # version-identified message if the installed mlx_lm is too old,
+        # rather than AttributeError-ing on every engine step mid-decode.
+        if not hasattr(bg, "_generation_batch"):
+            import mlx_lm as _mlx_lm_mod
+            _installed_v = getattr(_mlx_lm_mod, "__version__", "unknown")
+            raise RuntimeError(
+                "vllm_mlx requires mlx_lm >= 0.31.2 (BatchGenerator must "
+                "expose _prompt_batch + _generation_batch). "
+                f"Installed mlx_lm version: {_installed_v}. "
+                "Upgrade with: pip install -U 'mlx-lm>=0.31.2'  "
+                "(or pin vllm_mlx to a release compatible with your "
+                "mlx_lm)."
+            )
+        # Positive-signal breadcrumb: surface the invariant upheld in
+        # the log so on-call engineers can distinguish a fixed server
+        # from a stale backup running pre-fix code. Grep for
+        # "invariant #10 upheld" to confirm this server has the fix.
+        # Gated by a module-level flag so it fires exactly ONCE per
+        # process lifetime — recreation on sampler-params change would
+        # otherwise spam the log.
+        global _INVARIANT_10_LOGGED
+        if not _INVARIANT_10_LOGGED:
+            import mlx_lm as _mlx_lm_mod
+            logger.info(
+                "[BatchGenerator] invariant #10 upheld (mlx_lm %s split "
+                "_prompt_batch + _generation_batch detected)",
+                getattr(_mlx_lm_mod, "__version__", "unknown"),
+            )
+            _INVARIANT_10_LOGGED = True
         # Always set the progress callback as an attribute. In older mlx_lm
         # releases this was a constructor kwarg (filtered out above on
         # newer releases); chunked-prefill installs below read it via
@@ -1346,12 +1453,31 @@ class Scheduler:
         # Install MTP if the model supports it
         if self.config.enable_mtp:
             if hasattr(self.model, "mtp") and self.model.mtp is not None:
-                _install_mtp(
-                    bg,
-                    model=self.model,
-                    num_draft_tokens=self.config.mtp_num_draft_tokens,
-                    optimistic=self.config.mtp_optimistic,
-                )
+                # mlx_lm 0.31.2+ replaced BatchGenerator.active_batch
+                # with split _prompt_batch + _generation_batch. The
+                # closures inside _install_mtp (_mtp_step, _mtp_next)
+                # still reference the old single-slot API and would
+                # crash on every decode step. Keep them dead under
+                # 0.31.2+ until a proper MTP port lands. Loud WARN so
+                # operators know MTP is not active.
+                if hasattr(bg, "_generation_batch"):
+                    logger.warning(
+                        "[MTP] Requested but not installed under mlx_lm "
+                        "0.31.2+ (BatchGenerator split batches require an "
+                        "MTP closure rewrite that has not shipped yet). "
+                        "Decode will run WITHOUT speculative draft "
+                        "acceleration. See UPSTREAM_PIN.md invariant #10 "
+                        "for contract status, and the LEGACY DEAD CODE "
+                        "docstring at vllm_mlx/scheduler.py::_install_mtp "
+                        "for the closures that need porting."
+                    )
+                else:
+                    _install_mtp(
+                        bg,
+                        model=self.model,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                        optimistic=self.config.mtp_optimistic,
+                    )
             else:
                 logger.warning(
                     "[MTP] --enable-mtp is set but model has no MTP head "
@@ -2533,15 +2659,16 @@ class Scheduler:
 
         self._step_count += 1
         if self._step_count % effective_interval == 0:
-            # Evaluate batch tokens to collapse lazy concatenation chains
-            if (
-                self.batch_generator is not None
-                and self.batch_generator.active_batch is not None
-                and hasattr(self.batch_generator.active_batch, "tokens")
-            ):
-                tokens = self.batch_generator.active_batch.tokens
-                if tokens:
-                    mx.eval(*tokens)
+            # Collapse lazy concatenation chains on active batch tokens.
+            # In mlx_lm 0.31.2+ the BatchGenerator exposes prompt +
+            # generation batches separately; either or both may be
+            # active during pipelined work. See _active_batches() at
+            # top of module.
+            if self.batch_generator is not None:
+                for batch in _active_batches(self.batch_generator):
+                    tokens = getattr(batch, "tokens", None)
+                    if tokens:
+                        mx.eval(*tokens)
             mx.clear_cache()
 
         # Periodically log memory stats for monitoring

@@ -316,7 +316,7 @@ Without a message, the forced close can cut the model mid-sentence. Set `thinkin
 **Simple mode (single-user, default)**: `thinking_token_budget` is **silently logged and dropped**. To enforce the budget, start the server with `--continuous-batching`. If you need simple-mode enforcement, file an issue — this is a known v1 limitation.
 
 **Not supported in v1 (loud no-op):**
-- **MLLM / VLM models** (Qwen3-VL, Gemma 4, etc.) — served by `MLLMBatchGenerator` which does not yet wire `logits_processors`. Tracked as follow-up.
+- **MLLM / VLM models** (Qwen3-VL, Gemma 4, etc.) — served by `MLLMBatchGenerator` which does not yet wire `logits_processors`. Tracked as follow-up. The extension playbook — including which files to patch and test-coverage deltas — is in `docs/development/vllm-mlx-vs-vllm.md` under "Extending thinking_token_budget to MLLM". It's an internal patch (three files, one afternoon of work); no mlx_lm fork required.
 - **GPT-OSS / Harmony** — channel-based protocol with no `<think>` pair; the processor's delimiter resolution fails and it's a no-op.
 - **Models without `--reasoning-parser`** configured.
 

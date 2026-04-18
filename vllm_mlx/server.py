@@ -1750,8 +1750,11 @@ async def create_anthropic_message(
     )
     logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
-    # Convert Anthropic request -> OpenAI request
-    openai_request = anthropic_to_openai(anthropic_request)
+    # Convert Anthropic request -> OpenAI request. The adapter now returns
+    # a (ChatCompletionRequest, ResolvedBudget) tuple; Task 9 will wire the
+    # resolved budget into x-thinking-* response headers at this site.
+    # TODO(Task 9): plumb real context_window from the loaded model config.
+    openai_request, _resolved_budget = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}

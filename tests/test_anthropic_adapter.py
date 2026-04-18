@@ -268,7 +268,7 @@ class TestAnthropicToOpenai:
 
     def test_simple_request(self):
         req = self._make_request()
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.model == "default"
         assert result.max_tokens == 100
         assert len(result.messages) == 1
@@ -277,7 +277,7 @@ class TestAnthropicToOpenai:
 
     def test_system_string(self):
         req = self._make_request(system="Be helpful.")
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert len(result.messages) == 2
         assert result.messages[0].role == "system"
         assert result.messages[0].content == "Be helpful."
@@ -285,38 +285,38 @@ class TestAnthropicToOpenai:
 
     def test_system_list(self):
         req = self._make_request(system=[{"type": "text", "text": "Be concise."}])
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.messages[0].role == "system"
         assert result.messages[0].content == "Be concise."
 
     def test_temperature_default(self):
         req = self._make_request()
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.temperature == 0.7
 
     def test_temperature_explicit(self):
         req = self._make_request(temperature=0.3)
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.temperature == 0.3
 
     def test_top_p_default(self):
         req = self._make_request()
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.top_p == 0.9
 
     def test_top_p_explicit(self):
         req = self._make_request(top_p=0.5)
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.top_p == 0.5
 
     def test_stop_sequences(self):
         req = self._make_request(stop_sequences=["END", "STOP"])
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.stop == ["END", "STOP"]
 
     def test_stream_flag(self):
         req = self._make_request(stream=True)
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.stream is True
 
     def test_tools_conversion(self):
@@ -332,18 +332,18 @@ class TestAnthropicToOpenai:
                 )
             ]
         )
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert len(result.tools) == 1
         assert result.tools[0].function["name"] == "search"
 
     def test_tool_choice_conversion(self):
         req = self._make_request(tool_choice={"type": "any"})
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.tool_choice == "required"
 
     def test_no_tools(self):
         req = self._make_request()
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert result.tools is None
         assert result.tool_choice is None
 
@@ -354,7 +354,7 @@ class TestAnthropicToOpenai:
             AnthropicMessage(role="user", content="how are you"),
         ]
         req = self._make_request(messages=msgs)
-        result = anthropic_to_openai(req)
+        result, _ = anthropic_to_openai(req)
         assert len(result.messages) == 3
         assert result.messages[0].role == "user"
         assert result.messages[1].role == "assistant"

@@ -458,7 +458,7 @@ class TestAnthropicPlumbing:
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking_token_budget=512, thinking_budget_message="wrap")
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 512
         assert openai.thinking_budget_message == "wrap"
 
@@ -467,8 +467,13 @@ class TestAnthropicPlumbing:
         thinking_token_budget."""
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
-        req = self._base(thinking={"budget_tokens": 256})
-        openai = anthropic_to_openai(req)
+        # Post-Task 6: the shared effort resolver is strict about
+        # `thinking.type` — it must be one of "enabled"/"disabled"/"adaptive".
+        # Bare {"budget_tokens": N} with no type falls through to DEFAULT.
+        # Anthropic's own API already requires `type` on the thinking dict,
+        # so this matches the upstream contract.
+        req = self._base(thinking={"type": "enabled", "budget_tokens": 256})
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 256
 
     def test_adapter_top_level_wins_over_nested(self):
@@ -478,7 +483,7 @@ class TestAnthropicPlumbing:
             thinking_token_budget=1024,
             thinking={"budget_tokens": 256},
         )
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 1024
 
     def test_adapter_thinking_disabled_forces_zero(self):
@@ -487,14 +492,14 @@ class TestAnthropicPlumbing:
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking={"type": "disabled", "budget_tokens": 1024})
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 0  # disabled wins over budget_tokens
 
     def test_adapter_thinking_enabled_uses_budget_tokens(self):
         from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 
         req = self._base(thinking={"type": "enabled", "budget_tokens": 512})
-        openai = anthropic_to_openai(req)
+        openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget == 512
 
     def test_adapter_unknown_type_ignores(self, caplog):
@@ -506,9 +511,15 @@ class TestAnthropicPlumbing:
 
         req = self._base(thinking={"type": "unknown", "budget_tokens": 256})
         with caplog.at_level(logging.WARNING):
-            openai = anthropic_to_openai(req)
+            openai, _ = anthropic_to_openai(req)
         assert openai.thinking_token_budget is None
-        assert any("not recognized" in rec.message for rec in caplog.records)
+        # Resolver logs "Unknown anthropic_thinking.type=..." and falls through
+        # to DEFAULT (budget None). Match on "Unknown" + "thinking" to stay
+        # tolerant of small log-message wording changes.
+        assert any(
+            "Unknown" in rec.message and "thinking" in rec.message
+            for rec in caplog.records
+        )
 
     def test_anthropic_budget_requested_helper(self):
         from vllm_mlx.server import _anthropic_budget_requested

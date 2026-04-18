@@ -1,10 +1,8 @@
 """Integration tests for anthropic_adapter's use of the effort resolver."""
 
-import pytest
-
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 from vllm_mlx.api.anthropic_models import AnthropicRequest
-from vllm_mlx.api.effort import EffortSource, ResolvedBudget
+from vllm_mlx.api.effort import EffortSource
 
 
 def _mk(body: dict) -> AnthropicRequest:
@@ -67,10 +65,12 @@ def test_adapter_output_config_effort_max_dynamic():
 
 def test_adapter_top_level_beats_output_config():
     """Precedence — top-level thinking_token_budget wins."""
-    req = _mk({
-        "thinking_token_budget": 333,
-        "output_config": {"effort": "max"},
-    })
+    req = _mk(
+        {
+            "thinking_token_budget": 333,
+            "output_config": {"effort": "max"},
+        }
+    )
     oa_req, resolved = anthropic_to_openai(req, context_window=131072)
     assert oa_req.thinking_token_budget == 333
     assert resolved.source == EffortSource.TOP_LEVEL

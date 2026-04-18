@@ -51,7 +51,6 @@ from typing import Any
 import pytest
 import requests
 
-
 pytestmark = pytest.mark.integration
 
 
@@ -187,6 +186,7 @@ def _chat(
 
 # ----- Supported-family invariants -------------------------------------
 
+
 @pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
 def test_budget_zero_is_fast_and_silent_on_thinking(spec: ModelSpec) -> None:
     """budget=0: on a reasoning model, thinking MUST be force-closed
@@ -306,8 +306,9 @@ def test_budget_zero_is_faster_than_unbounded(spec: ModelSpec) -> None:
     """
     _require_matrix()
     if spec.family != "supported":
-        pytest.skip(f"{spec.name}: latency assertion only meaningful for "
-                    "supported family")
+        pytest.skip(
+            f"{spec.name}: latency assertion only meaningful for " "supported family"
+        )
 
     # Warm the server with unbounded first, THEN measure budget=0 so the
     # warm-up cost is absorbed by the unbounded cell.
@@ -323,6 +324,7 @@ def test_budget_zero_is_faster_than_unbounded(spec: ModelSpec) -> None:
 
 # ----- Graceful wrap-up message ---------------------------------------
 
+
 @pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
 def test_thinking_budget_message_produces_transition(
     spec: ModelSpec,
@@ -333,8 +335,7 @@ def test_thinking_budget_message_produces_transition(
     """
     _require_matrix()
     if spec.family != "supported":
-        pytest.skip(f"{spec.name}: message feature only runs on supported "
-                    "family")
+        pytest.skip(f"{spec.name}: message feature only runs on supported " "family")
 
     hint = "Wrap up and answer now."
     # Fetch the raw response so we can inspect the reasoning block text.
@@ -347,7 +348,9 @@ def test_thinking_budget_message_produces_transition(
         "thinking_budget_message": hint,
     }
     resp = requests.post(
-        f"{spec.url}/v1/chat/completions", json=body, timeout=_TIMEOUT_SEC,
+        f"{spec.url}/v1/chat/completions",
+        json=body,
+        timeout=_TIMEOUT_SEC,
     )
     resp.raise_for_status()
     assert resp.headers.get("x-thinking-budget-applied") == "true"
@@ -360,8 +363,10 @@ def test_thinking_budget_message_produces_transition(
     # A distinctive substring from the hint should survive tokenization.
     # "Wrap up" is the highest-signal phrase; if the tokenizer splits it
     # weirdly, fall back to checking "answer" which is also in the hint.
-    hit = ("Wrap up" in reasoning) or ("wrap up" in reasoning) or (
-        "answer" in reasoning.lower()
+    hit = (
+        ("Wrap up" in reasoning)
+        or ("wrap up" in reasoning)
+        or ("answer" in reasoning.lower())
     )
     assert hit, (
         f"{spec.name}: expected wrap-up hint to appear in reasoning "
@@ -370,6 +375,7 @@ def test_thinking_budget_message_produces_transition(
 
 
 # ----- Anthropic /v1/messages plumbing --------------------------------
+
 
 @pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
 def test_anthropic_messages_path_honors_budget(spec: ModelSpec) -> None:
@@ -380,8 +386,7 @@ def test_anthropic_messages_path_honors_budget(spec: ModelSpec) -> None:
     """
     _require_matrix()
     if spec.family != "supported":
-        pytest.skip(f"{spec.name}: Anthropic plumbing test only on "
-                    "supported family")
+        pytest.skip(f"{spec.name}: Anthropic plumbing test only on " "supported family")
 
     body = {
         "model": spec.model,
@@ -407,22 +412,18 @@ def test_anthropic_messages_path_honors_budget(spec: ModelSpec) -> None:
     data = resp.json()
     blocks = data.get("content") or []
     thinking_chars = sum(
-        len(b.get("thinking", "") or "")
-        for b in blocks
-        if b.get("type") == "thinking"
+        len(b.get("thinking", "") or "") for b in blocks if b.get("type") == "thinking"
     )
     text_chars = sum(
-        len(b.get("text", "") or "")
-        for b in blocks
-        if b.get("type") == "text"
+        len(b.get("text", "") or "") for b in blocks if b.get("type") == "text"
     )
     assert thinking_chars <= 50, (
         f"{spec.name}: budget=0 via Anthropic produced {thinking_chars} "
         f"thinking chars; expected ~0"
     )
-    assert text_chars > 0, (
-        f"{spec.name}: Anthropic must still produce an answer at budget=0"
-    )
+    assert (
+        text_chars > 0
+    ), f"{spec.name}: Anthropic must still produce an answer at budget=0"
     # Soft latency check — Anthropic path shouldn't be dramatically
     # slower than OpenAI.
     assert elapsed < _TIMEOUT_SEC * 0.5
@@ -445,16 +446,20 @@ def test_anthropic_messages_path_honors_budget(spec: ModelSpec) -> None:
 
 _MESSAGES_DIALECT_CASES: list[tuple[dict, str, str]] = [
     # (body_patch, expected_source, expected_budget_str)
-    ({"output_config": {"effort": "low"}},    "output_config_effort",        "512"),
-    ({"output_config": {"effort": "medium"}}, "output_config_effort",        "2048"),
-    ({"output_config": {"effort": "high"}},   "output_config_effort",        "8192"),
-    ({"output_config": {"effort": "xhigh"}},  "output_config_effort",        "16384"),
-    ({"thinking": {"type": "adaptive"}},      "anthropic_thinking_adaptive", "none"),
+    ({"output_config": {"effort": "low"}}, "output_config_effort", "512"),
+    ({"output_config": {"effort": "medium"}}, "output_config_effort", "2048"),
+    ({"output_config": {"effort": "high"}}, "output_config_effort", "8192"),
+    ({"output_config": {"effort": "xhigh"}}, "output_config_effort", "16384"),
+    ({"thinking": {"type": "adaptive"}}, "anthropic_thinking_adaptive", "none"),
     # top-level budget MUST win even when effort="max" is also sent.
-    ({
-        "thinking_token_budget": 777,
-        "output_config": {"effort": "max"},
-    },                                         "top_level",                   "777"),
+    (
+        {
+            "thinking_token_budget": 777,
+            "output_config": {"effort": "max"},
+        },
+        "top_level",
+        "777",
+    ),
 ]
 
 
@@ -514,9 +519,9 @@ def test_messages_header_matrix(
 @pytest.mark.parametrize(
     "reasoning_effort,expected_budget_str",
     [
-        ("low",    "512"),
+        ("low", "512"),
         ("medium", "2048"),
-        ("high",   "8192"),
+        ("high", "8192"),
     ],
 )
 def test_chat_completions_reasoning_effort(

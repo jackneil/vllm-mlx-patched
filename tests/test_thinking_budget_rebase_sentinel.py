@@ -8,8 +8,6 @@ surfacing a conflict.
 
 import inspect
 
-import pytest
-
 
 class TestThinkingBudgetSentinel:
     def test_sampling_params_has_fields(self):
@@ -354,11 +352,15 @@ class TestThinkingBudgetSentinel:
         # existing=True (happy path) + new=None (abort) → True preserved.
         existing_true = RequestOutput(request_id="x", thinking_budget_applied=True)
         new_none = RequestOutput(request_id="x", thinking_budget_applied=None)
-        assert coll._merge_outputs(existing_true, new_none).thinking_budget_applied is True
+        assert (
+            coll._merge_outputs(existing_true, new_none).thinking_budget_applied is True
+        )
         # Symmetric: existing=None + new=True → True wins.
         existing_none = RequestOutput(request_id="x", thinking_budget_applied=None)
         new_true = RequestOutput(request_id="x", thinking_budget_applied=True)
-        assert coll._merge_outputs(existing_none, new_true).thinking_budget_applied is True
+        assert (
+            coll._merge_outputs(existing_none, new_true).thinking_budget_applied is True
+        )
 
     def test_insert_call_accepts_logits_processors(self):
         """CRITICAL-2 (pre-mortem S2): _BG_INIT_PARAMS is derived from

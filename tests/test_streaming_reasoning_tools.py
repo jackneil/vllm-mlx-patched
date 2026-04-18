@@ -1,6 +1,6 @@
 """Test streaming with reasoning parser and tool calls coexisting."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from vllm_mlx.server import _process_streaming_tool_delta, ToolDeltaResult
 
 

@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class EffortSource(StrEnum):
     """Which input field produced the resolved budget. Emitted as the
     `x-thinking-budget-source` response header."""
+
     TOP_LEVEL = "top_level"
     ANTHROPIC_THINKING_DISABLED = "anthropic_thinking_disabled"
     ANTHROPIC_THINKING_ENABLED = "anthropic_thinking_enabled"
@@ -37,6 +38,7 @@ class EffortSource(StrEnum):
 @dataclass(frozen=True)
 class ResolvedBudget:
     """Result of resolving all budget-ish signals on a single request."""
+
     budget: int | None
     source: EffortSource
     max_tokens_floor: int | None
@@ -47,10 +49,10 @@ class ResolvedBudget:
 # max_tokens_floor is a client-side *hint* returned via
 # `x-thinking-budget-max-tokens-floor`; it is not enforced server-side.
 _EFFORT_TABLE: dict[str, tuple[int, int]] = {
-    "low":    (512,   2048),
-    "medium": (2048,  4096),
-    "high":   (8192,  16384),
-    "xhigh":  (16384, 32768),
+    "low": (512, 2048),
+    "medium": (2048, 4096),
+    "high": (8192, 16384),
+    "xhigh": (16384, 32768),
     # "max" is computed dynamically in resolve_effort — see below.
 }
 
@@ -61,7 +63,7 @@ _MAX_BUDGET_CAP: int = 65536
 # Synonyms — client vocabularies that mean the same thing.
 _EFFORT_ALIASES: dict[str, str] = {
     "minimal": "low",
-    "normal":  "medium",
+    "normal": "medium",
 }
 
 
@@ -127,7 +129,9 @@ def resolve_effort(
         raw_effort = output_config.get("effort")
         if raw_effort is not None:
             resolved = _resolve_effort_string(
-                raw_effort, context_window, EffortSource.OUTPUT_CONFIG_EFFORT,
+                raw_effort,
+                context_window,
+                EffortSource.OUTPUT_CONFIG_EFFORT,
             )
             if resolved is not None:
                 return resolved
@@ -135,7 +139,9 @@ def resolve_effort(
     # 6. OpenAI reasoning_effort.
     if reasoning_effort is not None:
         resolved = _resolve_effort_string(
-            reasoning_effort, context_window, EffortSource.REASONING_EFFORT,
+            reasoning_effort,
+            context_window,
+            EffortSource.REASONING_EFFORT,
         )
         if resolved is not None:
             return resolved
@@ -184,6 +190,7 @@ def _resolve_effort_string(
 
     logger.warning(
         "Unknown effort=%r (source=%s); falling through to DEFAULT.",
-        raw_effort, source,
+        raw_effort,
+        source,
     )
     return None

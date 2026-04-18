@@ -552,9 +552,7 @@ def _parse_tool_calls_with_parser(
             tokenizer = _engine._tokenizer
         parser = parser_cls(tokenizer)
     except Exception as e:
-        logger.warning(
-            f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
-        )
+        logger.warning(f"Failed to initialize tool parser '{_tool_call_parser}': {e}")
         logger.warning("Falling back to generic parser")
         return parse_tool_calls(output_text, request_dict)
 
@@ -1662,26 +1660,27 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 "window and content will be truncated or empty. Set "
                 "max_tokens >= thinking_token_budget + %d for content "
                 "headroom.",
-                _budget, request.max_tokens, _MIN_CONTENT_HEADROOM,
+                _budget,
+                request.max_tokens,
+                _MIN_CONTENT_HEADROOM,
             )
         elif request.max_tokens - _budget < _MIN_CONTENT_HEADROOM:
             logger.warning(
                 "thinking_token_budget=%d leaves only %d tokens of content "
                 "headroom under max_tokens=%d. Response content may be "
                 "truncated. Set max_tokens >= %d for safer sizing.",
-                _budget, request.max_tokens - _budget, request.max_tokens,
+                _budget,
+                request.max_tokens - _budget,
+                request.max_tokens,
                 _budget + _MIN_CONTENT_HEADROOM,
             )
 
     # Was a budget requested by the client? Used to decide whether to emit
     # the x-thinking-budget-applied response header for both streaming and
     # non-streaming paths.
-    budget_was_requested = (
-        request.thinking_token_budget is not None
-        or (
-            isinstance(request.chat_template_kwargs, dict)
-            and "thinking_token_budget" in request.chat_template_kwargs
-        )
+    budget_was_requested = request.thinking_token_budget is not None or (
+        isinstance(request.chat_template_kwargs, dict)
+        and "thinking_token_budget" in request.chat_template_kwargs
     )
 
     # Resolve thinking budget from all provider-dialect signals. This also
@@ -1690,8 +1689,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # TODO(context_window): thread from loaded model config.
     _resolved_budget = resolve_effort(
         top_level_budget=request.thinking_token_budget,
-        anthropic_thinking=None,        # not on OpenAI path
-        output_config=None,             # not on OpenAI path
+        anthropic_thinking=None,  # not on OpenAI path
+        output_config=None,  # not on OpenAI path
         reasoning_effort=request.reasoning_effort,
         context_window=131072,
     )
@@ -2316,7 +2315,8 @@ async def _stream_anthropic_messages(
             "Reasoning parser %s missing expected properties %r — upstream API "
             "drift? Falling back to default router (reasoning blocks will not "
             "be routed for this parser).",
-            type(_rp).__name__, _EXPECTED_PROPS,
+            type(_rp).__name__,
+            _EXPECTED_PROPS,
         )
         _start_token = "<think>"
         _end_tokens = ["</think>"]
@@ -2333,7 +2333,11 @@ async def _stream_anthropic_messages(
 
     logger.info(
         "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",
-        _parser_label, _start_token, _end_tokens, _channel_strip, _starts_thinking,
+        _parser_label,
+        _start_token,
+        _end_tokens,
+        _channel_strip,
+        _starts_thinking,
     )
 
     think_router = StreamingThinkRouter(
@@ -2527,12 +2531,16 @@ def _process_streaming_tool_delta(
     function -- a bug fix here fixes both paths.
     """
     if tool_parser is None or content is None:
-        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
     # Fast path: skip parsing until '<' seen
     if not tool_markup_possible and "<" not in content:
         tool_accumulated_text += content
-        return ToolDeltaResult(content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
     if not tool_markup_possible:
         tool_markup_possible = True
@@ -2543,12 +2551,18 @@ def _process_streaming_tool_delta(
     )
 
     if tool_result is None:
-        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            None, tool_accumulated_text, tool_markup_possible, False, None
+        )
     elif "tool_calls" in tool_result:
-        return ToolDeltaResult(None, tool_accumulated_text, tool_markup_possible, True, tool_result)
+        return ToolDeltaResult(
+            None, tool_accumulated_text, tool_markup_possible, True, tool_result
+        )
     else:
         new_content = tool_result.get("content", "")
-        return ToolDeltaResult(new_content, tool_accumulated_text, tool_markup_possible, False, None)
+        return ToolDeltaResult(
+            new_content, tool_accumulated_text, tool_markup_possible, False, None
+        )
 
 
 async def stream_chat_completion(
@@ -2605,7 +2619,11 @@ async def stream_chat_completion(
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
     # tool_choice="none" prevents tool_parser init, which also guards the
     # streaming fallback block (it checks `if tool_parser`).
-    if _enable_auto_tool_choice and _tool_call_parser and getattr(request, "tool_choice", None) != "none":
+    if (
+        _enable_auto_tool_choice
+        and _tool_call_parser
+        and getattr(request, "tool_choice", None) != "none"
+    ):
         # Create per-request parser instance to avoid concurrency corruption
         try:
             parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
@@ -2685,9 +2703,7 @@ async def stream_chat_completion(
                         finish_reason=(
                             "tool_calls"
                             if (output.finished and tool_calls_detected)
-                            else (
-                                output.finish_reason if output.finished else None
-                            )
+                            else (output.finish_reason if output.finished else None)
                         ),
                     )
                 ],
@@ -2761,7 +2777,10 @@ async def stream_chat_completion(
         tool_parser
         and tool_accumulated_text
         and not tool_calls_detected
-        and ("<tool_call>" in tool_accumulated_text or "<|tool_call>" in tool_accumulated_text)
+        and (
+            "<tool_call>" in tool_accumulated_text
+            or "<|tool_call>" in tool_accumulated_text
+        )
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:

@@ -7,7 +7,6 @@ apply_chat_template() raises ValueError. vllm-mlx should fall back to
 a plain-text prompt format instead of crashing.
 """
 
-import pytest
 
 
 class FakeProcessorNoTemplate:

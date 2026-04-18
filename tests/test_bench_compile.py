@@ -6,7 +6,7 @@ import os
 import pytest
 
 try:
-    import mlx.core as mx
+    import mlx.core as mx  # noqa: F401 — availability probe
     from mlx_lm import load
 
     HAS_MLX_LM = True

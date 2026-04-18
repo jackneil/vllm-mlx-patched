@@ -14,8 +14,12 @@ from vllm_mlx.api.effort import (
 def test_module_imports_and_exports_public_api():
     """Scaffold test: the module loads and exposes the documented surface."""
     assert EffortSource.DEFAULT == "default"
-    assert ResolvedBudget(budget=None, source=EffortSource.DEFAULT,
-                          max_tokens_floor=None, effort_label=None)
+    assert ResolvedBudget(
+        budget=None,
+        source=EffortSource.DEFAULT,
+        max_tokens_floor=None,
+        effort_label=None,
+    )
     assert callable(resolve_effort)
     assert isinstance(_EFFORT_TABLE, dict)
     assert isinstance(_MAX_BUDGET_CAP, int)
@@ -24,6 +28,7 @@ def test_module_imports_and_exports_public_api():
 # -----------------------------------------------------------------------------
 # Precedence: top-level `thinking_token_budget` (highest)
 # -----------------------------------------------------------------------------
+
 
 def test_top_level_int_wins_over_everything():
     """If the caller set thinking_token_budget=N, use N regardless of others."""
@@ -47,6 +52,7 @@ def test_top_level_zero_is_honored():
 # -----------------------------------------------------------------------------
 # Precedence: Anthropic `thinking.type`
 # -----------------------------------------------------------------------------
+
 
 def test_thinking_disabled_means_budget_zero():
     result = resolve_effort(anthropic_thinking={"type": "disabled"})
@@ -96,12 +102,16 @@ def test_default_when_no_signals():
 # Precedence: Anthropic output_config.effort
 # -----------------------------------------------------------------------------
 
-@pytest.mark.parametrize("effort,expected_budget,expected_floor", [
-    ("low",    512,   2048),
-    ("medium", 2048,  4096),
-    ("high",   8192,  16384),
-    ("xhigh",  16384, 32768),
-])
+
+@pytest.mark.parametrize(
+    "effort,expected_budget,expected_floor",
+    [
+        ("low", 512, 2048),
+        ("medium", 2048, 4096),
+        ("high", 8192, 16384),
+        ("xhigh", 16384, 32768),
+    ],
+)
 def test_output_config_effort_table_lookup(effort, expected_budget, expected_floor):
     result = resolve_effort(output_config={"effort": effort})
     assert result.budget == expected_budget
@@ -133,10 +143,13 @@ def test_output_config_effort_max_capped_at_65k():
     assert result.effort_label == "max"
 
 
-@pytest.mark.parametrize("alias,canonical", [
-    ("minimal", "low"),
-    ("normal",  "medium"),
-])
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [
+        ("minimal", "low"),
+        ("normal", "medium"),
+    ],
+)
 def test_output_config_effort_synonyms(alias, canonical):
     """minimal → low, normal → medium."""
     result = resolve_effort(output_config={"effort": alias})
@@ -164,6 +177,7 @@ def test_output_config_without_effort_key_is_default():
 # Precedence: output_config LOSES to higher-precedence signals
 # -----------------------------------------------------------------------------
 
+
 def test_output_config_effort_loses_to_top_level():
     result = resolve_effort(
         top_level_budget=111,
@@ -187,11 +201,15 @@ def test_output_config_effort_loses_to_thinking_enabled():
 # Precedence: OpenAI reasoning_effort
 # -----------------------------------------------------------------------------
 
-@pytest.mark.parametrize("effort,expected_budget", [
-    ("low",    512),
-    ("medium", 2048),
-    ("high",   8192),
-])
+
+@pytest.mark.parametrize(
+    "effort,expected_budget",
+    [
+        ("low", 512),
+        ("medium", 2048),
+        ("high", 8192),
+    ],
+)
 def test_reasoning_effort_openai_levels(effort, expected_budget):
     result = resolve_effort(reasoning_effort=effort)
     assert result.budget == expected_budget

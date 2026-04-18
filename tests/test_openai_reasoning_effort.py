@@ -4,8 +4,6 @@ Server-side integration (resolver call + thinking_token_budget population)
 is covered by the HTTP matrix test in Task 11.
 """
 
-import pytest
-
 from vllm_mlx.api.models import ChatCompletionRequest
 
 

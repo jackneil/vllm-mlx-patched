@@ -358,3 +358,27 @@ class TestAnthropicResponse:
         assert resp.content[0].type == "text"
         assert resp.content[1].type == "tool_use"
         assert resp.stop_reason == "tool_use"
+
+
+def test_anthropic_request_accepts_output_config():
+    """Claude Code sends output_config; we must not drop it at schema time."""
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+    req = AnthropicRequest(
+        model="any-model",
+        messages=[],
+        max_tokens=1024,
+        output_config={"effort": "high"},
+    )
+    assert req.output_config == {"effort": "high"}
+
+
+def test_anthropic_request_output_config_optional():
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+    req = AnthropicRequest(
+        model="any-model",
+        messages=[],
+        max_tokens=1024,
+    )
+    assert req.output_config is None

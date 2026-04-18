@@ -76,6 +76,11 @@ class AnthropicRequest(BaseModel):
     # Capped at 2048 chars — see ChatCompletionRequest for rationale
     # (DoS prevention — DCR Wave-3 finding).
     thinking_budget_message: str | None = Field(default=None, max_length=2048)
+    # Claude Code's wire format for effort-based thinking budget selection.
+    # Normalized by vllm_mlx.api.effort.resolve_effort. Accepts
+    # {"effort": "low"|"medium"|"high"|"xhigh"|"max"}. Unknown values
+    # fall through to default behavior rather than erroring.
+    output_config: dict | None = None
 
 
 # =============================================================================

@@ -176,13 +176,32 @@ def _install_chunked_prefill(
     """
     import time as _time
 
-    from mlx_lm.generate import (
-        Batch,
-        _left_pad_prompts,
-        _make_cache,
-        _merge_caches,
-        _right_pad_prompts,
-    )
+    # mlx_lm 0.31+ split `Batch` into `GenerationBatch` / `PromptProcessingBatch`
+    # with different constructor signatures. Our monkey-patch below was written
+    # against the pre-split API and can't be adapted trivially. When the old
+    # symbol is gone, skip the chunked-prefill install entirely and emit a
+    # loud WARN so operators know: long prompts will go through in a single
+    # prefill pass (fine for most workloads, may OOM on >32k prompts), and the
+    # mid-prefill cache-save hook for memory-aware cache is skipped.
+    try:
+        from mlx_lm.generate import (
+            Batch,
+            _left_pad_prompts,
+            _make_cache,
+            _merge_caches,
+            _right_pad_prompts,
+        )
+    except ImportError as e:
+        logger.warning(
+            "_install_chunked_prefill: mlx_lm.generate no longer exports 'Batch' "
+            "(mlx_lm 0.31+ API drift: %s). Chunked prefill and mid-prefill "
+            "cache save are DISABLED. Long prompts (>prefill_step_size) will "
+            "be processed in a single pass and may hit memory pressure. To "
+            "restore chunked prefill, upgrade vllm_mlx to a version that "
+            "adapts to mlx_lm's new GenerationBatch/PromptProcessingBatch API.",
+            e,
+        )
+        return
 
     # Keep references to originals
     _orig_next = batch_gen._next
@@ -2252,7 +2271,17 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
+                    result = self.batch_generator.next()
+                    # mlx_lm 0.31+ returns (prompt_processing_responses,
+                    # generation_responses). Older versions returned a flat
+                    # list of generation responses. Handle both.
+                    if isinstance(result, tuple) and len(result) == 2:
+                        # New API: discard the prompt-processing responses
+                        # (we don't surface those to clients) and keep
+                        # generation responses which carry .uid/.token/etc.
+                        _, responses = result
+                    else:
+                        responses = result
                     output.has_work = True
 
                     if responses:

@@ -121,15 +121,59 @@ def test_output_config_effort_table_lookup(effort, expected_budget, expected_flo
 
 
 def test_output_config_effort_max_with_small_context():
-    """max = min(context_window // 2, _MAX_BUDGET_CAP). 32k ctx → 16k budget."""
+    """`max` effort on a 32k-context model produces budget=16384 (half the
+    context) and a floor clamped to leave 1024 tokens of prompt headroom.
+    Pre-v2, the floor was unclamped and could equal context_window exactly —
+    leaving no room for the prompt itself."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
     result = resolve_effort(
         output_config={"effort": "max"},
         context_window=32768,
     )
-    assert result.budget == 16384
-    assert result.max_tokens_floor == 32768
     assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
-    assert result.effort_label == "max"
+    assert result.budget == 16384  # half of 32768, under the 65536 cap
+    # Floor math (from the new formula):
+    #   min(budget*2, 32768 ceiling, max(budget, ctx - 1024 headroom))
+    #   = min(32768, 32768, max(16384, 31744))
+    #   = min(32768, 32768, 31744)
+    #   = 31744
+    assert result.max_tokens_floor == 31744, (
+        f"expected 31744 (ctx - 1024 prompt headroom); "
+        f"got {result.max_tokens_floor}"
+    )
+
+
+def test_output_config_effort_max_floor_capped_at_ceiling():
+    """On a 1M-context model, `max` floor must NOT exceed 32768 (serving-
+    realistic ceiling). Pre-fix, 1M context produced floor=131072 which
+    most serving topologies reject."""
+    from vllm_mlx.api.effort import resolve_effort
+
+    result = resolve_effort(
+        reasoning_effort="max",
+        context_window=1_000_000,
+    )
+    assert result.budget == 65536
+    assert result.max_tokens_floor is not None
+    assert result.max_tokens_floor <= 32768, (
+        f"max_tokens_floor={result.max_tokens_floor} exceeds 32768 ceiling"
+    )
+
+
+def test_output_config_effort_max_floor_respects_prompt_headroom():
+    """Tiny-context model: floor must leave 1024 tokens for the prompt."""
+    from vllm_mlx.api.effort import resolve_effort
+
+    result = resolve_effort(
+        reasoning_effort="max",
+        context_window=4096,
+    )
+    assert result.budget == 2048  # 4096 // 2
+    assert result.max_tokens_floor is not None
+    assert result.max_tokens_floor <= 4096 - 1024, (
+        f"floor={result.max_tokens_floor} leaves no prompt headroom"
+    )
 
 
 def test_output_config_effort_max_capped_at_65k():

@@ -195,9 +195,22 @@ def _resolve_effort_string(
     canonical = _EFFORT_ALIASES.get(raw_effort, raw_effort)
 
     if canonical == "max":
+        # Dynamic: half the context, capped at _MAX_BUDGET_CAP to keep
+        # 1M-context models from burning 500k tokens per reasoning pass.
         budget = min(context_window // 2, _MAX_BUDGET_CAP)
-        # max_tokens_floor: 2x budget, capped at 2x _MAX_BUDGET_CAP
-        floor = min(budget * 2, _MAX_BUDGET_CAP * 2)
+        # Cap the floor at a serving-realistic ceiling and leave at least
+        # 1024 tokens of prompt headroom. Without this cap, a 1M-context
+        # model returned floor=131072 which most serving topologies reject
+        # outright. The `max(budget, ...)` guarantees the floor never
+        # undershoots the budget itself (pointless to request a floor
+        # below the very budget we're setting).
+        _FLOOR_CEILING = 32768
+        _PROMPT_HEADROOM = 1024
+        floor = min(
+            budget * 2,
+            _FLOOR_CEILING,
+            max(budget, context_window - _PROMPT_HEADROOM),
+        )
         return ResolvedBudget(
             budget=budget,
             source=source,

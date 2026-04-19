@@ -561,3 +561,78 @@ def test_chat_completions_reasoning_effort(
         f"resolved={expected_budget_str!r}, got "
         f"{resp.headers.get('x-thinking-budget-resolved')!r}"
     )
+
+
+# ----- Cross-dialect parity (PR-E Task E.2) ---------------------------
+
+
+@pytest.mark.parametrize("spec", _MATRIX, ids=_matrix_ids)
+def test_dialect_parity_same_budget_same_output(spec: ModelSpec) -> None:
+    """Four dialects that all resolve to budget=8192 must produce comparable
+    reasoning_chars on the same prompt, at matched max_tokens.
+
+    Regression guard (pre-mortem S2 from PR #13 review): before v2 PR-C/D
+    fixes, output_config.effort=high could produce wildly different char
+    counts because max_tokens_floor wasn't enforced and SDK default
+    max_tokens varied.
+
+    Test logic (M-9 fix from v1 review): require every dialect to emit
+    SOME thinking (count > 0). If ALL four dialects emit zero, skip —
+    the model probably didn't use <think> tags on this prompt run.
+    """
+    _require_matrix()
+    if spec.family != "supported":
+        pytest.skip(f"{spec.name}: parity only meaningful for supported family")
+
+    PROMPT = "What is 2+2?"
+    MAX = 16384
+
+    bodies = [
+        {"max_tokens": MAX, "temperature": 0.3,
+         "thinking_token_budget": 8192},
+        {"max_tokens": MAX, "temperature": 0.3,
+         "chat_template_kwargs": {
+             "thinking": {"type": "enabled", "budget_tokens": 8192}
+         }},
+        {"max_tokens": MAX, "temperature": 0.3, "reasoning_effort": "high"},
+        {"max_tokens": MAX, "temperature": 0.3,
+         "chat_template_kwargs": {"output_config": {"effort": "high"}}},
+    ]
+    labels = ["top_level", "anthropic_thinking_enabled",
+              "openai_reasoning_effort", "output_config_effort"]
+    r_chars: list[int] = []
+
+    for body, _label in zip(bodies, labels):
+        body["model"] = spec.model
+        body["messages"] = [{"role": "user", "content": PROMPT}]
+        resp = requests.post(
+            f"{spec.url}/v1/chat/completions", json=body, timeout=_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        msg = (resp.json().get("choices") or [{}])[0].get("message") or {}
+        r_chars.append(len(msg.get("reasoning") or ""))
+
+    if all(c == 0 for c in r_chars):
+        pytest.skip(
+            f"{spec.name}: model emitted no <think> tags on any dialect "
+            f"run — likely a model/prompt property, not a regression."
+        )
+
+    # M-9 fix: require every dialect to emit SOME thinking.
+    # Pre-fix, `count == 0 or ratio_ok` masked real regressions where
+    # some dialects emitted zero while others emitted normally.
+    for count, label in zip(r_chars, labels):
+        assert count > 0, (
+            f"{spec.name}/{label}: reasoning_chars=0 while another dialect "
+            f"produced non-zero. Likely a resolver / sizing drift. "
+            f"All: {dict(zip(labels, r_chars))}"
+        )
+
+    # All non-zero. Ratio parity within 3x (tolerant for temp=0.3 noise).
+    median = sorted(r_chars)[len(r_chars) // 2]
+    for count, label in zip(r_chars, labels):
+        assert 0.33 * median <= count <= 3.0 * median, (
+            f"{spec.name}/{label}: r_chars={count} > 3x from median={median}. "
+            f"Dialect likely produces different effective budget. "
+            f"All: {dict(zip(labels, r_chars))}"
+        )

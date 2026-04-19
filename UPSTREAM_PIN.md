@@ -150,11 +150,13 @@ Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` f
 
 Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py`.
 
-### Invariant 13: Non-streaming Anthropic thinking-block ordering
+### Invariant 13: Non-streaming Anthropic thinking-block ordering and schema
 
 `vllm_mlx.api.anthropic_adapter.openai_to_anthropic` MUST emit a `type: "thinking"` content block BEFORE the `type: "text"` content block when `choice.message.reasoning` is populated. The ordering matches Anthropic's public API and the streaming path (`server.py:1991-2032`).
 
-Test guard: `tests/test_anthropic_adapter_thinking_block.py`.
+Every `type: "thinking"` block MUST also be schema-conformant with the Anthropic SDK's `ThinkingBlock` model: it MUST include a `signature: str` field. We populate it with `"vllm-mlx:" + sha256(thinking_text).hexdigest()[:32]` — an opaque, deterministic hash so identical reasoning text produces identical signatures across requests. The prefix distinguishes our signatures from Anthropic's own server-signed values.
+
+Test guards: `tests/test_anthropic_adapter_thinking_block.py` (ordering), `tests/test_anthropic_thinking_block_schema.py` (signature contract).
 
 ## Rebase checklist
 

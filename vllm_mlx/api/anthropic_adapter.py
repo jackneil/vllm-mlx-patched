@@ -8,6 +8,7 @@ Handles translation of:
 - Messages: Content blocks, tool calls, tool results
 """
 
+import hashlib
 import json
 import uuid
 
@@ -139,10 +140,17 @@ def openai_to_anthropic(
         # Matches Anthropic's public API and the streaming path
         # (server.py:1991-2032).
         if choice.message.reasoning:
+            sig = (
+                "vllm-mlx:"
+                + hashlib.sha256(
+                    choice.message.reasoning.encode("utf-8")
+                ).hexdigest()[:32]
+            )
             content.append(
                 AnthropicResponseContentBlock(
                     type="thinking",
                     thinking=choice.message.reasoning,
+                    signature=sig,
                 )
             )
 

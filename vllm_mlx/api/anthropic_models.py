@@ -106,6 +106,10 @@ class AnthropicResponseContentBlock(BaseModel):
     # attached reasoning parser's extracted <think>...</think> span.
     # Distinct from text so clients can segment reasoning from the answer.
     thinking: str | None = None
+    # Required by Anthropic SDK's ThinkingBlock schema: an opaque signature
+    # string clients can use to verify/echo the thinking block. We emit a
+    # deterministic hash of the thinking text so same-text → same-signature.
+    signature: str | None = None
     # tool_use fields
     id: str | None = None
     name: str | None = None

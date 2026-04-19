@@ -107,6 +107,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .metrics import streaming_cap_fired_total
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -120,6 +121,14 @@ _model_path: str | None = (
 )
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+# Default wall-clock cap on streaming responses. Referenced by cli.py so
+# the CLI default and the module-level default can't drift. When
+# exceeded, the handler emits finish_reason="length" + message_stop
+# gracefully instead of running until the client aborts. 0 disables the
+# cap. See the CLI --streaming-max-seconds flag for rationale + tuning
+# guidance.
+STREAMING_MAX_SECONDS_DEFAULT: float = 260.0
+_streaming_max_seconds: float = STREAMING_MAX_SECONDS_DEFAULT
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
@@ -2549,8 +2558,99 @@ async def _stream_anthropic_messages(
     current_block_type = None  # "thinking" or "text"
     block_index = 0
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
-        delta_text = output.new_text
+    # Server-side streaming cap — guards against Qwen3.x "interleaved
+    # thinking" trap and any other model-side non-termination. When the
+    # wall-clock cap is hit we cancel the in-flight anext task and fall
+    # through to tail-frame emission with finish_reason="length".
+    #
+    # NOTE: we use explicit task cancellation rather than `break` in an
+    # `async for` loop. A plain break triggers implicit aclose() on the
+    # engine's async iterator, which can throw GeneratorExit into
+    # scheduler.step()'s executor thread mid-mlx-eval — the same Metal
+    # SIGABRT class described in _disconnect_guard's cleanup comment.
+    # Cancellation propagates cleanly through stream_outputs's
+    # CancelledError → abort_request path instead.
+    timed_out = False
+    _stream_cap = _streaming_max_seconds
+    _aiter = engine.stream_chat(messages=messages, **chat_kwargs).__aiter__()
+
+    def _log_cap_fired(path: str) -> None:
+        """Log + metric for cap fire. `path` is `"prologue"` (budget
+        already exhausted on loop re-entry) or `"wait_for"` (engine
+        produced no chunk within the remaining window — the model-wedge
+        case). Both are cap fires; operators use the discriminator to
+        separate wedge from budget-exhaustion in alerts."""
+        logger.warning(
+            "[streaming-timeout] /v1/messages exceeded "
+            "--streaming-max-seconds=%.1f (cap=%s, elapsed=%.1fs, "
+            "completion_tokens=%d, msg_id=%s, model=%s); closing stream "
+            "with stop_reason=max_tokens. Raise --streaming-max-seconds "
+            "if this was a legitimately long response.",
+            _stream_cap,
+            path,
+            time.perf_counter() - start_time,
+            completion_tokens,
+            msg_id,
+            _model_name,
+        )
+        streaming_cap_fired_total.inc()
+
+    while True:
+        remaining = (
+            _stream_cap - (time.perf_counter() - start_time)
+            if _stream_cap
+            else None
+        )
+        if remaining is not None and remaining <= 0:
+            _log_cap_fired("prologue")
+            timed_out = True
+            break
+
+        _anext = asyncio.ensure_future(_aiter.__anext__())
+        try:
+            if remaining is None:
+                output = await _anext
+            else:
+                # shield(_anext) prevents wait_for's timeout from racing
+                # the cancel we issue below. Explicit cancel → CancelledError
+                # in stream_outputs → abort_request, mirroring the
+                # _disconnect_guard cleanup path.
+                output = await asyncio.wait_for(
+                    asyncio.shield(_anext), timeout=remaining
+                )
+        except asyncio.TimeoutError:
+            _anext.cancel()
+            try:
+                # Bounded wait on cleanup — if the engine is wedged
+                # mid-mlx-eval (the very SIGABRT class we're defending
+                # against), CancelledError may never reach the scheduler.
+                # A hung drain would defeat the cap. Give up after 2s.
+                await asyncio.wait_for(_anext, timeout=2.0)
+            except (asyncio.CancelledError, StopAsyncIteration, asyncio.TimeoutError):
+                pass
+            except Exception:
+                logger.exception(
+                    "[streaming-timeout:cleanup-error] /v1/messages _anext "
+                    "raised during cancel cleanup for msg_id=%s; tail frames "
+                    "will still be emitted.",
+                    msg_id,
+                )
+            _log_cap_fired("wait_for")
+            timed_out = True
+            break
+        except StopAsyncIteration:
+            break
+        finally:
+            # Defensive: outer-task cancellation (e.g. _disconnect_guard)
+            # would let `shield` orphan `_anext`. Fire-and-forget cancel
+            # if still pending; safe when already done/cancelled.
+            if not _anext.done():
+                _anext.cancel()
+
+        # Defensive: mirror the hasattr guards on prompt/completion_tokens
+        # so an upstream GenerationOutput rename (new_text → delta_text)
+        # doesn't silently crash the stream mid-request (Pre-Mortem S3).
+        delta_text = getattr(output, "new_text", None) or ""
 
         # Track token counts
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -2637,8 +2737,15 @@ async def _stream_anthropic_messages(
             # content_block_stop
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
 
-    # Determine stop reason
-    stop_reason = "tool_use" if tool_calls else "end_turn"
+    # Determine stop reason. Streaming cap hit → "end_turn" if tool calls
+    # were present (the model did manage to emit a tool use), else
+    # "max_tokens" — Anthropic's value for max_tokens/length termination.
+    if tool_calls:
+        stop_reason = "tool_use"
+    elif timed_out:
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
 
     # Emit message_delta with stop_reason and usage
     message_delta = {
@@ -2830,9 +2937,76 @@ async def stream_chat_completion(
         except Exception as e:
             logger.warning(f"Failed to init tool parser for streaming: {e}")
 
-    # Stream content
-    async for output in engine.stream_chat(messages=messages, **kwargs):
-        delta_text = output.new_text
+    # Server-side streaming cap — same rationale + same cancel-not-break
+    # safety concern as /v1/messages.
+    timed_out = False
+    _stream_cap = _streaming_max_seconds
+    _aiter = engine.stream_chat(messages=messages, **kwargs).__aiter__()
+
+    def _log_cap_fired(path: str) -> None:
+        """See Anthropic handler's _log_cap_fired for rationale."""
+        logger.warning(
+            "[streaming-timeout] /v1/chat/completions exceeded "
+            "--streaming-max-seconds=%.1f (cap=%s, elapsed=%.1fs, "
+            "completion_tokens=%d, response_id=%s, model=%s); closing "
+            "stream with finish_reason=length.",
+            _stream_cap,
+            path,
+            time.perf_counter() - start_time,
+            completion_tokens,
+            response_id,
+            _model_name,
+        )
+        streaming_cap_fired_total.inc()
+
+    while True:
+        remaining = (
+            _stream_cap - (time.perf_counter() - start_time)
+            if _stream_cap
+            else None
+        )
+        if remaining is not None and remaining <= 0:
+            _log_cap_fired("prologue")
+            timed_out = True
+            break
+
+        _anext = asyncio.ensure_future(_aiter.__anext__())
+        try:
+            if remaining is None:
+                output = await _anext
+            else:
+                # See Anthropic handler for why shield is load-bearing.
+                output = await asyncio.wait_for(
+                    asyncio.shield(_anext), timeout=remaining
+                )
+        except asyncio.TimeoutError:
+            _anext.cancel()
+            try:
+                # Bounded — see Anthropic handler for rationale.
+                await asyncio.wait_for(_anext, timeout=2.0)
+            except (asyncio.CancelledError, StopAsyncIteration, asyncio.TimeoutError):
+                pass
+            except Exception:
+                logger.exception(
+                    "[streaming-timeout:cleanup-error] /v1/chat/completions "
+                    "_anext raised during cancel cleanup for response_id=%s; "
+                    "tail frames will still be emitted.",
+                    response_id,
+                )
+            _log_cap_fired("wait_for")
+            timed_out = True
+            break
+        except StopAsyncIteration:
+            break
+        finally:
+            # Defensive cancel if the outer task got cancelled mid-shield.
+            if not _anext.done():
+                _anext.cancel()
+
+        # Defensive: mirror the hasattr guards on prompt/completion_tokens
+        # so an upstream GenerationOutput rename (new_text → delta_text)
+        # doesn't silently crash the stream mid-request (Pre-Mortem S3).
+        delta_text = getattr(output, "new_text", None) or ""
         last_output = output
 
         # Track token counts from output (updated each chunk)
@@ -3004,6 +3178,26 @@ async def stream_chat_completion(
                 ],
             )
             yield f"data: {tool_chunk.model_dump_json()}\n\n"
+
+    # Streaming-cap terminator: if the model never emitted a finish_reason
+    # because we exited the loop at the wall-clock cap, send a synthetic
+    # final chunk so the client sees a clean termination instead of
+    # inferring end-of-stream from the [DONE] marker alone. Use
+    # "tool_calls" when mid-tool-call so strict OpenAI clients don't see
+    # a protocol error; "length" otherwise.
+    if timed_out:
+        _final_reason = "tool_calls" if tool_calls_detected else "length"
+        final_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=_model_name,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(),
+                    finish_reason=_final_reason,
+                )
+            ],
+        )
+        yield f"data: {final_chunk.model_dump_json()}\n\n"
 
     # Log throughput
     elapsed = time.perf_counter() - start_time

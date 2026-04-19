@@ -93,3 +93,34 @@ def test_different_reasoning_produces_different_signatures():
     r1 = openai_to_anthropic(_mk_openai_response(reasoning="one"), model="m")
     r2 = openai_to_anthropic(_mk_openai_response(reasoning="two"), model="m")
     assert r1.content[0].signature != r2.content[0].signature
+
+
+# ---- Inbound schema sentinels (round-trip protection) ----
+
+
+def test_inbound_content_block_accepts_thinking_type():
+    """Pins that AnthropicContentBlock accepts `type: "thinking"` with a
+    `thinking` field on inbound. If an upstream rebase tightens `type` to
+    a Literal enum excluding "thinking", this sentinel catches the
+    regression that would silently 422 every Qwen3+ assistant-history
+    thinking block in multi-turn conversations."""
+    from vllm_mlx.api.anthropic_models import AnthropicContentBlock
+
+    block = AnthropicContentBlock(
+        type="thinking",
+        thinking="prior reasoning from this assistant turn",
+        signature="vllm-mlx:deadbeef",
+    )
+    assert block.type == "thinking"
+    assert block.thinking == "prior reasoning from this assistant turn"
+    assert block.signature == "vllm-mlx:deadbeef"
+
+
+def test_inbound_content_block_thinking_defaults_to_none():
+    """Fields default to None so old clients that don't send them still
+    parse cleanly."""
+    from vllm_mlx.api.anthropic_models import AnthropicContentBlock
+
+    block = AnthropicContentBlock(type="text", text="hello")
+    assert block.thinking is None
+    assert block.signature is None

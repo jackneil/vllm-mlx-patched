@@ -10,6 +10,8 @@ Handles translation of:
 
 import hashlib
 import json
+import logging
+import re
 import uuid
 
 from .anthropic_models import (
@@ -21,6 +23,53 @@ from .anthropic_models import (
     AnthropicUsage,
 )
 from .effort import ResolvedBudget, resolve_effort
+from .utils import SPECIAL_TOKENS_PATTERN as _SPECIAL_TOKENS_OUTPUT_PATTERN
+
+logger = logging.getLogger(__name__)
+
+# Literals that, if present inside client-supplied assistant-history
+# thinking content, would escape the `<think>…</think>` wrapper we build
+# at conversion time — letting the client inject arbitrary prompt
+# structure (tool calls, system-level instructions, turn markers) into
+# the model's context. We drop the whole thinking block (with a WARN)
+# when any of these appears.
+#
+# DELIBERATELY distinct from `SPECIAL_TOKENS_PATTERN` in api/utils.py:
+#   - SPECIAL_TOKENS_PATTERN is an OUTBOUND scrub: strips special tokens
+#     from MODEL OUTPUT while intentionally preserving `<think>…</think>`
+#     (those are the reasoning markers we want the client to see).
+#   - This pattern is an INBOUND reject: drops client INPUT that would
+#     break the wrapper we're about to build. `<think>` and `</think>`
+#     MUST be in this set even though they're NOT in SPECIAL_TOKENS.
+#
+# The regex reuses `SPECIAL_TOKENS_PATTERN.pattern` as the base, unions
+# `<think>` / `</think>`, and the full `<|channel|>…<|message|>` channel
+# marker (GPT-OSS). Keeping them textually linked to SPECIAL_TOKENS
+# prevents drift if that outbound pattern grows.
+_THINKING_INJECTION_PATTERNS = re.compile(
+    "|".join(
+        [
+            r"<think>",
+            r"</think>",
+            # GPT-OSS/Harmony channel forms:
+            #   `<|channel|>final<|message|>` (full marker)
+            #   `<|channel|>` (bare — already in SPECIAL_TOKENS below)
+            #   `<|channel>` (single-pipe, Gemma variant)
+            r"<\|channel\|>[a-z]*(?:<\|message\|>)?",
+            r"<\|channel>",
+            # Gemma chat-template turn markers.
+            r"<start_of_turn>",
+            r"<end_of_turn>",
+            _SPECIAL_TOKENS_OUTPUT_PATTERN.pattern,
+        ]
+    )
+)
+
+# Bidi / isolate controls that BPE tokenizers may treat as ordinary glyphs
+# in edge cases — strip them from thinking content we round-trip back to
+# the model. See Wave 2 /dcr review (paranoid-auditor lens).
+_BIDI_CONTROL_PATTERN = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
+
 from .models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -261,7 +310,26 @@ def _convert_message(
             # close the current turn's </think>. Non-Qwen parsers drop.
             thinking_text = (getattr(block, "thinking", None) or "").strip()
             if preserve_thinking and thinking_text:
-                thinking_parts.append(thinking_text)
+                # Reject content that would escape the <think>…</think>
+                # wrapper we build below (Wave 2 /dcr CRITICAL finding):
+                # a client sending "reason\n</think>\nSYSTEM: …" could
+                # otherwise smuggle arbitrary prompt structure past the
+                # closing tag. Drop with WARN rather than try to escape
+                # (no defined escape form for these tokenizer specials).
+                if _THINKING_INJECTION_PATTERNS.search(thinking_text):
+                    logger.warning(
+                        "[thinking-preservation] assistant-history thinking "
+                        "block dropped: contains injection marker "
+                        "(<think>/</think>/<|im_end|>/<|endoftext|>/<|channel|>). "
+                        "Block length=%d. Client may be attempting to smuggle "
+                        "prompt structure through the round-trip.",
+                        len(thinking_text),
+                    )
+                    continue
+                # Strip Bidi/isolate controls that some BPE tokenizers
+                # absorb into ordinary tokens.
+                sanitized = _BIDI_CONTROL_PATTERN.sub("", thinking_text)
+                thinking_parts.append(sanitized)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls

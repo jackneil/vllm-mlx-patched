@@ -40,6 +40,7 @@ def serve_command(args):
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
+    server._streaming_max_seconds = args.streaming_max_seconds
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -975,6 +976,32 @@ Examples:
         type=float,
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
+    )
+    from .server import STREAMING_MAX_SECONDS_DEFAULT as _STREAMING_DEFAULT
+
+    def _nonneg_float(raw: str) -> float:
+        v = float(raw)
+        if v < 0:
+            raise argparse.ArgumentTypeError(
+                f"--streaming-max-seconds must be >= 0 (got {v}). "
+                "Use 0 to disable the cap."
+            )
+        return v
+
+    serve_parser.add_argument(
+        "--streaming-max-seconds",
+        type=_nonneg_float,
+        default=_STREAMING_DEFAULT,
+        help=(
+            "Server-side cap on streaming response wall-clock duration "
+            "(default: 260s — sits under typical 300s client timeouts with "
+            "a 40s margin for SSE tail frames). When hit, the streaming "
+            "handler emits finish_reason=length + message_stop gracefully "
+            "instead of letting the stream run until the client aborts. "
+            "Mitigates the Qwen3.x 'interleaved thinking' trap and any "
+            "other model-side non-termination. Set higher if you legitimately "
+            "stream >260s responses; set to 0 to disable the cap."
+        ),
     )
     # Tool calling options
     serve_parser.add_argument(

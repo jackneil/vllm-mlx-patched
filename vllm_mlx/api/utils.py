@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pattern to match special tokens that should be removed from output
-# Keeps <think>...</think> blocks intact for reasoning models
+# Keeps <think>...</think> blocks intact for reasoning models.
+#
+# NOTE: a distinct inbound-reject pattern lives in
+# `api/anthropic_adapter.py::_THINKING_INJECTION_PATTERNS` — it UNIONS
+# this pattern with `<think>`/`</think>` to catch client-supplied
+# prompt-injection attempts in assistant-history thinking blocks.
+# Keep that pattern in sync with this one (it derives from `.pattern`).
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"

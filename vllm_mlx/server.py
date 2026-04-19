@@ -2148,9 +2148,22 @@ async def create_anthropic_message(
         f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls
+    # IMPORTANT: Reasoning extraction MUST run before tool parsing — mirrors
+    # the OpenAI /v1/chat/completions handler. If reversed, tool parsers'
+    # strip_think_tags() destroys reasoning content before the reasoning
+    # parser can extract it (issue #161). Without this step, the thinking
+    # block on the Anthropic response stays empty because openai_to_anthropic
+    # reads choice.message.reasoning.
+    reasoning_text = None
+    text_for_tools = output.text
+    if _reasoning_parser:
+        reasoning_text, text_for_tools = _reasoning_parser.extract_reasoning(
+            output.text
+        )
+
+    # Parse tool calls from the remainder (reasoning already extracted).
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, openai_request
+        text_for_tools if text_for_tools is not None else "", openai_request
     )
 
     # Clean output text
@@ -2161,13 +2174,16 @@ async def create_anthropic_message(
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-    # Build OpenAI response to convert
+    # Build OpenAI response to convert — populate `reasoning` so
+    # openai_to_anthropic emits the type:"thinking" content block alongside
+    # the text block. See UPSTREAM_PIN invariant #13.
     openai_response = ChatCompletionResponse(
         model=_model_name,
         choices=[
             ChatCompletionChoice(
                 message=AssistantMessage(
                     content=final_content,
+                    reasoning=reasoning_text,
                     tool_calls=tool_calls,
                 ),
                 finish_reason=finish_reason,
@@ -2182,6 +2198,28 @@ async def create_anthropic_message(
 
     # Convert to Anthropic response
     anthropic_response = openai_to_anthropic(openai_response, _model_name)
+
+    # vllm-mlx extension: populate AnthropicUsage.thinking_tokens with a
+    # best-effort count of the reasoning portion alone. Operators use this
+    # to measure thinking depth without re-tokenizing the response. Narrow
+    # the caught types to the expected tokenizer failure classes so
+    # genuinely unexpected errors still bubble up. Log at WARNING so a
+    # fleet-wide degradation shows in operator logs instead of silently
+    # dropping the field for every request.
+    if reasoning_text and _reasoning_parser is not None:
+        _tok = getattr(_reasoning_parser, "tokenizer", None)
+        if _tok is not None and hasattr(_tok, "encode"):
+            try:
+                anthropic_response.usage.thinking_tokens = len(
+                    _tok.encode(reasoning_text)
+                )
+            except (TypeError, ValueError, AttributeError, UnicodeError) as exc:
+                logger.warning(
+                    "thinking_tokens tokenization failed (%s: %s); "
+                    "leaving field as None",
+                    type(exc).__name__,
+                    exc,
+                )
     _resp_headers: dict[str, str] = {}
     if _anthropic_budget_requested(anthropic_request):
         applied = getattr(output, "thinking_budget_applied", None)

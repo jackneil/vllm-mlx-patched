@@ -165,3 +165,68 @@ def test_adapter_clear_treats_none_return_as_success():
     all_cleared, refused = adapter.clear()
     assert all_cleared is True
     assert refused == []
+
+
+# ---- PR-E Task E.1: full adapter chain exercise ----
+
+
+def test_clear_walks_scheduler_attribute_chain():
+    """_PrefixCacheEndpointAdapter.clear() must walk the real
+    BatchedEngine._engine.engine.scheduler chain, not be mocked at
+    app.state. Regression guard: pre-fix, tests mocked at adapter level
+    and masked the scheduler-walking logic (PR #13 known follow-up #2)."""
+    from vllm_mlx.server import _PrefixCacheEndpointAdapter
+
+    scheduler = MagicMock()
+    cache_tier = MagicMock()
+    cache_tier.clear = MagicMock(return_value=True)
+    scheduler.memory_aware_cache = cache_tier
+    scheduler.block_aware_cache = None
+    scheduler.prefix_cache = None
+
+    core_engine = MagicMock()
+    core_engine.engine = MagicMock()
+    core_engine.engine.scheduler = scheduler
+
+    outer = MagicMock()
+    outer._engine = core_engine
+
+    adapter = _PrefixCacheEndpointAdapter(outer)
+    all_cleared, refused = adapter.clear()
+    assert all_cleared is True
+    assert refused == []
+    cache_tier.clear.assert_called_once()
+
+
+def test_stats_walks_scheduler_attribute_chain():
+    """GET /v1/cache/stats must similarly walk the real chain."""
+    from vllm_mlx.server import _PrefixCacheEndpointAdapter
+
+    scheduler = MagicMock()
+    scheduler.get_cache_stats = MagicMock(return_value={
+        "cache_hits": 100, "cache_misses": 5,
+    })
+    core_engine = MagicMock()
+    core_engine.engine = MagicMock()
+    core_engine.engine.scheduler = scheduler
+    outer = MagicMock()
+    outer._engine = core_engine
+
+    adapter = _PrefixCacheEndpointAdapter(outer)
+    stats = adapter.get_stats()
+    assert stats == {"cache_hits": 100, "cache_misses": 5}
+    scheduler.get_cache_stats.assert_called_once()
+
+
+def test_clear_handles_missing_scheduler_gracefully():
+    """When engine doesn't expose the expected chain (e.g., SimpleEngine
+    paths, test stubs), clear() must no-op rather than raise AttributeError."""
+    from vllm_mlx.server import _PrefixCacheEndpointAdapter
+
+    class _BrokenEngine:
+        _engine = None
+
+    adapter = _PrefixCacheEndpointAdapter(_BrokenEngine())
+    all_cleared, refused = adapter.clear()
+    assert all_cleared is True
+    assert refused == []

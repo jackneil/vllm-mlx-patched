@@ -64,3 +64,47 @@ def test_helper_zero_budget_omits_floor():
     headers = _build_thinking_budget_headers(resolved, applied=True)
     assert headers["x-thinking-budget-resolved"] == "0"
     assert "x-thinking-budget-max-tokens-floor" not in headers
+
+
+def test_noop_reason_emitted_when_applied_false():
+    from vllm_mlx.server import _build_thinking_budget_headers
+
+    resolved = ResolvedBudget(
+        budget=512,
+        source=EffortSource.TOP_LEVEL,
+        max_tokens_floor=2048,
+        effort_label=None,
+    )
+    headers = _build_thinking_budget_headers(
+        resolved, applied=False, noop_reason="mllm_path",
+    )
+    assert headers["x-thinking-budget-applied"] == "false"
+    assert headers["x-thinking-budget-noop-reason"] == "mllm_path"
+
+
+def test_noop_reason_omitted_when_applied_true():
+    from vllm_mlx.server import _build_thinking_budget_headers
+
+    resolved = ResolvedBudget(
+        budget=512,
+        source=EffortSource.TOP_LEVEL,
+        max_tokens_floor=2048,
+        effort_label=None,
+    )
+    headers = _build_thinking_budget_headers(resolved, applied=True)
+    assert "x-thinking-budget-noop-reason" not in headers
+
+
+def test_noop_reason_omitted_when_none_even_on_false():
+    from vllm_mlx.server import _build_thinking_budget_headers
+
+    resolved = ResolvedBudget(
+        budget=512,
+        source=EffortSource.TOP_LEVEL,
+        max_tokens_floor=2048,
+        effort_label=None,
+    )
+    headers = _build_thinking_budget_headers(
+        resolved, applied=False, noop_reason=None,
+    )
+    assert "x-thinking-budget-noop-reason" not in headers

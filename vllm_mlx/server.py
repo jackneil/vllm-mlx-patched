@@ -199,16 +199,47 @@ def _streaming_header_value(
     return "true"
 
 
+def _streaming_noop_reason(
+    *, is_mllm: bool, reasoning_parser, engine_supports_budget: bool
+) -> str | None:
+    """Streaming pre-flight: map the same engine-state tuple used by
+    `_streaming_header_value` onto a ``noop_reason`` string when the
+    processor is known NOT to attach. Returns None when the processor
+    is likely to attach.
+
+    Reason strings match ``Request.thinking_budget_noop_reason`` so the
+    streaming pre-flight header agrees with the non-streaming path that
+    reads the value off ``RequestOutput``:
+      - ``"mllm_path"``             — MLLM engines skip logits_processors
+      - ``"simple_engine"``         — SimpleEngine path ignores budget
+      - ``"parser_not_configured"`` — no --reasoning-parser wired
+    """
+    if is_mllm:
+        return "mllm_path"
+    if not engine_supports_budget:
+        return "simple_engine"
+    if reasoning_parser is None:
+        return "parser_not_configured"
+    return None
+
+
 def _build_thinking_budget_headers(
     resolved: ResolvedBudget,
     applied: bool | None,
+    noop_reason: str | None = None,
 ) -> dict[str, str]:
-    """Build the four x-thinking-budget-* response headers from a ResolvedBudget.
+    """Build the x-thinking-budget-* response headers from a ResolvedBudget.
 
     `applied` is the pre-existing bool/None the emission sites were computing
     before this change (based on whether the logits processor attached and the
     family can enforce). It stays separate because applied = "did it actually
     work" != resolved = "what did we decide to try."
+
+    `noop_reason`, when present with applied=False, surfaces WHY the processor
+    didn't attach (e.g. ``"simple_engine"``, ``"mllm_path"``,
+    ``"parser_not_configured"``, ``"tokenizer_encode_failed"``). Operators
+    need this to diagnose silent no-ops — without it, the only signal is
+    `applied=false` with no root cause (the arena incident on 2026-04-18).
     """
     headers: dict[str, str] = {}
 
@@ -227,6 +258,13 @@ def _build_thinking_budget_headers(
     # 4. x-thinking-budget-max-tokens-floor — recommended min max_tokens.
     if resolved.max_tokens_floor is not None:
         headers["x-thinking-budget-max-tokens-floor"] = str(resolved.max_tokens_floor)
+
+    # 5. x-thinking-budget-noop-reason — emitted ONLY when applied is False.
+    # Tells operators WHY the processor didn't attach (simple_engine vs
+    # mllm_path vs parser_not_configured vs tokenizer_encode_failed). Absent
+    # when applied is True or no budget was requested.
+    if applied is False and noop_reason:
+        headers["x-thinking-budget-noop-reason"] = noop_reason
 
     return headers
 
@@ -1722,10 +1760,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
             )
+            _streaming_noop = _streaming_noop_reason(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
             stream_headers.update(
                 _build_thinking_budget_headers(
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
+                    noop_reason=_streaming_noop,
                 )
             )
         elif _resolved_budget.source != EffortSource.DEFAULT:
@@ -1821,11 +1865,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         from fastapi.responses import JSONResponse
 
         applied = getattr(output, "thinking_budget_applied", None)
+        noop_reason = getattr(output, "thinking_budget_noop_reason", None)
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
             headers=_build_thinking_budget_headers(
                 _resolved_budget,
                 applied=(applied is True),
+                noop_reason=noop_reason,
             ),
         )
 
@@ -1934,10 +1980,16 @@ async def create_anthropic_message(
                 reasoning_parser=getattr(engine, "_reasoning_parser", None),
                 engine_supports_budget=isinstance(engine, BatchedEngine),
             )
+            _streaming_noop = _streaming_noop_reason(
+                is_mllm=getattr(engine, "_is_mllm", False),
+                reasoning_parser=getattr(engine, "_reasoning_parser", None),
+                engine_supports_budget=isinstance(engine, BatchedEngine),
+            )
             headers.update(
                 _build_thinking_budget_headers(
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
+                    noop_reason=_streaming_noop,
                 )
             )
         elif _resolved_budget.source != EffortSource.DEFAULT:
@@ -2034,10 +2086,12 @@ async def create_anthropic_message(
     _resp_headers: dict[str, str] = {}
     if _anthropic_budget_requested(anthropic_request):
         applied = getattr(output, "thinking_budget_applied", None)
+        noop_reason = getattr(output, "thinking_budget_noop_reason", None)
         _resp_headers.update(
             _build_thinking_budget_headers(
                 _resolved_budget,
                 applied=(applied is True),
+                noop_reason=noop_reason,
             )
         )
     elif _resolved_budget.source != EffortSource.DEFAULT:

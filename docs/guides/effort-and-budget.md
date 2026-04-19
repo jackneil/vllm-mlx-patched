@@ -47,21 +47,35 @@ Every response that went through the resolver emits these headers:
 | `x-thinking-budget-resolved` | int as string, or `"none"` | The resolver's output — what the server actually tried to enforce. |
 | `x-thinking-budget-source` | `top_level` \| `anthropic_thinking_enabled` \| `anthropic_thinking_disabled` \| `anthropic_thinking_adaptive` \| `output_config_effort` \| `reasoning_effort` \| `default` | Which input field won precedence. |
 | `x-thinking-budget-max-tokens-floor` | int as string | Recommended minimum `max_tokens` for this effort level. Absent when source is `default` or budget is 0. |
-| `x-thinking-budget-noop-reason` | string (e.g., `channel_protocol_not_supported`) | Explains why `applied=false`. Only present when applied=false. |
+| `x-thinking-budget-noop-reason` | `parser_not_configured` \| `tokenizer_encode_failed` \| `multi_token_delimiter` \| `mllm_path` \| `simple_engine` | Machine-readable reason the processor didn't attach. Only present when `applied=false`. See **Noop reasons** below. |
 
 ## Per-family enforceability
 
-Not every model family can enforce the budget. The logits processor biases the `</think>` token's logit when the budget is hit — this only works if `</think>` tokenizes to a single token.
+Not every model family can enforce the budget. The logits processor biases the `</think>` token's logit when the budget is hit — this only works if `</think>` tokenizes to a single token AND the engine runs logits processors at all.
 
-| Family | Thinking protocol | Enforceable? |
+| Family | Thinking protocol | Enforceable? | Typical noop reason |
+|---|---|---|---|
+| Qwen3 / Qwen3.5 / Qwen3.6 | `<think>…</think>` (single token) | ✓ | — |
+| DeepSeek-R1 | `<think>…</think>` | ✓ | — |
+| Generic models with `think_parser` | `<think>…</think>` | ✓ | — |
+| Gemma 4 | channel protocol, also auto-detected as MLLM | ✗ — loud noop | `mllm_path` |
+| GPT-OSS / Harmony | channel protocol (multi-token) | ✗ — loud noop | `multi_token_delimiter` |
+
+When enforcement fails, the request still succeeds — the server generates normally and reports `applied=false` + the reason header. Nothing silent.
+
+## Noop reasons
+
+| Value | What it means | How to fix |
 |---|---|---|
-| Qwen3 / Qwen3.5 / Qwen3.6 | `<think>…</think>` (single token) | ✓ |
-| DeepSeek-R1 | `<think>…</think>` | ✓ |
-| Generic models with `think_parser` | `<think>…</think>` | ✓ |
-| Gemma 4 | channel protocol (multi-token) | ✗ — loud noop |
-| GPT-OSS / Harmony | channel protocol | ✗ — loud noop |
+| `parser_not_configured` | Server started without `--reasoning-parser`. | Restart the server with e.g. `--reasoning-parser qwen3`. |
+| `tokenizer_encode_failed` | The parser's `start_token` / `end_tokens` raised when encoded, or returned an empty list. | Usually means the parser is mismatched with the tokenizer. Check parser/model compatibility. |
+| `multi_token_delimiter` | Delimiters exist but encode to >1 token — the force-bias logic only hits single-token `</think>`. | Inherent to the model family. No fix; choose a family with single-token delimiters or accept unbounded thinking. |
+| `mllm_path` | Request went through the multimodal path, which skips logits processors entirely. | Inherent to the path. For text-only requests you can force the LLM path if the model supports it; otherwise accept unbounded thinking. |
+| `simple_engine` | Server is running in SimpleEngine mode, which doesn't support logits processors. | Restart the server with `--continuous-batching`. This is the most common misconfiguration. |
 
-When a model family cannot enforce, the server attaches the processor anyway (so `applied=false` is a legitimate signal rather than a silent failure), emits `x-thinking-budget-noop-reason`, and generates normally. The request succeeds with no cap applied.
+## `AnthropicUsage.thinking_tokens` (vllm-mlx extension)
+
+Non-streaming `/v1/messages` responses include a `usage.thinking_tokens` field carrying the token count of the reasoning portion alone (Anthropic's public API only surfaces a single `output_tokens`). `None` (excluded from JSON) when no reasoning was produced. Best-effort — computed by tokenizing the extracted reasoning text with the reasoning parser's tokenizer; a tokenizer failure logs a WARNING and leaves the field as `None`. Streaming does not yet emit this field.
 
 ## Examples
 
@@ -114,3 +128,5 @@ or (Anthropic only)
 When setting a non-zero budget, ensure `max_tokens >= thinking_token_budget + content_headroom` (roughly `budget + 1000` for typical chat responses). If `max_tokens` is too tight, the model hits `max_tokens` while still inside `<think>` and the caller sees `finish_reason: "length"` with an empty or truncated content block.
 
 Clients can trust `x-thinking-budget-max-tokens-floor` as a floor — it is always at least `budget + content_headroom`.
+
+The server logs a WARNING with prefix `[thinking-budget-resolver]` when `max_tokens < max_tokens_floor` at request ingress, naming the effort level, the floor, and the received `max_tokens` — grep operator logs for this marker when debugging truncated output on `effort=high` requests.

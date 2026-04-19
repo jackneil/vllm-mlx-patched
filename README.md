@@ -1,11 +1,13 @@
-# vLLM-MLX
+# vLLM-MLX (patched fork)
 
 **vLLM-like inference for Apple Silicon** - GPU-accelerated Text, Image, Video & Audio on Mac
+
+> **This is a patched fork** of [waybarrios/vllm-mlx](https://github.com/waybarrios/vllm-mlx) tracked at [`jackneil/vllm-mlx-patched`](https://github.com/jackneil/vllm-mlx-patched). It adds per-request thinking-token budgets, provider-dialect effort unification, cache-safety guards, and assorted `mlx_lm` 0.31.x compatibility fixes. See [`CHANGELOG.md`](CHANGELOG.md) for the full diff vs. upstream and [`UPSTREAM_PIN.md`](UPSTREAM_PIN.md) for the invariants that must survive a rebase.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Apple Silicon](https://img.shields.io/badge/Apple-Silicon-black.svg)](https://support.apple.com/en-us/HT211814)
-[![GitHub](https://img.shields.io/badge/GitHub-waybarrios%2Fvllm--mlx-blue?logo=github)](https://github.com/waybarrios/vllm-mlx)
+[![GitHub](https://img.shields.io/badge/GitHub-jackneil%2Fvllm--mlx--patched-blue?logo=github)](https://github.com/jackneil/vllm-mlx-patched)
 
 ## Overview
 
@@ -26,8 +28,9 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **Anthropic Messages API** - native `/v1/messages` endpoint for Claude Code and OpenCode
 - **Embeddings** - OpenAI-compatible `/v1/embeddings` endpoint with mlx-embeddings
 - **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
+- **Thinking Token Budget** (fork) - per-request caps via `thinking_token_budget`, `reasoning_effort`, `output_config.effort`, or Anthropic `thinking.type` — see [Effort & Thinking Budget](docs/guides/effort-and-budget.md)
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
-- **Paged KV Cache** - memory-efficient caching with prefix sharing
+- **Paged KV Cache** - memory-efficient caching with prefix sharing + in-flight guards (fork: `DELETE /v1/cache` returns HTTP 409 under load instead of crashing the generation loop)
 - **Continuous Batching** - high throughput for multiple concurrent users
 
 ## Quick Start
@@ -224,8 +227,13 @@ For full documentation, see the [docs](docs/) directory:
   - [Audio (STT/TTS)](docs/guides/audio.md)
   - [Embeddings](docs/guides/embeddings.md)
   - [Reasoning Models](docs/guides/reasoning.md)
+  - [Effort & Thinking Budget](docs/guides/effort-and-budget.md) *(fork)*
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
+
+- **Fork-specific**
+  - [Changelog](CHANGELOG.md)
+  - [Upstream Pin + Invariants](UPSTREAM_PIN.md)
 
 - **Reference**
   - [CLI Commands](docs/reference/cli.md)
@@ -371,7 +379,7 @@ We welcome contributions! See [Contributing Guide](docs/development/contributing
 - Documentation improvements
 - Benchmarks on different Apple Silicon chips
 
-Submit PRs to: [https://github.com/waybarrios/vllm-mlx](https://github.com/waybarrios/vllm-mlx)
+Submit PRs against this fork at [https://github.com/jackneil/vllm-mlx-patched](https://github.com/jackneil/vllm-mlx-patched). Changes that aren't fork-specific are ideally also sent upstream to [waybarrios/vllm-mlx](https://github.com/waybarrios/vllm-mlx) so everyone benefits.
 
 ## License
 

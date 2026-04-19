@@ -12,6 +12,7 @@ This module provides two implementations:
 
 import copy
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -113,12 +114,11 @@ class PrefixCacheManager:
         # Statistics
         self.stats = PrefixCacheStats()
 
-        # PR-A Task A.3: in-flight guard counter for clear() refusal.
-        # Defense-in-depth — PrefixCacheManager itself has no liveness
-        # tracking; production-side acquire/release wiring is a follow-up.
-        # Today the downstream PagedCacheManager guard is the authoritative
-        # one; this mirror keeps the contract uniform across cache tiers.
-        self._in_flight_count: int = 0
+        # In-flight guard for clear() — PR-A Task A.3 + acquire/release
+        # wiring for production. The set is canonical; _in_flight_count
+        # is a derived view kept for test/backward-compat readers.
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_ids: set[str] = set()
 
     def _search(
         self, tokens: List[int]
@@ -366,33 +366,50 @@ class PrefixCacheManager:
             True if cache was wiped; False if refused because requests
             are in flight.
         """
-        num_in_use = self._in_flight_count
-        if num_in_use > 0:
-            logger.warning(
-                "[prefix-cache-admin] PrefixCacheManager.clear refused: "
-                "%d active requests. Drain traffic or wait for idle.",
-                num_in_use,
-            )
-            return False
+        with self._in_flight_lock:
+            num_in_use = len(self._in_flight_ids)
+            if num_in_use > 0:
+                logger.warning(
+                    "[prefix-cache-admin] PrefixCacheManager.clear refused: "
+                    "%d active requests. Drain traffic or wait for idle.",
+                    num_in_use,
+                )
+                return False
 
-        self._cache.clear()
-        self._lru.clear()
-        self.reset_stats()
-        logger.info("PrefixCacheManager cleared")
-        return True
+            self._cache.clear()
+            self._lru.clear()
+            self.reset_stats()
+            logger.info("PrefixCacheManager cleared")
+            return True
 
     # -----------------------------------------------------------------
-    # In-flight guard test helper — PR-A Task A.3
+    # In-flight guard API — PR-A Task A.3 + production acquire/release.
+    # See MemoryAwarePrefixCache.acquire/release for the sibling impl.
     # -----------------------------------------------------------------
+    @property
+    def _in_flight_count(self) -> int:
+        """Derived view kept for test/backward-compat readers."""
+        with self._in_flight_lock:
+            return len(self._in_flight_ids)
+
+    def acquire(self, request_id: str) -> None:
+        """Record that `request_id` is in flight and blocks clear()."""
+        with self._in_flight_lock:
+            self._in_flight_ids.add(request_id)
+
+    def release(self, request_id: str) -> None:
+        """Release `request_id`'s hold. No-op if unknown (idempotent)."""
+        with self._in_flight_lock:
+            self._in_flight_ids.discard(request_id)
+
     def _mark_in_use_for_test(self) -> None:
-        """Bump the in-flight counter so ``clear()`` refuses.
+        """Bump with a synthetic id so ``clear()`` refuses.
 
-        Test-only affordance. Production wiring (scheduler-side acquire
-        on request enter / release on exit) is a follow-up; today this
-        guard is defense-in-depth behind PagedCacheManager's guard.
-        Mirrors the A.1 helper on MemoryAwarePrefixCache.
+        Test-only affordance. Each call adds a fresh id so multiple
+        invocations stack, matching the pre-acquire counter behavior.
         """
-        self._in_flight_count += 1
+        import uuid as _uuid
+        self.acquire(f"_test_{_uuid.uuid4()}")
 
     def __len__(self) -> int:
         """Return number of cached entries."""

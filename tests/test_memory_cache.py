@@ -497,3 +497,57 @@ class TestClearInFlightGuard:
         assert len(cache) == 1, (
             "refused clear must leave entries intact for live decoders"
         )
+
+
+# ---- acquire/release production API ----
+
+def test_acquire_blocks_clear_release_allows_it():
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    cache = MemoryAwarePrefixCache(model=None)
+    cache.acquire("req-A")
+
+    assert cache.clear() is False  # refused while req-A holds
+
+    cache.release("req-A")
+    assert cache.clear() is True   # allowed after release
+
+
+def test_acquire_is_idempotent():
+    """Double-acquire of same request_id is a no-op (set semantics)."""
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    cache = MemoryAwarePrefixCache(model=None)
+    cache.acquire("req-A")
+    cache.acquire("req-A")
+    cache.acquire("req-A")
+    assert cache._in_flight_count == 1
+
+    cache.release("req-A")
+    assert cache._in_flight_count == 0
+
+
+def test_release_unknown_id_is_silent_noop():
+    """Release of id never acquired doesn't error or underflow."""
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    cache = MemoryAwarePrefixCache(model=None)
+    cache.release("never-acquired")
+    assert cache._in_flight_count == 0
+    assert cache.clear() is True
+
+
+def test_acquire_release_multiple_requests_independent():
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    cache = MemoryAwarePrefixCache(model=None)
+    cache.acquire("req-A")
+    cache.acquire("req-B")
+    assert cache._in_flight_count == 2
+
+    cache.release("req-A")
+    assert cache._in_flight_count == 1
+    assert cache.clear() is False  # req-B still holds
+
+    cache.release("req-B")
+    assert cache.clear() is True

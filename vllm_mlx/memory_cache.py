@@ -27,6 +27,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import threading as _threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -440,17 +441,17 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
-        # In-flight guard for clear() — PR-A Task A.1.
-        # Non-zero when entries are held by live requests; clear() refuses
-        # in that case so DELETE /v1/cache can return HTTP 409 instead of
-        # wiping state mid-decode and crashing the generation loop.
+        # In-flight guard for clear() — PR-A Task A.1 + acquire/release
+        # wiring for production (follow-up). The set is the canonical
+        # representation; _in_flight_count is a derived view kept for
+        # backward compatibility with tests that read it directly.
         #
-        # NOTE: this is defense-in-depth only today. Concrete wiring from
-        # the scheduler (acquire on request enter, release on exit) is a
-        # follow-up — PagedCacheManager.reset_prefix_cache() is what
-        # actually protects the live system right now. See paged_cache.py
-        # lines ~1149-1156 for the reference guard pattern.
-        self._in_flight_count: int = 0
+        # acquire(req_id) and release(req_id) are called by the scheduler
+        # at request enter / exit. clear() refuses when the set is
+        # non-empty so DELETE /v1/cache returns HTTP 409 instead of
+        # wiping state mid-decode and crashing the generation loop.
+        self._in_flight_lock = _threading.Lock()
+        self._in_flight_ids: set[str] = set()
 
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
@@ -837,33 +838,55 @@ class MemoryAwarePrefixCache:
             True if the cache was wiped; False if the clear was refused
             because entries are in use.
         """
-        num_in_use = self._in_flight_count
-        if num_in_use > 0:
-            logger.warning(
-                "[prefix-cache-admin] MemoryAwarePrefixCache.clear refused: "
-                "%d entries in use. Drain traffic or wait for idle.",
-                num_in_use,
-            )
-            return False
+        with self._in_flight_lock:
+            num_in_use = len(self._in_flight_ids)
+            if num_in_use > 0:
+                logger.warning(
+                    "[prefix-cache-admin] MemoryAwarePrefixCache.clear refused: "
+                    "%d entries in use. Drain traffic or wait for idle.",
+                    num_in_use,
+                )
+                return False
 
-        self._entries.clear()
-        self._sorted_keys.clear()
-        self._current_memory = 0
-        self._stats = CacheStats(max_memory_bytes=self._max_memory)
-        logger.debug("Cache cleared")
-        return True
+            self._entries.clear()
+            self._sorted_keys.clear()
+            self._current_memory = 0
+            self._stats = CacheStats(max_memory_bytes=self._max_memory)
+            logger.debug("Cache cleared")
+            return True
 
     # -----------------------------------------------------------------
-    # In-flight guard test helper — PR-A Task A.1
+    # In-flight guard API — PR-A Task A.1 + production acquire/release.
+    # Scheduler calls acquire(request_id) when a request enters and
+    # release(request_id) when it exits (finished or aborted). The
+    # underlying set makes both operations idempotent so double-calls
+    # and unknown-id releases are safe.
     # -----------------------------------------------------------------
+    @property
+    def _in_flight_count(self) -> int:
+        """Derived view kept for test/backward-compat readers."""
+        with self._in_flight_lock:
+            return len(self._in_flight_ids)
+
+    def acquire(self, request_id: str) -> None:
+        """Record that `request_id` holds entries and blocks clear()."""
+        with self._in_flight_lock:
+            self._in_flight_ids.add(request_id)
+
+    def release(self, request_id: str) -> None:
+        """Release `request_id`'s hold. No-op if unknown (idempotent)."""
+        with self._in_flight_lock:
+            self._in_flight_ids.discard(request_id)
+
     def _mark_in_use_for_test(self) -> None:
-        """Bump the in-flight counter so `clear()` refuses.
+        """Bump the in-flight set with a synthetic id so `clear()` refuses.
 
-        Test-only affordance. Production wiring (scheduler-side acquire
-        on request enter / release on exit) is a follow-up; today this
-        guard is defense-in-depth behind PagedCacheManager's guard.
+        Test-only affordance. Each call adds a fresh synthetic id so
+        multiple invocations stack (matching the pre-acquire counter
+        behavior the existing tests rely on).
         """
-        self._in_flight_count += 1
+        import uuid as _uuid
+        self.acquire(f"_test_{_uuid.uuid4()}")
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""

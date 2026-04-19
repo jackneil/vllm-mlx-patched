@@ -2014,9 +2014,32 @@ class Scheduler:
         self.requests[request.request_id] = request
         self.waiting.append(request)
 
+        # Acquire the in-flight hold on the active defensive cache tier.
+        # Released in remove_finished_request / _do_abort_request. The paged
+        # and block-aware tiers have their own authoritative guards via block
+        # refcounts and don't need the acquire/release wiring.
+        self._acquire_cache_hold(request.request_id)
+
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def _acquire_cache_hold(self, request_id: str) -> None:
+        """Acquire an in-flight hold on whichever defensive cache tier is
+        active. Idempotent. No-op when only the paged/block-aware tiers
+        are configured (they guard via block refcounts)."""
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.acquire(request_id)
+        if self.prefix_cache is not None:
+            self.prefix_cache.acquire(request_id)
+
+    def _release_cache_hold(self, request_id: str) -> None:
+        """Release the in-flight hold. Idempotent — safe to call on unknown
+        or already-released request_ids."""
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.release(request_id)
+        if self.prefix_cache is not None:
+            self.prefix_cache.release(request_id)
 
     def abort_request(self, request_id: str) -> bool:
         """
@@ -2087,6 +2110,7 @@ class Scheduler:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
+        self._release_cache_hold(request_id)
 
         # Flush Metal encoders after removing arrays from batch
         mx.clear_cache()
@@ -2720,6 +2744,7 @@ class Scheduler:
 
     def remove_finished_request(self, request_id: str) -> Optional[Request]:
         """Remove a finished request from tracking."""
+        self._release_cache_hold(request_id)
         return self.requests.pop(request_id, None)
 
     def get_running_requests_info(self) -> List[Dict[str, Any]]:

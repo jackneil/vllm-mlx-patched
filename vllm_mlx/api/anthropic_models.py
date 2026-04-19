@@ -136,6 +136,12 @@ class AnthropicUsage(BaseModel):
     output_tokens: int = 0
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    # vllm-mlx extension: token count for the reasoning/thinking portion
+    # alone. Anthropic's public API lumps thinking into output_tokens;
+    # this field breaks it out so operators can measure thinking depth
+    # without re-tokenizing the response. None when no thinking content
+    # was produced (non-reasoning model or reasoning parser not attached).
+    thinking_tokens: int | None = None
 
 
 class AnthropicResponseContentBlock(BaseModel):

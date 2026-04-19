@@ -130,13 +130,24 @@ def resolve_effort(
                 max_tokens_floor=None,
                 effort_label=None,
             )
+        # Unknown value for `type` (includes non-string types).
         if thinking_type is not None:
-            # Unknown type — log and fall through to lower-precedence signals
-            # or to DEFAULT. Matches the old adapter's WARN-on-unknown.
             logger.warning(
-                "Unknown anthropic_thinking.type=%r; falling through to "
-                "lower-precedence signals or default.",
+                "[thinking-budget-resolver] Unknown anthropic_thinking.type=%r; "
+                "falling through to lower-precedence signals.",
                 thinking_type,
+            )
+        # Missing `type` key on a non-empty dict = malformed shape.
+        # (Empty dict `{}` is DELIBERATELY treated as "no signal" — same
+        # as thinking=None — so clients that use `thinking={}` as a
+        # sentinel don't get spurious WARNs.)
+        elif anthropic_thinking:
+            logger.warning(
+                "[thinking-budget-resolver] anthropic_thinking dict is "
+                "missing `type` key (keys=%s); falling through to "
+                "lower-precedence signals. Clients should include "
+                "`type: \"enabled\"|\"disabled\"|\"adaptive\"` explicitly.",
+                sorted(anthropic_thinking.keys()),
             )
 
     # 5. Anthropic output_config.effort (Claude Code wire format).

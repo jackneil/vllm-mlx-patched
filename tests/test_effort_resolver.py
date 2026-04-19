@@ -267,3 +267,80 @@ def test_allowed_effort_levels_includes_core_synonyms():
 
     for level in ("minimal", "low", "normal", "medium", "high", "xhigh", "max"):
         assert level in ALLOWED_EFFORT_LEVELS, f"{level!r} missing"
+
+
+# ---- PR-C Task C.2: malformed anthropic_thinking ----
+
+
+def test_anthropic_thinking_missing_type_key_logs_warn(caplog):
+    """Non-empty dict missing `type` must WARN and fall through to
+    lower-precedence signals. Pre-fix, this silently returned DEFAULT."""
+    import logging
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
+        result = resolve_effort(anthropic_thinking={"budget_tokens": 100})
+    assert result.source == EffortSource.DEFAULT
+    msgs = [r.message for r in caplog.records]
+    assert any(
+        "[thinking-budget-resolver]" in m and "missing `type`" in m.lower()
+        for m in msgs
+    ), f"expected WARN; got {msgs}"
+
+
+def test_anthropic_thinking_unknown_type_logs_warn_with_prefix(caplog):
+    """Unknown `type` value already WARNed pre-fix but without the
+    [thinking-budget-resolver] prefix. Ensure the prefix is present now."""
+    import logging
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
+        result = resolve_effort(anthropic_thinking={"type": "invalidtype"})
+    assert result.source == EffortSource.DEFAULT
+    assert any(
+        "[thinking-budget-resolver]" in r.message for r in caplog.records
+    )
+
+
+def test_anthropic_thinking_non_str_type_logs_warn(caplog):
+    """`type` as non-string (e.g. int) also malformed."""
+    import logging
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
+        result = resolve_effort(anthropic_thinking={"type": 42})
+    assert result.source == EffortSource.DEFAULT
+    assert any(
+        "[thinking-budget-resolver]" in r.message for r in caplog.records
+    )
+
+
+def test_anthropic_thinking_none_does_not_warn(caplog):
+    """thinking=None is the normal 'no signal' case — no WARN."""
+    import logging
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
+        result = resolve_effort(anthropic_thinking=None)
+    assert result.source == EffortSource.DEFAULT
+    assert not any(
+        "[thinking-budget-resolver]" in r.message for r in caplog.records
+    )
+
+
+def test_anthropic_thinking_empty_dict_is_silent(caplog):
+    """Empty dict {} is treated as 'no signal' (same as None). No WARN.
+
+    Rationale: some clients construct thinking={} as a sentinel meaning
+    'let defaults decide'. Treating it as malformed would break them. This
+    is a deliberate design choice — documented here so future reviewers
+    don't 'fix' it."""
+    import logging
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
+        result = resolve_effort(anthropic_thinking={})
+    assert result.source == EffortSource.DEFAULT
+    assert not any(
+        "[thinking-budget-resolver]" in r.message for r in caplog.records
+    )

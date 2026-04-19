@@ -65,6 +65,22 @@ class TestThinkingBudgetSentinel:
         ro = RequestOutput(request_id="x")
         assert hasattr(ro, "thinking_budget_applied")
 
+    def test_rebase_sentinel_noop_reason_field_on_request(self):
+        """noop_reason field on Request is pinned to survive rebase."""
+        from vllm_mlx.request import Request
+
+        assert hasattr(Request, "__dataclass_fields__")
+        assert "thinking_budget_noop_reason" in Request.__dataclass_fields__, (
+            "Request.thinking_budget_noop_reason removed — rebase regression"
+        )
+
+    def test_rebase_sentinel_noop_reason_field_on_request_output(self):
+        from vllm_mlx.request import RequestOutput
+
+        assert "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__, (
+            "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
+        )
+
     def test_generation_output_has_applied_field(self):
         """Pin the api-surface dataclass: server.py reads
         GenerationOutput.thinking_budget_applied via getattr(..., None).

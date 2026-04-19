@@ -159,6 +159,16 @@ class Request:
     #           x-thinking-budget-applied response header (Task 5).
     thinking_budget_applied: Optional[bool] = None
 
+    # Machine-readable reason when thinking_budget_applied is False.
+    # Values:
+    #   - "parser_not_configured"    — server started without --reasoning-parser
+    #   - "tokenizer_encode_failed"  — start/end delimiter encode raised
+    #   - "multi_token_delimiter"    — start/end delimiters not single-token
+    #   - "mllm_path"                — MLLM engine ignores logits_processors
+    #   - "simple_engine"            — SimpleEngine requires --continuous-batching
+    # None when thinking_budget_applied is True or None.
+    thinking_budget_noop_reason: Optional[str] = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
@@ -236,6 +246,16 @@ class RequestOutput:
     #   None  = no budget requested. Server reads this to emit the
     #           x-thinking-budget-applied response header.
     thinking_budget_applied: Optional[bool] = None
+
+    # Machine-readable reason when thinking_budget_applied is False.
+    # Values:
+    #   - "parser_not_configured"    — server started without --reasoning-parser
+    #   - "tokenizer_encode_failed"  — start/end delimiter encode raised
+    #   - "multi_token_delimiter"    — start/end delimiters not single-token
+    #   - "mllm_path"                — MLLM engine ignores logits_processors
+    #   - "simple_engine"            — SimpleEngine requires --continuous-batching
+    # None when thinking_budget_applied is True or None.
+    thinking_budget_noop_reason: Optional[str] = None
 
     @property
     def usage(self) -> Dict[str, int]:

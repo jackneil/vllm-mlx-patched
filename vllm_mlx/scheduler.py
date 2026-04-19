@@ -2273,6 +2273,7 @@ class Scheduler:
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 thinking_budget_applied=request.thinking_budget_applied,
+                thinking_budget_noop_reason=request.thinking_budget_noop_reason,
             )
 
             # Check if finished
@@ -2652,12 +2653,18 @@ class Scheduler:
                     _applied = (
                         _req.thinking_budget_applied if _req is not None else None
                     )
+                    _noop_reason = (
+                        _req.thinking_budget_noop_reason
+                        if _req is not None
+                        else None
+                    )
                     output.outputs.append(
                         RequestOutput(
                             request_id=rid,
                             finished=True,
                             finish_reason="error",
                             thinking_budget_applied=_applied,
+                            thinking_budget_noop_reason=_noop_reason,
                         )
                     )
                 output.finished_request_ids = aborted_ids

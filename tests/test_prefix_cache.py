@@ -297,6 +297,74 @@ class TestSchedulerIntegration:
         assert default_config.prefix_cache_size == 100
 
 
+class TestBlockAwarePrefixCacheClear:
+    """Tests for BlockAwarePrefixCache.clear() delegate-first ordering.
+
+    PR-A Task A.2: clear() must delegate to paged_cache.clear() FIRST and
+    only wipe _request_tables / _prefix_index if the delegate succeeded.
+    Pre-fix, outer state was wiped before delegating, so a refusal by the
+    downstream PagedCacheManager guard (A.4) would leave the cache in a
+    partially-cleared inconsistent state.
+    """
+
+    def _make_cache(self):
+        """Build a BlockAwarePrefixCache with a mocked paged_cache.
+
+        The real constructor signature is (model, paged_cache_manager).
+        We use MagicMock for both; paged_cache_manager.block_size must be
+        an attribute read during __init__, so MagicMock suffices.
+        """
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64  # reasonable default
+        cache = BlockAwarePrefixCache(
+            model=MagicMock(), paged_cache_manager=paged_cache
+        )
+        return cache
+
+    def test_clear_refuses_when_paged_cache_refuses(self):
+        """clear() must check delegated PagedCacheManager result BEFORE
+        wiping _request_tables and _prefix_index. If delegate refuses,
+        outer state must remain intact."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=False)  # refusal
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is False
+        # Critical: inner state NOT wiped.
+        assert "req-1" in cache._request_tables
+        assert "hash-abc" in cache._prefix_index
+
+    def test_clear_wipes_outer_state_when_paged_cache_succeeds(self):
+        """When delegate returns True, outer state is wiped and clear
+        returns True."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=True)
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is True
+        assert len(cache._request_tables) == 0
+        assert len(cache._prefix_index) == 0
+
+    def test_clear_treats_none_delegate_return_as_success(self):
+        """Legacy tiers predating the bool contract return None; treat
+        as success so we don't break backwards compatibility."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=None)  # legacy
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is True  # None treated as success
+        assert len(cache._request_tables) == 0
+        assert len(cache._prefix_index) == 0
+
+
 if __name__ == "__main__":
     # Verbose standalone test with real model
     import argparse

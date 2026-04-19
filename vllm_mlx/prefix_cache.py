@@ -940,12 +940,38 @@ class BlockAwarePrefixCache:
         self._tokens_saved = 0
         self.paged_cache.reset_stats()
 
-    def clear(self) -> None:
-        """Clear all cached data."""
+    def clear(self) -> bool:
+        """Clear all cached data.
+
+        Delegates to ``paged_cache.clear()`` FIRST. Only wipes our own
+        ``_request_tables`` / ``_prefix_index`` if the delegate succeeded.
+        This ordering is critical: pre-fix, we wiped outer state first,
+        so a delegate refusal (e.g. from the in-flight guard landing in
+        ``PagedCacheManager.clear()``) left the cache in a partially-
+        cleared inconsistent state worse than not clearing at all.
+
+        Returns
+        -------
+        bool
+            True if wiped (or delegate returned None for legacy contract);
+            False if delegate refused.
+        """
+        delegate_result = self.paged_cache.clear()
+        # None = legacy tier predating the bool contract = treat as success.
+        # False = explicit refusal — abort without touching outer state.
+        if delegate_result is False:
+            logger.warning(
+                "[prefix-cache-admin] BlockAwarePrefixCache.clear refused: "
+                "delegated paged_cache.clear returned False. Outer state "
+                "preserved."
+            )
+            return False
+
         self._request_tables.clear()
         self._prefix_index.clear()
-        self.paged_cache.clear()
         self.reset_stats()
+        logger.info("BlockAwarePrefixCache cleared")
+        return True
 
     def __len__(self) -> int:
         """Return number of active request entries."""

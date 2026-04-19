@@ -442,3 +442,58 @@ class TestGetAvailableMemory:
             # Should return 0 when psutil not available
             # Note: This test may not work as expected due to import caching
             pass
+
+
+class TestClearInFlightGuard:
+    """PR-A Task A.1 — in-flight guard for DELETE /v1/cache.
+
+    Mirrors the PagedCacheManager.reset_prefix_cache() pattern in
+    paged_cache.py:1149-1156 ("refuse when entries are in use"). The
+    adapter caller aggregates refusals so DELETE /v1/cache returns HTTP
+    409 Conflict instead of proceeding and crashing mid-decode.
+    """
+
+    @pytest.fixture
+    def model(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def cache(self, model):
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=10)
+        return MemoryAwarePrefixCache(model, config)
+
+    def test_clear_refuses_when_entries_in_use(self, cache):
+        """clear() must return False when entries are held by in-flight
+        requests, so the endpoint can return 409 instead of wiping state
+        that live decode still reads."""
+        cache._mark_in_use_for_test()
+        result = cache.clear()
+        assert result is False, "clear() must refuse when entries are in use"
+
+    def test_clear_returns_true_when_idle(self, cache):
+        """Idle cache clears normally and reports success."""
+        assert cache.clear() is True
+
+    def test_clear_wipes_entries_when_idle(self, cache):
+        """Idle clear still performs the full wipe (no regression)."""
+
+        def _mock_kv(size_bytes: int):
+            return [MockKVCache(size_bytes // 2, size_bytes // 2)]
+
+        cache.store([1, 2, 3], _mock_kv(1000))
+        assert len(cache) == 1
+        assert cache.clear() is True
+        assert len(cache) == 0
+
+    def test_clear_preserves_entries_when_refused(self, cache):
+        """A refused clear must NOT wipe state — that's the whole point."""
+
+        def _mock_kv(size_bytes: int):
+            return [MockKVCache(size_bytes // 2, size_bytes // 2)]
+
+        cache.store([1, 2, 3], _mock_kv(1000))
+        cache._mark_in_use_for_test()
+        assert cache.clear() is False
+        assert len(cache) == 1, (
+            "refused clear must leave entries intact for live decoders"
+        )

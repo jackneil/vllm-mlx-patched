@@ -11,6 +11,15 @@ Five provider-dialect signals can appear on a request:
 This module collapses all five into a single `ResolvedBudget`. See
 `docs/superpowers/specs/2026-04-18-provider-effort-budget-unification-design.md`
 for the precedence table and rationale.
+
+Special case: `thinking.type="adaptive"` normally returns `budget=None`
+(trust the model to self-regulate). But when a lower-precedence explicit
+budget signal (`output_config.effort` or `reasoning_effort`) is ALSO
+present, we prefer it as a ceiling. Rationale: `adaptive` is a trained
+behavior of Claude 4.5+; open-weight models that don't implement it
+would otherwise run away under `adaptive`. See the Qwen3.6 first-turn
+runaway test report (docs/testing/2026-04-19-qwen36-first-turn-runaway-
+under-claude-code-payload.md) for the bug this closes.
 """
 
 from __future__ import annotations
@@ -124,12 +133,34 @@ def resolve_effort(
                 effort_label=None,
             )
         if thinking_type == "adaptive":
-            return ResolvedBudget(
-                budget=None,
-                source=EffortSource.ANTHROPIC_THINKING_ADAPTIVE,
-                max_tokens_floor=None,
-                effort_label=None,
-            )
+            # `adaptive` is a Claude-family-specific trained behavior
+            # (the model self-regulates thinking length). Open-weight
+            # models (Qwen3.6, DeepSeek-R1, Gemma 4, etc.) are NOT
+            # trained on it — treating adaptive as "no cap" on those
+            # produces runaway thinking until the streaming cap fires.
+            #
+            # Claude Code sends BOTH `thinking.type=adaptive` AND
+            # `output_config.effort=high` (or reasoning_effort). When a
+            # lower-precedence explicit budget signal is also present,
+            # prefer it as a ceiling — a model that actually honors
+            # adaptive will naturally terminate below the ceiling
+            # anyway, while a model that doesn't will still be capped.
+            # See docs/testing/2026-04-19-qwen36-first-turn-runaway-
+            # under-claude-code-payload.md (H4).
+            if (
+                isinstance(output_config, dict)
+                and output_config.get("effort") is not None
+            ) or reasoning_effort is not None:
+                # Fall through to the output_config / reasoning_effort
+                # branches below.
+                pass
+            else:
+                return ResolvedBudget(
+                    budget=None,
+                    source=EffortSource.ANTHROPIC_THINKING_ADAPTIVE,
+                    max_tokens_floor=None,
+                    effort_label=None,
+                )
         # Unknown value for `type` (includes non-string types).
         if thinking_type is not None:
             logger.warning(

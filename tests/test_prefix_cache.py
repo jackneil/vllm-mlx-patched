@@ -685,3 +685,36 @@ if __name__ == "__main__":
             print("=" * 70)
 
     asyncio.run(run_cache_test())
+
+
+# ---- acquire/release production API ----
+
+def test_prefix_cache_manager_acquire_blocks_clear():
+    from vllm_mlx.prefix_cache import PrefixCacheManager
+
+    mgr = PrefixCacheManager(model=None)
+    mgr.acquire("req-A")
+    assert mgr.clear() is False
+
+    mgr.release("req-A")
+    assert mgr.clear() is True
+
+
+def test_prefix_cache_manager_acquire_idempotent():
+    from vllm_mlx.prefix_cache import PrefixCacheManager
+
+    mgr = PrefixCacheManager(model=None)
+    mgr.acquire("req-A")
+    mgr.acquire("req-A")
+    assert mgr._in_flight_count == 1
+
+    mgr.release("req-A")
+    assert mgr._in_flight_count == 0
+
+
+def test_prefix_cache_manager_release_unknown_is_noop():
+    from vllm_mlx.prefix_cache import PrefixCacheManager
+
+    mgr = PrefixCacheManager(model=None)
+    mgr.release("never-acquired")
+    assert mgr._in_flight_count == 0

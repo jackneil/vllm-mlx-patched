@@ -159,6 +159,14 @@ class RequestOutputCollector:
                 if new.thinking_budget_applied is not None
                 else existing.thinking_budget_applied
             ),
+            # Same prefer-non-None rule for the noop reason so a mid-stream
+            # "mllm_path" marker isn't overwritten by a later None-carrying
+            # error/abort output.
+            thinking_budget_noop_reason=(
+                new.thinking_budget_noop_reason
+                if new.thinking_budget_noop_reason is not None
+                else existing.thinking_budget_noop_reason
+            ),
         )
 
     def clear(self) -> None:

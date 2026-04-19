@@ -72,6 +72,15 @@ _EFFORT_ALIASES: dict[str, str] = {
     "normal": "medium",
 }
 
+# Public export: the canonical set of effort levels accepted by the resolver.
+# Pydantic validators on ChatCompletionRequest.reasoning_effort and
+# AnthropicRequest.output_config.effort import this to avoid drift if
+# _EFFORT_TABLE or _EFFORT_ALIASES grows a new level. "max" is in
+# _EFFORT_TABLE implicitly (handled dynamically) so we add it explicitly.
+ALLOWED_EFFORT_LEVELS: frozenset[str] = frozenset(
+    set(_EFFORT_TABLE.keys()) | set(_EFFORT_ALIASES.keys()) | {"max"}
+)
+
 
 def resolve_effort(
     *,
@@ -121,13 +130,24 @@ def resolve_effort(
                 max_tokens_floor=None,
                 effort_label=None,
             )
+        # Unknown value for `type` (includes non-string types).
         if thinking_type is not None:
-            # Unknown type — log and fall through to lower-precedence signals
-            # or to DEFAULT. Matches the old adapter's WARN-on-unknown.
             logger.warning(
-                "Unknown anthropic_thinking.type=%r; falling through to "
-                "lower-precedence signals or default.",
+                "[thinking-budget-resolver] Unknown anthropic_thinking.type=%r; "
+                "falling through to lower-precedence signals.",
                 thinking_type,
+            )
+        # Missing `type` key on a non-empty dict = malformed shape.
+        # (Empty dict `{}` is DELIBERATELY treated as "no signal" — same
+        # as thinking=None — so clients that use `thinking={}` as a
+        # sentinel don't get spurious WARNs.)
+        elif anthropic_thinking:
+            logger.warning(
+                "[thinking-budget-resolver] anthropic_thinking dict is "
+                "missing `type` key (keys=%s); falling through to "
+                "lower-precedence signals. Clients should include "
+                "`type: \"enabled\"|\"disabled\"|\"adaptive\"` explicitly.",
+                sorted(anthropic_thinking.keys()),
             )
 
     # 5. Anthropic output_config.effort (Claude Code wire format).
@@ -175,9 +195,22 @@ def _resolve_effort_string(
     canonical = _EFFORT_ALIASES.get(raw_effort, raw_effort)
 
     if canonical == "max":
+        # Dynamic: half the context, capped at _MAX_BUDGET_CAP to keep
+        # 1M-context models from burning 500k tokens per reasoning pass.
         budget = min(context_window // 2, _MAX_BUDGET_CAP)
-        # max_tokens_floor: 2x budget, capped at 2x _MAX_BUDGET_CAP
-        floor = min(budget * 2, _MAX_BUDGET_CAP * 2)
+        # Cap the floor at a serving-realistic ceiling and leave at least
+        # 1024 tokens of prompt headroom. Without this cap, a 1M-context
+        # model returned floor=131072 which most serving topologies reject
+        # outright. The `max(budget, ...)` guarantees the floor never
+        # undershoots the budget itself (pointless to request a floor
+        # below the very budget we're setting).
+        _FLOOR_CEILING = 32768
+        _PROMPT_HEADROOM = 1024
+        floor = min(
+            budget * 2,
+            _FLOOR_CEILING,
+            max(budget, context_window - _PROMPT_HEADROOM),
+        )
         return ResolvedBudget(
             budget=budget,
             source=source,

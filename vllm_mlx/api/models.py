@@ -14,6 +14,8 @@ import uuid
 
 from pydantic import BaseModel, Field, computed_field, field_validator
 
+from vllm_mlx.api.effort import ALLOWED_EFFORT_LEVELS
+
 # =============================================================================
 # Content Types (for multimodal messages)
 # =============================================================================
@@ -223,8 +225,23 @@ class ChatCompletionRequest(BaseModel):
     # through vllm_mlx.api.effort.resolve_effort. Accepted values include
     # "low" | "medium" | "high" per OpenAI spec, plus "xhigh" | "max" and
     # the synonyms "minimal" | "normal" via the shared effort table.
-    # Unknown strings WARN and fall through to DEFAULT rather than erroring.
+    # PR-C C.3: Pydantic validator now rejects unknown levels at request
+    # ingress (HTTP 422) using the ALLOWED_EFFORT_LEVELS export from
+    # vllm_mlx.api.effort. This replaces the prior WARN+fallthrough behavior
+    # so client typos surface immediately rather than silently DEFAULTing.
     reasoning_effort: str | None = None
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, v):
+        if v is None:
+            return None
+        if v not in ALLOWED_EFFORT_LEVELS:
+            raise ValueError(
+                f"reasoning_effort={v!r} is not a recognized level. "
+                f"Allowed: {sorted(ALLOWED_EFFORT_LEVELS)}"
+            )
+        return v
 
 
 class AssistantMessage(BaseModel):

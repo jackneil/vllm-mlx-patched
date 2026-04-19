@@ -74,3 +74,87 @@ def test_adapter_top_level_beats_output_config():
     oa_req, resolved = anthropic_to_openai(req, context_window=131072)
     assert oa_req.thinking_token_budget == 333
     assert resolved.source == EffortSource.TOP_LEVEL
+
+
+# =============================================================================
+# C.3 — Pydantic validator tests for output_config.effort and thinking
+# =============================================================================
+
+
+def test_output_config_rejects_unknown_effort():
+    import pytest
+    from pydantic import ValidationError
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+    with pytest.raises(ValidationError):
+        AnthropicRequest(
+            model="t",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            output_config={"effort": "hgih"},
+        )
+
+
+def test_output_config_accepts_allowed_efforts():
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+    from vllm_mlx.api.effort import ALLOWED_EFFORT_LEVELS
+
+    for level in sorted(ALLOWED_EFFORT_LEVELS):
+        req = AnthropicRequest(
+            model="t",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            output_config={"effort": level},
+        )
+        assert req.output_config["effort"] == level
+
+
+def test_thinking_budget_tokens_rejects_string():
+    import pytest
+    from pydantic import ValidationError
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+    with pytest.raises(ValidationError):
+        AnthropicRequest(
+            model="t",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            thinking={"type": "enabled", "budget_tokens": "8192"},
+        )
+
+
+def test_thinking_budget_tokens_rejects_negative():
+    import pytest
+    from pydantic import ValidationError
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+    with pytest.raises(ValidationError):
+        AnthropicRequest(
+            model="t",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            thinking={"type": "enabled", "budget_tokens": -1},
+        )
+
+
+def test_thinking_budget_tokens_accepts_positive_int():
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+    req = AnthropicRequest(
+        model="t",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100,
+        thinking={"type": "enabled", "budget_tokens": 8192},
+    )
+    assert req.thinking["budget_tokens"] == 8192
+
+
+def test_thinking_budget_tokens_accepts_zero():
+    """budget_tokens=0 is valid — means 'no thinking'. Don't reject it."""
+    from vllm_mlx.api.anthropic_models import AnthropicRequest
+    req = AnthropicRequest(
+        model="t",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100,
+        thinking={"type": "enabled", "budget_tokens": 0},
+    )
+    assert req.thinking["budget_tokens"] == 0

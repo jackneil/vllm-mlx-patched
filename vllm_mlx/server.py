@@ -2064,7 +2064,12 @@ async def create_anthropic_message(
     # budget into x-thinking-* response headers at both emission sites below.
     # TODO(context_window): plumb real context_window from the loaded model
     # config (the adapter defaults to 131072 today).
-    openai_request, _resolved_budget = anthropic_to_openai(anthropic_request)
+    openai_request, _resolved_budget = anthropic_to_openai(
+        anthropic_request,
+        reasoning_parser_start_token=getattr(_reasoning_parser, "start_token", None)
+        if _reasoning_parser is not None
+        else None,
+    )
 
     # Also WARN if max_tokens is below the resolver's advisory floor.
     # Sibling of PR #12's sizing guardrail — catches the common "effort=high

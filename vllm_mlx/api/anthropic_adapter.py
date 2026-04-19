@@ -32,6 +32,7 @@ from .models import (
 def anthropic_to_openai(
     request: AnthropicRequest,
     context_window: int = 131072,
+    reasoning_parser_start_token: str | None = None,
 ) -> tuple[ChatCompletionRequest, ResolvedBudget]:
     """
     Convert an Anthropic Messages API request to OpenAI Chat Completions format.
@@ -51,6 +52,19 @@ def anthropic_to_openai(
         request: Anthropic Messages API request
         context_window: model context window used for dynamic effort sizing
             (e.g., "max" effort scales with ctx). Default 131072 when unknown.
+        reasoning_parser_start_token: Start delimiter of the currently-active
+            reasoning parser (e.g. ``"<think>"`` for Qwen3/DeepSeek-R1,
+            ``"<|channel>"`` for Gemma 4). When this matches ``"<think>"``,
+            prior-turn Anthropic ``type: "thinking"`` content blocks are
+            preserved back into the assistant's OpenAI content field as
+            inline ``<think>…</think>`` — which closes the Qwen3.x
+            "interleaved thinking" trap where the model otherwise never
+            emits ``</think>`` after seeing thinking-less assistant history
+            in multi-turn + tool contexts. See llama.cpp#21118 and
+            litellm#19849 for the upstream discussion. Any other value
+            (or None) preserves the legacy drop behavior — injecting
+            literal ``<think>`` text into Gemma/non-reasoning prompts
+            would just appear as prose to the model.
 
     Returns:
         (ChatCompletionRequest, ResolvedBudget)
@@ -76,7 +90,9 @@ def anthropic_to_openai(
 
     # Convert each message
     for msg in request.messages:
-        converted = _convert_message(msg)
+        converted = _convert_message(
+            msg, reasoning_parser_start_token=reasoning_parser_start_token
+        )
         messages.extend(converted)
 
     # Convert tools
@@ -199,7 +215,11 @@ def openai_to_anthropic(
     )
 
 
-def _convert_message(msg: AnthropicMessage) -> list[Message]:
+def _convert_message(
+    msg: AnthropicMessage,
+    *,
+    reasoning_parser_start_token: str | None = None,
+) -> list[Message]:
     """
     Convert an Anthropic message to one or more OpenAI messages.
 
@@ -208,6 +228,10 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     Args:
         msg: Anthropic message
+        reasoning_parser_start_token: see ``anthropic_to_openai`` docstring.
+            Gates whether prior-turn ``type: "thinking"`` blocks are
+            preserved as inline ``<think>…</think>`` text (Qwen3+) or
+            dropped (Gemma 4 / non-reasoning models).
 
     Returns:
         List of OpenAI messages
@@ -219,12 +243,25 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     # Content is a list of blocks
     messages = []
     text_parts = []
+    thinking_parts = []  # preserved for Qwen-style parsers only
     tool_calls_for_assistant = []
     tool_results = []
+
+    preserve_thinking = reasoning_parser_start_token == "<think>"
 
     for block in msg.content:
         if block.type == "text":
             text_parts.append(block.text or "")
+
+        elif block.type == "thinking":
+            # Only relevant in assistant-history turns. For Qwen3+ we
+            # round-trip the thinking back into the conversation so the
+            # model sees the "closed </think>" pattern and doesn't fall
+            # into the interleaved-thinking trap where it declines to
+            # close the current turn's </think>. Non-Qwen parsers drop.
+            thinking_text = (getattr(block, "thinking", None) or "").strip()
+            if preserve_thinking and thinking_text:
+                thinking_parts.append(thinking_text)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -265,7 +302,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     # Build the messages
     if msg.role == "assistant":
-        combined_text = "\n".join(text_parts) if text_parts else None
+        # Prepend any preserved thinking as inline <think>…</think> so
+        # Qwen3+ sees the closed-think pattern in history (see docstring).
+        # thinking_parts is only ever populated when preserve_thinking=True.
+        thinking_prefix = ""
+        if thinking_parts:
+            inner = "\n".join(thinking_parts)
+            thinking_prefix = f"<think>\n{inner}\n</think>\n"
+        combined_text_body = "\n".join(text_parts) if text_parts else None
+        if combined_text_body is None and not thinking_prefix:
+            combined_text = None
+        else:
+            combined_text = thinking_prefix + (combined_text_body or "")
         if tool_calls_for_assistant:
             messages.append(
                 Message(

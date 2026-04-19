@@ -206,7 +206,9 @@ class TestPrefixCacheManager:
         cache_manager.store_cache([3, 4], ["cache2"])
         assert len(cache_manager) == 2
 
-        cache_manager.clear()
+        # PR-A A.3: clear() now returns bool (True on wipe, False on refusal).
+        result = cache_manager.clear()
+        assert result is True
         assert len(cache_manager) == 0
 
         # Stats should also be reset
@@ -363,6 +365,35 @@ class TestBlockAwarePrefixCacheClear:
         assert result is True  # None treated as success
         assert len(cache._request_tables) == 0
         assert len(cache._prefix_index) == 0
+
+
+class TestPrefixCacheManagerClearGuard:
+    """Tests for PrefixCacheManager.clear() in-flight guard.
+
+    PR-A Task A.3: clear() must refuse (return False) when requests are
+    actively using cached prefixes. Mirrors the guard in
+    PagedCacheManager.reset_prefix_cache (paged_cache.py:1149-1156) and
+    the A.1 guard on MemoryAwarePrefixCache.
+    """
+
+    def test_prefix_cache_manager_clear_refuses_when_active_requests(self):
+        """PrefixCacheManager.clear() must refuse when requests are actively
+        using cached prefixes. Mirrors the guard in PagedCacheManager
+        reset_prefix_cache (paged_cache.py:1149-1156)."""
+        from vllm_mlx.prefix_cache import PrefixCacheManager
+
+        mgr = PrefixCacheManager(MagicMock(), max_entries=10)
+        mgr._mark_in_use_for_test()
+
+        result = mgr.clear()
+        assert result is False
+
+    def test_prefix_cache_manager_clear_returns_true_when_idle(self):
+        """Idle manager clears normally and returns True."""
+        from vllm_mlx.prefix_cache import PrefixCacheManager
+
+        mgr = PrefixCacheManager(MagicMock(), max_entries=10)
+        assert mgr.clear() is True
 
 
 if __name__ == "__main__":

@@ -269,6 +269,37 @@ def _build_thinking_budget_headers(
     return headers
 
 
+def _warn_if_max_tokens_below_floor(
+    resolved: ResolvedBudget,
+    max_tokens: int | None,
+) -> None:
+    """Log a WARN when the client's max_tokens is below the resolver's
+    max_tokens_floor. Sibling to PR #12's sizing-guardrail WARN.
+
+    The floor is advisory — the resolver does not coerce max_tokens
+    server-side because some clients legitimately want minimal content
+    output. But the most common mistake is setting effort=high and leaving
+    max_tokens at the SDK default (~4096) — thinking truncates mid-stream
+    and the result looks worse than effort=off. This WARN surfaces the
+    mistake in server logs so operators can fix their clients.
+    """
+    if max_tokens is None or resolved.max_tokens_floor is None:
+        return
+    if max_tokens >= resolved.max_tokens_floor:
+        return
+    logger.warning(
+        "[thinking-budget-resolver] effort=%s resolved to budget=%s with "
+        "max_tokens_floor=%d, but client set max_tokens=%d. Thinking will "
+        "likely truncate mid-stream. Increase max_tokens to >= %d for "
+        "full effort, or lower the effort level.",
+        resolved.effort_label or resolved.source.value,
+        resolved.budget,
+        resolved.max_tokens_floor,
+        max_tokens,
+        resolved.max_tokens_floor,
+    )
+
+
 def _anthropic_budget_requested(anthropic_request) -> bool:
     """Return True iff the Anthropic request asked for a thinking budget
     via EITHER the vllm-mlx extension field `thinking_token_budget` OR
@@ -1745,6 +1776,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # for header-emission purposes.
         budget_was_requested = True
 
+    # Also WARN if max_tokens is below the resolver's advisory floor.
+    # Sibling of PR #12's sizing guardrail — catches the common "effort=high
+    # with SDK-default max_tokens" truncation mistake.
+    _warn_if_max_tokens_below_floor(_resolved_budget, request.max_tokens)
+
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
@@ -1971,6 +2007,11 @@ async def create_anthropic_message(
     # TODO(context_window): plumb real context_window from the loaded model
     # config (the adapter defaults to 131072 today).
     openai_request, _resolved_budget = anthropic_to_openai(anthropic_request)
+
+    # Also WARN if max_tokens is below the resolver's advisory floor.
+    # Sibling of PR #12's sizing guardrail — catches the common "effort=high
+    # with SDK-default max_tokens" truncation mistake.
+    _warn_if_max_tokens_below_floor(_resolved_budget, anthropic_request.max_tokens)
 
     if anthropic_request.stream:
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}

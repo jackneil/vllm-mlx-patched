@@ -108,3 +108,41 @@ def test_noop_reason_omitted_when_none_even_on_false():
         resolved, applied=False, noop_reason=None,
     )
     assert "x-thinking-budget-noop-reason" not in headers
+
+
+def test_warn_when_max_tokens_below_floor(caplog):
+    """When client sets max_tokens < resolver's max_tokens_floor, log a WARN
+    so operators can diagnose the truncation mistake. Sibling of PR #12's
+    WARN (max_tokens <= budget)."""
+    import logging
+    from vllm_mlx.server import _warn_if_max_tokens_below_floor
+    from vllm_mlx.api.effort import EffortSource, ResolvedBudget
+
+    resolved = ResolvedBudget(
+        budget=8192,
+        source=EffortSource.REASONING_EFFORT,
+        max_tokens_floor=16384,
+        effort_label="high",
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        _warn_if_max_tokens_below_floor(resolved, max_tokens=4000)
+    msgs = [r.message for r in caplog.records]
+    assert any(
+        "[thinking-budget-resolver]" in m
+        and "4000" in m and "16384" in m
+        for m in msgs
+    )
+
+
+def test_no_warn_when_max_tokens_meets_floor(caplog):
+    import logging
+    from vllm_mlx.server import _warn_if_max_tokens_below_floor
+    from vllm_mlx.api.effort import EffortSource, ResolvedBudget
+
+    resolved = ResolvedBudget(
+        budget=8192, source=EffortSource.REASONING_EFFORT,
+        max_tokens_floor=16384, effort_label="high",
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        _warn_if_max_tokens_below_floor(resolved, max_tokens=20000)
+    assert not caplog.records

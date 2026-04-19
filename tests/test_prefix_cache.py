@@ -206,7 +206,9 @@ class TestPrefixCacheManager:
         cache_manager.store_cache([3, 4], ["cache2"])
         assert len(cache_manager) == 2
 
-        cache_manager.clear()
+        # PR-A A.3: clear() now returns bool (True on wipe, False on refusal).
+        result = cache_manager.clear()
+        assert result is True
         assert len(cache_manager) == 0
 
         # Stats should also be reset
@@ -295,6 +297,103 @@ class TestSchedulerIntegration:
         default_config = SchedulerConfig()
         assert default_config.enable_prefix_cache is True
         assert default_config.prefix_cache_size == 100
+
+
+class TestBlockAwarePrefixCacheClear:
+    """Tests for BlockAwarePrefixCache.clear() delegate-first ordering.
+
+    PR-A Task A.2: clear() must delegate to paged_cache.clear() FIRST and
+    only wipe _request_tables / _prefix_index if the delegate succeeded.
+    Pre-fix, outer state was wiped before delegating, so a refusal by the
+    downstream PagedCacheManager guard (A.4) would leave the cache in a
+    partially-cleared inconsistent state.
+    """
+
+    def _make_cache(self):
+        """Build a BlockAwarePrefixCache with a mocked paged_cache.
+
+        The real constructor signature is (model, paged_cache_manager).
+        We use MagicMock for both; paged_cache_manager.block_size must be
+        an attribute read during __init__, so MagicMock suffices.
+        """
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64  # reasonable default
+        cache = BlockAwarePrefixCache(
+            model=MagicMock(), paged_cache_manager=paged_cache
+        )
+        return cache
+
+    def test_clear_refuses_when_paged_cache_refuses(self):
+        """clear() must check delegated PagedCacheManager result BEFORE
+        wiping _request_tables and _prefix_index. If delegate refuses,
+        outer state must remain intact."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=False)  # refusal
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is False
+        # Critical: inner state NOT wiped.
+        assert "req-1" in cache._request_tables
+        assert "hash-abc" in cache._prefix_index
+
+    def test_clear_wipes_outer_state_when_paged_cache_succeeds(self):
+        """When delegate returns True, outer state is wiped and clear
+        returns True."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=True)
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is True
+        assert len(cache._request_tables) == 0
+        assert len(cache._prefix_index) == 0
+
+    def test_clear_treats_none_delegate_return_as_success(self):
+        """Legacy tiers predating the bool contract return None; treat
+        as success so we don't break backwards compatibility."""
+        cache = self._make_cache()
+        cache.paged_cache.clear = MagicMock(return_value=None)  # legacy
+        cache._request_tables["req-1"] = MagicMock()
+        cache._prefix_index["hash-abc"] = MagicMock()
+
+        result = cache.clear()
+        assert result is True  # None treated as success
+        assert len(cache._request_tables) == 0
+        assert len(cache._prefix_index) == 0
+
+
+class TestPrefixCacheManagerClearGuard:
+    """Tests for PrefixCacheManager.clear() in-flight guard.
+
+    PR-A Task A.3: clear() must refuse (return False) when requests are
+    actively using cached prefixes. Mirrors the guard in
+    PagedCacheManager.reset_prefix_cache (paged_cache.py:1149-1156) and
+    the A.1 guard on MemoryAwarePrefixCache.
+    """
+
+    def test_prefix_cache_manager_clear_refuses_when_active_requests(self):
+        """PrefixCacheManager.clear() must refuse when requests are actively
+        using cached prefixes. Mirrors the guard in PagedCacheManager
+        reset_prefix_cache (paged_cache.py:1149-1156)."""
+        from vllm_mlx.prefix_cache import PrefixCacheManager
+
+        mgr = PrefixCacheManager(MagicMock(), max_entries=10)
+        mgr._mark_in_use_for_test()
+
+        result = mgr.clear()
+        assert result is False
+
+    def test_prefix_cache_manager_clear_returns_true_when_idle(self):
+        """Idle manager clears normally and returns True."""
+        from vllm_mlx.prefix_cache import PrefixCacheManager
+
+        mgr = PrefixCacheManager(MagicMock(), max_entries=10)
+        assert mgr.clear() is True
 
 
 if __name__ == "__main__":

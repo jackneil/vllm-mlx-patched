@@ -1168,9 +1168,28 @@ class PagedCacheManager:
             logger.info("Prefix cache reset successfully")
             return True
 
-    def clear(self) -> None:
-        """Clear all cached data."""
+    def clear(self) -> bool:
+        """Clear all cached data.
+
+        Refuses (returns False) when any blocks are allocated to in-flight
+        requests. Mirrors the guard in ``reset_prefix_cache()`` at
+        paged_cache.py:1149-1156 so both admin paths fail safely under load.
+
+        Returns
+        -------
+        bool
+            True if wiped; False if refused because blocks are in use.
+        """
         with self._lock:
+            num_used = self.max_blocks - self.free_block_queue.num_free_blocks
+            if num_used > 1:  # null_block always counts as used
+                logger.warning(
+                    "[prefix-cache-admin] PagedCacheManager.clear refused: "
+                    "%d blocks in use.",
+                    num_used - 1,
+                )
+                return False
+
             # Recreate blocks and queue
             self.blocks = [CacheBlock(block_id=i) for i in range(self.max_blocks)]
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
@@ -1193,3 +1212,4 @@ class PagedCacheManager:
             )
 
             logger.info("PagedCacheManager cleared")
+            return True

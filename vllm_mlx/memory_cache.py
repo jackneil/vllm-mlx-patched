@@ -440,6 +440,18 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        # In-flight guard for clear() — PR-A Task A.1.
+        # Non-zero when entries are held by live requests; clear() refuses
+        # in that case so DELETE /v1/cache can return HTTP 409 instead of
+        # wiping state mid-decode and crashing the generation loop.
+        #
+        # NOTE: this is defense-in-depth only today. Concrete wiring from
+        # the scheduler (acquire on request enter, release on exit) is a
+        # follow-up — PagedCacheManager.reset_prefix_cache() is what
+        # actually protects the live system right now. See paged_cache.py
+        # lines ~1149-1156 for the reference guard pattern.
+        self._in_flight_count: int = 0
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -809,13 +821,49 @@ class MemoryAwarePrefixCache:
             return True
         return False
 
-    def clear(self) -> None:
-        """Clear all cached entries."""
+    def clear(self) -> bool:
+        """Clear all cached entries.
+
+        Refuses (returns False) when any entry is held by an in-flight
+        request. The adapter caller aggregates refusals so DELETE
+        /v1/cache returns HTTP 409 when concurrent load prevents a safe
+        clear. Mirrors PagedCacheManager.reset_prefix_cache() in
+        paged_cache.py:1149-1156 (UPSTREAM_PIN cache-clear invariant —
+        see PR-A post-impl /dc).
+
+        Returns
+        -------
+        bool
+            True if the cache was wiped; False if the clear was refused
+            because entries are in use.
+        """
+        num_in_use = self._in_flight_count
+        if num_in_use > 0:
+            logger.warning(
+                "[prefix-cache-admin] MemoryAwarePrefixCache.clear refused: "
+                "%d entries in use. Drain traffic or wait for idle.",
+                num_in_use,
+            )
+            return False
+
         self._entries.clear()
         self._sorted_keys.clear()
         self._current_memory = 0
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
+        return True
+
+    # -----------------------------------------------------------------
+    # In-flight guard test helper — PR-A Task A.1
+    # -----------------------------------------------------------------
+    def _mark_in_use_for_test(self) -> None:
+        """Bump the in-flight counter so `clear()` refuses.
+
+        Test-only affordance. Production wiring (scheduler-side acquire
+        on request enter / release on exit) is a follow-up; today this
+        guard is defense-in-depth behind PagedCacheManager's guard.
+        """
+        self._in_flight_count += 1
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""

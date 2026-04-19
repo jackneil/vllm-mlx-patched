@@ -404,15 +404,32 @@ class _PrefixCacheEndpointAdapter:
                 return cache.get_stats()
         return None
 
-    def clear(self):
-        """Clear every prefix cache tier the scheduler holds."""
+    def clear(self) -> tuple[bool, list[str]]:
+        """Clear every prefix cache tier the scheduler holds.
+
+        Returns
+        -------
+        tuple[bool, list[str]]
+            ``(all_cleared, refused_tiers)``. ``all_cleared`` is True when
+            every tier that was touched succeeded (True) OR no tiers exist
+            OR every tier returned None (legacy pre-bool contract = success).
+            ``refused_tiers`` names tiers whose ``clear()`` explicitly
+            returned False (in-flight guard fired). When non-empty, the HTTP
+            handler returns 409.
+        """
         scheduler = self._scheduler()
         if scheduler is None:
-            return
+            return True, []
+        refused: list[str] = []
         for attr in ("memory_aware_cache", "block_aware_cache", "prefix_cache"):
             cache = getattr(scheduler, attr, None)
-            if cache is not None and hasattr(cache, "clear"):
-                cache.clear()
+            if cache is None or not hasattr(cache, "clear"):
+                continue
+            result = cache.clear()
+            # None = legacy success; False = explicit refusal.
+            if result is False:
+                refused.append(attr)
+        return (not refused, refused)
 
 
 def _get_cache_dir() -> str:
@@ -916,16 +933,36 @@ async def cache_stats():
 
 @app.delete("/v1/cache")
 async def clear_cache():
-    """Clear all caches held by this server (LLM prefix + mlx_vlm tiers)."""
-    cleared: list[str] = []
+    """Clear all caches held by this server (LLM prefix + mlx_vlm tiers).
+
+    The LLM prefix cache tiers (MemoryAwarePrefixCache / BlockAwarePrefixCache /
+    PrefixCacheManager) now refuse (return False from ``clear()``) when any
+    in-flight request is holding cached state. When any tier refuses, this
+    handler returns HTTP 409 with the full response shape plus a
+    ``refused_tiers`` list naming which tiers refused. Retry once traffic
+    drains.
+    """
+    caches: list[dict] = []
     errors: list[str] = []
+    refused_tiers: list[str] = []
 
     # LLM prefix cache (MemoryAwarePrefixCache) — only present when configured.
     prefix_cache = getattr(app.state, "prefix_cache", None)
     if prefix_cache is not None:
         try:
-            prefix_cache.clear()
-            cleared.append("llm_prefix")
+            result = prefix_cache.clear()
+            # Legacy adapters may return None; treat as success.
+            if isinstance(result, tuple):
+                all_cleared, tier_refused = result
+            else:
+                all_cleared, tier_refused = True, []
+            entry = {
+                "name": "llm_prefix",
+                "cleared": bool(all_cleared),
+                "refused_tiers": list(tier_refused),
+            }
+            caches.append(entry)
+            refused_tiers.extend(tier_refused)
         except Exception as e:
             errors.append(f"llm_prefix: {e}")
 
@@ -938,14 +975,35 @@ async def clear_cache():
 
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
-        cleared.extend(["multimodal_kv", "pixel_values", "pil_image"])
+        for name in ("multimodal_kv", "pixel_values", "pil_image"):
+            caches.append(
+                {"name": name, "cleared": True, "refused_tiers": []}
+            )
     except ImportError:
         pass  # not a VLM server; not an error
 
+    if refused_tiers:
+        # Any tier refused — surface 409 so operators can retry once traffic
+        # drains. Include the full response shape in `detail` so clients can
+        # still inspect per-cache state.
+        detail = {
+            "status": "refused",
+            "caches": caches,
+            "errors": errors or None,
+            "refused_tiers": refused_tiers,
+            "message": (
+                "One or more prefix cache tiers refused to clear because "
+                "in-flight requests are still holding cached blocks. Wait "
+                "for current traffic to drain, then retry DELETE /v1/cache."
+            ),
+        }
+        raise HTTPException(status_code=409, detail=detail)
+
     return {
-        "status": "cleared" if cleared else "noop",
-        "caches": cleared,
+        "status": "cleared" if caches else "noop",
+        "caches": caches,
         "errors": errors or None,
+        "refused_tiers": refused_tiers,
     }
 
 

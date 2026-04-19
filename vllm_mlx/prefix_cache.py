@@ -113,6 +113,13 @@ class PrefixCacheManager:
         # Statistics
         self.stats = PrefixCacheStats()
 
+        # PR-A Task A.3: in-flight guard counter for clear() refusal.
+        # Defense-in-depth — PrefixCacheManager itself has no liveness
+        # tracking; production-side acquire/release wiring is a follow-up.
+        # Today the downstream PagedCacheManager guard is the authoritative
+        # one; this mirror keeps the contract uniform across cache tiers.
+        self._in_flight_count: int = 0
+
     def _search(
         self, tokens: List[int]
     ) -> Tuple[Optional[List[int]], Optional[List[int]], Optional[List[int]], int]:
@@ -341,11 +348,51 @@ class PrefixCacheManager:
         """Reset statistics."""
         self.stats = PrefixCacheStats()
 
-    def clear(self) -> None:
-        """Clear all cached entries."""
+    def clear(self) -> bool:
+        """Clear all cached prefix data.
+
+        Refuses (returns False) when any requests are actively holding
+        cached prefixes. The adapter caller
+        (``_PrefixCacheEndpointAdapter.clear``) aggregates refusals so
+        ``DELETE /v1/cache`` can return HTTP 409 when traffic is live.
+        Mirrors the PagedCacheManager ``reset_prefix_cache`` guard at
+        paged_cache.py:1149-1156 and the A.1 guard on
+        MemoryAwarePrefixCache.clear (PR-A cache-clear invariant — see
+        UPSTREAM_PIN in CLAUDE.md).
+
+        Returns
+        -------
+        bool
+            True if cache was wiped; False if refused because requests
+            are in flight.
+        """
+        num_in_use = self._in_flight_count
+        if num_in_use > 0:
+            logger.warning(
+                "[prefix-cache-admin] PrefixCacheManager.clear refused: "
+                "%d active requests. Drain traffic or wait for idle.",
+                num_in_use,
+            )
+            return False
+
         self._cache.clear()
         self._lru.clear()
         self.reset_stats()
+        logger.info("PrefixCacheManager cleared")
+        return True
+
+    # -----------------------------------------------------------------
+    # In-flight guard test helper — PR-A Task A.3
+    # -----------------------------------------------------------------
+    def _mark_in_use_for_test(self) -> None:
+        """Bump the in-flight counter so ``clear()`` refuses.
+
+        Test-only affordance. Production wiring (scheduler-side acquire
+        on request enter / release on exit) is a follow-up; today this
+        guard is defense-in-depth behind PagedCacheManager's guard.
+        Mirrors the A.1 helper on MemoryAwarePrefixCache.
+        """
+        self._in_flight_count += 1
 
     def __len__(self) -> int:
         """Return number of cached entries."""
@@ -940,12 +987,38 @@ class BlockAwarePrefixCache:
         self._tokens_saved = 0
         self.paged_cache.reset_stats()
 
-    def clear(self) -> None:
-        """Clear all cached data."""
+    def clear(self) -> bool:
+        """Clear all cached data.
+
+        Delegates to ``paged_cache.clear()`` FIRST. Only wipes our own
+        ``_request_tables`` / ``_prefix_index`` if the delegate succeeded.
+        This ordering is critical: pre-fix, we wiped outer state first,
+        so a delegate refusal (e.g. from the in-flight guard landing in
+        ``PagedCacheManager.clear()``) left the cache in a partially-
+        cleared inconsistent state worse than not clearing at all.
+
+        Returns
+        -------
+        bool
+            True if wiped (or delegate returned None for legacy contract);
+            False if delegate refused.
+        """
+        delegate_result = self.paged_cache.clear()
+        # None = legacy tier predating the bool contract = treat as success.
+        # False = explicit refusal — abort without touching outer state.
+        if delegate_result is False:
+            logger.warning(
+                "[prefix-cache-admin] BlockAwarePrefixCache.clear refused: "
+                "delegated paged_cache.clear returned False. Outer state "
+                "preserved."
+            )
+            return False
+
         self._request_tables.clear()
         self._prefix_index.clear()
-        self.paged_cache.clear()
         self.reset_stats()
+        logger.info("BlockAwarePrefixCache cleared")
+        return True
 
     def __len__(self) -> int:
         """Return number of active request entries."""

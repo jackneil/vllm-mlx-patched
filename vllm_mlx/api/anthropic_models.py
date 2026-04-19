@@ -10,7 +10,9 @@ Claude Code to communicate with vllm-mlx.
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from vllm_mlx.api.effort import ALLOWED_EFFORT_LEVELS
 
 # =============================================================================
 # Request Models
@@ -78,9 +80,48 @@ class AnthropicRequest(BaseModel):
     thinking_budget_message: str | None = Field(default=None, max_length=2048)
     # Claude Code's wire format for effort-based thinking budget selection.
     # Normalized by vllm_mlx.api.effort.resolve_effort. Accepts
-    # {"effort": "low"|"medium"|"high"|"xhigh"|"max"}. Unknown values
-    # fall through to default behavior rather than erroring.
+    # {"effort": "low"|"medium"|"high"|"xhigh"|"max"}.
+    # PR-C C.3: Pydantic validator now rejects unknown effort values at
+    # request ingress (HTTP 422) using ALLOWED_EFFORT_LEVELS. Likewise the
+    # `thinking` validator rejects non-int / negative budget_tokens.
     output_config: dict | None = None
+
+    @field_validator("output_config")
+    @classmethod
+    def _validate_output_config(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("output_config must be a dict or null")
+        effort = v.get("effort")
+        if effort is not None:
+            if not isinstance(effort, str) or effort not in ALLOWED_EFFORT_LEVELS:
+                raise ValueError(
+                    f"output_config.effort={effort!r} is not a recognized "
+                    f"level. Allowed: {sorted(ALLOWED_EFFORT_LEVELS)}"
+                )
+        return v
+
+    @field_validator("thinking")
+    @classmethod
+    def _validate_thinking(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("thinking must be a dict or null")
+        bt = v.get("budget_tokens")
+        if bt is not None:
+            # bool is a subclass of int in Python — reject explicitly.
+            if not isinstance(bt, int) or isinstance(bt, bool):
+                raise ValueError(
+                    f"thinking.budget_tokens must be int, got "
+                    f"{type(bt).__name__}: {bt!r}"
+                )
+            if bt < 0:
+                raise ValueError(
+                    f"thinking.budget_tokens must be >= 0, got {bt}"
+                )
+        return v
 
 
 # =============================================================================

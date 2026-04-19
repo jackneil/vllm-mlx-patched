@@ -522,7 +522,7 @@ class TestStatistics:
         assert manager.stats.cache_misses == 0
         assert manager.stats.cow_copies == 0
 
-    def test_clear(self):
+    def test_clear_when_idle(self):
         """Test clearing all cache."""
         from vllm_mlx.paged_cache import PagedCacheManager
 
@@ -533,6 +533,13 @@ class TestStatistics:
         block = manager.allocate_block()
         manager.add_block_to_table(table, block, 64)
 
+        # Drain any allocations so clear() is allowed by the new in-flight guard.
+        # After Task A.4, PagedCacheManager.clear() refuses when num_used > 1.
+        for block_id in list(manager.allocated_blocks.keys()):
+            b = manager.allocated_blocks[block_id]
+            if not getattr(b, "is_null", False):
+                manager.free_block(block_id)
+
         manager.clear()
 
         # After clear, null block is re-reserved
@@ -540,6 +547,21 @@ class TestStatistics:
         assert len(manager.allocated_blocks) == 1  # only null block
         assert len(manager.request_tables) == 0
         assert len(manager.hash_to_block) == 0
+
+    def test_clear_refuses_when_blocks_in_use(self):
+        """PagedCacheManager.clear() refuses (returns False) when blocks are
+        allocated to in-flight requests. Matches the reset_prefix_cache guard
+        at paged_cache.py:1149-1156."""
+        from vllm_mlx.paged_cache import PagedCacheManager
+
+        manager = PagedCacheManager(block_size=64, max_blocks=16)
+        block = manager.allocate_block()
+        assert block is not None
+
+        result = manager.clear()
+        assert result is False
+        # State preserved.
+        assert block.block_id in manager.allocated_blocks
 
 
 class TestThreadSafety:
@@ -705,7 +727,7 @@ class TestBlockAwarePrefixCache:
         assert stats["misses"] == 1
         assert stats["hits"] == 0
 
-    def test_clear(self):
+    def test_clear_when_idle(self):
         """Test clearing cache."""
         from vllm_mlx.paged_cache import PagedCacheManager
         from vllm_mlx.prefix_cache import BlockAwarePrefixCache
@@ -718,6 +740,12 @@ class TestBlockAwarePrefixCache:
         cache.store_cache("req-2", tokens, ["data2"])
 
         assert len(cache) == 2
+
+        # Drain any allocations so clear() is allowed by the new in-flight guard.
+        # After Task A.4, PagedCacheManager.clear() refuses when num_used > 1.
+        # release_cache decrements ref counts via delete_block_table.
+        cache.release_cache("req-1")
+        cache.release_cache("req-2")
 
         cache.clear()
 

@@ -260,28 +260,38 @@ class TestAttachProcessor:
             prompt_token_ids=None,
         )
         base.update(overrides)
+        # Helper now returns (processor_or_None, reason_or_None) (PR-D D.2).
         return _attach_thinking_budget_processor(**base)
 
     def test_returns_processor_when_valid(self):
-        proc = self._call()
+        proc, reason = self._call()
         assert proc is not None
+        assert reason is None
 
     def test_none_when_budget_is_none(self):
-        assert self._call(budget=None) is None
+        # budget=None is NOT a no-op — reason must be None, not a string.
+        proc, reason = self._call(budget=None)
+        assert proc is None
+        assert reason is None
 
     def test_none_when_no_parser(self):
-        assert self._call(reasoning_parser=None) is None
+        proc, reason = self._call(reasoning_parser=None)
+        assert proc is None
+        assert reason == "parser_not_configured"
 
     def test_none_when_start_tokenize_fails(self):
         class BrokenTok:
             def encode(self, text, add_special_tokens=False):
                 raise RuntimeError("oops")
 
-        assert self._call(tokenizer=BrokenTok()) is None
+        proc, reason = self._call(tokenizer=BrokenTok())
+        assert proc is None
+        assert reason == "tokenizer_encode_failed"
 
     def test_message_tokenized_when_provided(self):
-        proc = self._call(message="Wrap it up.")
+        proc, reason = self._call(message="Wrap it up.")
         assert proc is not None
+        assert reason is None
         # Force sequence includes message ids (50, 51) then end ids (200).
         assert proc._force_sequence == [50, 51, 200]
 

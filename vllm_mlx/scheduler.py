@@ -120,18 +120,28 @@ def _attach_thinking_budget_processor(
 ):
     """Construct a ThinkingTokenBudgetLogitsProcessor for a single request.
 
-    Returns None (a loud no-op — caller should log WARN and increment the
-    metric) when any of:
-      - budget is None
-      - reasoning_parser is None (no --reasoning-parser flag)
-      - tokenizer can't encode the start/end delimiters to a non-empty list
+    Returns a 2-tuple ``(processor_or_None, reason_or_None)``:
 
-    Returns the processor on success.
+    - On success: ``(processor, None)``.
+    - On "not a no-op" (``budget is None``, i.e. the caller didn't ask for
+      a budget at all): ``(None, None)`` — caller should treat as a no-op
+      only if ``budget is not None``.
+    - On no-op (budget requested but processor can't be attached): ``(None,
+      "<reason>")``. Reason strings match ``Request.thinking_budget_noop_reason``:
+        - ``"parser_not_configured"``  — no reasoning parser configured
+        - ``"tokenizer_encode_failed"`` — tokenizer.encode raised or
+          returned empty/non-list for start or end delimiter
+        - ``"multi_token_delimiter"``  — (reserved for future use; no
+          length check in current code — see PR-D D.2 deviation note)
+
+    The caller is expected to log WARN and increment the noop counter when
+    the first element is None AND budget was requested.
     """
     if budget is None:
-        return None
+        # Budget wasn't requested — NOT a no-op.
+        return None, None
     if reasoning_parser is None:
-        return None
+        return None, "parser_not_configured"
 
     start_str = getattr(reasoning_parser, "start_token", "<think>")
     end_candidates = getattr(reasoning_parser, "end_tokens", ["</think>"])
@@ -150,7 +160,11 @@ def _attach_thinking_budget_processor(
 
     start_ids = _encode(start_str)
     if start_ids is None:
-        return None
+        # _encode returns None for BOTH exception and empty/non-list cases.
+        # Both are surfaced as tokenizer_encode_failed; we can't distinguish
+        # without adding a second return-value channel to _encode, which is
+        # out of scope for D.2.
+        return None, "tokenizer_encode_failed"
 
     end_ids = None
     for candidate in end_candidates:
@@ -159,7 +173,7 @@ def _attach_thinking_budget_processor(
             end_ids = enc
             break
     if end_ids is None:
-        return None
+        return None, "tokenizer_encode_failed"
 
     message_ids = None
     if message:
@@ -186,13 +200,14 @@ def _attach_thinking_budget_processor(
 
     from .logits_processors import ThinkingTokenBudgetLogitsProcessor
 
-    return ThinkingTokenBudgetLogitsProcessor(
+    processor = ThinkingTokenBudgetLogitsProcessor(
         budget=budget,
         start_token_ids=start_ids,
         end_token_ids=end_ids,
         message_token_ids=message_ids,
         prompt_token_ids=prompt_token_ids,
     )
+    return processor, None
 
 
 # Error patterns that indicate cache corruption
@@ -1823,7 +1838,7 @@ class Scheduler:
           - None  when no budget was requested (default).
         """
         sp = request.sampling_params
-        tb_proc = _attach_thinking_budget_processor(
+        tb_proc, noop_reason = _attach_thinking_budget_processor(
             tokenizer=self.tokenizer,
             reasoning_parser=self._reasoning_parser,
             budget=sp.thinking_token_budget,
@@ -1833,6 +1848,7 @@ class Scheduler:
         if tb_proc is not None:
             request.logits_processors.append(tb_proc)
             request.thinking_budget_applied = True
+            request.thinking_budget_noop_reason = None
         elif sp.thinking_token_budget is not None:
             _parser_name = (
                 type(self._reasoning_parser).__name__
@@ -1876,8 +1892,10 @@ class Scheduler:
                 # Task 6 creates vllm_mlx.metrics; tolerate its absence.
                 pass
             request.thinking_budget_applied = False
+            request.thinking_budget_noop_reason = noop_reason
         else:
             request.thinking_budget_applied = None
+            request.thinking_budget_noop_reason = None
 
     def add_request(self, request: Request) -> None:
         """

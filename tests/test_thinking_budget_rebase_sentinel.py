@@ -256,7 +256,7 @@ class TestThinkingBudgetSentinel:
 
         from vllm_mlx.scheduler import _attach_thinking_budget_processor
 
-        proc = _attach_thinking_budget_processor(
+        proc, reason = _attach_thinking_budget_processor(
             tokenizer=_FakeTok(),
             reasoning_parser=_FakeParser(),
             budget=512,
@@ -264,6 +264,7 @@ class TestThinkingBudgetSentinel:
             prompt_token_ids=None,
         )
         assert isinstance(proc, ThinkingTokenBudgetLogitsProcessor)
+        assert reason is None
 
     def test_scheduler_output_propagates_applied(self):
         """Pin the CRITICAL-1 fix: scheduler's _process_batch_responses must
@@ -350,7 +351,7 @@ class TestThinkingBudgetSentinel:
             start_token = "<think>"
             end_tokens = ["</think>"]
 
-        proc = _attach_thinking_budget_processor(
+        proc, reason = _attach_thinking_budget_processor(
             tokenizer=_OversizeTok(),
             reasoning_parser=_FakeParser(),
             budget=512,
@@ -358,6 +359,7 @@ class TestThinkingBudgetSentinel:
             prompt_token_ids=None,
         )
         assert isinstance(proc, ThinkingTokenBudgetLogitsProcessor)
+        assert reason is None
         # Force sequence must be end_token_ids only — the oversized
         # message was dropped. If the cap check regresses, the sequence
         # would be 1000..1549+[200] = 551 tokens.

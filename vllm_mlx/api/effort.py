@@ -72,6 +72,15 @@ _EFFORT_ALIASES: dict[str, str] = {
     "normal": "medium",
 }
 
+# Public export: the canonical set of effort levels accepted by the resolver.
+# Pydantic validators on ChatCompletionRequest.reasoning_effort and
+# AnthropicRequest.output_config.effort import this to avoid drift if
+# _EFFORT_TABLE or _EFFORT_ALIASES grows a new level. "max" is in
+# _EFFORT_TABLE implicitly (handled dynamically) so we add it explicitly.
+ALLOWED_EFFORT_LEVELS: frozenset[str] = frozenset(
+    set(_EFFORT_TABLE.keys()) | set(_EFFORT_ALIASES.keys()) | {"max"}
+)
+
 
 def resolve_effort(
     *,

@@ -241,3 +241,29 @@ def test_reasoning_effort_loses_to_output_config():
     )
     assert result.budget == 512
     assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
+
+
+# ---- PR-C Task C.1: ALLOWED_EFFORT_LEVELS export ----
+
+def test_allowed_effort_levels_covers_table_and_aliases():
+    """ALLOWED_EFFORT_LEVELS must be the union of _EFFORT_TABLE keys and
+    _EFFORT_ALIASES keys plus "max" (handled dynamically). Adding a new
+    level to either must automatically expand the validated vocabulary."""
+    from vllm_mlx.api.effort import (
+        ALLOWED_EFFORT_LEVELS,
+        _EFFORT_ALIASES,
+        _EFFORT_TABLE,
+    )
+
+    expected = (
+        set(_EFFORT_TABLE.keys()) | set(_EFFORT_ALIASES.keys()) | {"max"}
+    )
+    assert set(ALLOWED_EFFORT_LEVELS) == expected
+
+
+def test_allowed_effort_levels_includes_core_synonyms():
+    """Sanity: the current canonical levels and synonyms are present."""
+    from vllm_mlx.api.effort import ALLOWED_EFFORT_LEVELS
+
+    for level in ("minimal", "low", "normal", "medium", "high", "xhigh", "max"):
+        assert level in ALLOWED_EFFORT_LEVELS, f"{level!r} missing"

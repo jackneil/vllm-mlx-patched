@@ -187,16 +187,20 @@ class BatchedEngine(BaseEngine):
 
     def _log_mllm_budget_noop(
         self, thinking_token_budget: int | None, method: str
-    ) -> bool | None:
+    ) -> tuple[bool | None, str | None]:
         """Log WARN + increment noop counter when a thinking-token-budget
         was requested on the MLLM path (which does not enforce it yet).
 
-        Returns the value that should be written to
-        ``GenerationOutput.thinking_budget_applied`` (False if a budget was
-        requested, None otherwise).
+        Returns ``(applied, noop_reason)`` where:
+          - ``applied`` is the value that should be written to
+            ``GenerationOutput.thinking_budget_applied`` (False if a budget
+            was requested, None otherwise).
+          - ``noop_reason`` is ``"mllm_path"`` when applied is False, else
+            None. Propagated to ``GenerationOutput.thinking_budget_noop_reason``
+            by call sites.
         """
         if thinking_token_budget is None:
-            return None
+            return None, None
         logger.warning(
             "BatchedEngine.%s: thinking_token_budget=%s requested for an "
             "MLLM request, but the MLLM path does not yet support it. "
@@ -212,7 +216,7 @@ class BatchedEngine(BaseEngine):
         except ImportError:
             # Task 6 creates vllm_mlx.metrics; tolerate its absence.
             pass
-        return False
+        return False, "mllm_path"
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
@@ -528,7 +532,7 @@ class BatchedEngine(BaseEngine):
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
             # so text-only requests must also be routed here.
-            tb_applied = self._log_mllm_budget_noop(
+            tb_applied, tb_noop_reason = self._log_mllm_budget_noop(
                 thinking_token_budget, "generate"
             )
             output = await self._mllm_scheduler.generate(
@@ -546,6 +550,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
                 thinking_budget_applied=tb_applied,
+                thinking_budget_noop_reason=tb_noop_reason,
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -576,6 +581,9 @@ class BatchedEngine(BaseEngine):
             # x-thinking-budget-applied correctly. None when no budget
             # was requested; True/False otherwise.
             thinking_budget_applied=output.thinking_budget_applied,
+            thinking_budget_noop_reason=getattr(
+                output, "thinking_budget_noop_reason", None
+            ),
         )
 
     async def stream_generate(
@@ -615,7 +623,7 @@ class BatchedEngine(BaseEngine):
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
-            tb_applied = self._log_mllm_budget_noop(
+            tb_applied, tb_noop_reason = self._log_mllm_budget_noop(
                 thinking_token_budget, "stream_generate"
             )
             request_id = await self._mllm_scheduler.add_request_async(
@@ -636,6 +644,7 @@ class BatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     thinking_budget_applied=tb_applied,
+                    thinking_budget_noop_reason=tb_noop_reason,
                 )
             return
 
@@ -669,6 +678,9 @@ class BatchedEngine(BaseEngine):
                 finished=output.finished,
                 finish_reason=output.finish_reason,
                 thinking_budget_applied=output.thinking_budget_applied,
+                thinking_budget_noop_reason=getattr(
+                    output, "thinking_budget_noop_reason", None
+                ),
             )
 
     async def chat(

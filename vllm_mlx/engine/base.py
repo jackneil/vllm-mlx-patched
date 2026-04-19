@@ -29,6 +29,12 @@ class GenerationOutput:
     # MLLM branch; read by server.py to emit x-thinking-budget-applied
     # response header). None when no budget was requested.
     thinking_budget_applied: bool | None = None
+    # Machine-readable reason when thinking_budget_applied is False.
+    # Populated by the MLLM path (``"mllm_path"``), SimpleEngine
+    # (``"simple_engine"``), or propagated from the scheduler's
+    # Request.thinking_budget_noop_reason via RequestOutput (Task D.3+).
+    # None when thinking_budget_applied is True or None.
+    thinking_budget_noop_reason: str | None = None
 
 
 class BaseEngine(ABC):

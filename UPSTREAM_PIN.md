@@ -138,15 +138,16 @@ Adding a new provider dialect means extending `EffortSource` + the resolver. It 
 
 Test guard: `tests/test_effort_resolver.py` + `tests/test_anthropic_adapter_effort.py`.
 
-### Invariant 12: Four-header contract on budget-resolved responses
+### Invariant 12: Five-header contract on budget-resolved responses
 
 Every chat-completion or messages response that went through the resolver MUST emit:
 - `x-thinking-budget-applied` (`true` | `false`, absent when no budget requested)
 - `x-thinking-budget-resolved` (int as string, or `"none"`)
 - `x-thinking-budget-source` (one of the `EffortSource` enum values)
 - `x-thinking-budget-max-tokens-floor` (int as string, absent when source=default or budget=0)
+- `x-thinking-budget-noop-reason` (string; emitted ONLY when `applied=false`; one of `parser_not_configured` / `tokenizer_encode_failed` / `multi_token_delimiter` / `mllm_path` / `simple_engine`)
 
-Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` forwards the `x-thinking-` prefix to clients. Arena's admin UI reads these headers to show a per-request "effort honored" indicator.
+Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` forwards the `x-thinking-` prefix to clients. Arena's admin UI reads these headers to show a per-request "effort honored" indicator. The `noop-reason` header is what operators use to diagnose why the feature is a no-op (e.g., `simple_engine` means the server needs `--continuous-batching`).
 
 Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py`.
 

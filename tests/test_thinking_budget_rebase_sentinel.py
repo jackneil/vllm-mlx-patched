@@ -65,6 +65,33 @@ class TestThinkingBudgetSentinel:
         ro = RequestOutput(request_id="x")
         assert hasattr(ro, "thinking_budget_applied")
 
+    def test_rebase_sentinel_noop_reason_field_on_request(self):
+        """noop_reason field on Request is pinned to survive rebase."""
+        from vllm_mlx.request import Request
+
+        assert hasattr(Request, "__dataclass_fields__")
+        assert "thinking_budget_noop_reason" in Request.__dataclass_fields__, (
+            "Request.thinking_budget_noop_reason removed — rebase regression"
+        )
+        f = Request.__dataclass_fields__["thinking_budget_noop_reason"]
+        assert f.default is None, (
+            "Default for thinking_budget_noop_reason changed; "
+            "header emission depends on None sentinel."
+        )
+
+    def test_rebase_sentinel_noop_reason_field_on_request_output(self):
+        """noop_reason field on RequestOutput is pinned to survive rebase."""
+        from vllm_mlx.request import RequestOutput
+
+        assert "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__, (
+            "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
+        )
+        f = RequestOutput.__dataclass_fields__["thinking_budget_noop_reason"]
+        assert f.default is None, (
+            "Default for thinking_budget_noop_reason changed; "
+            "header emission depends on None sentinel."
+        )
+
     def test_generation_output_has_applied_field(self):
         """Pin the api-surface dataclass: server.py reads
         GenerationOutput.thinking_budget_applied via getattr(..., None).
@@ -229,7 +256,7 @@ class TestThinkingBudgetSentinel:
 
         from vllm_mlx.scheduler import _attach_thinking_budget_processor
 
-        proc = _attach_thinking_budget_processor(
+        proc, reason = _attach_thinking_budget_processor(
             tokenizer=_FakeTok(),
             reasoning_parser=_FakeParser(),
             budget=512,
@@ -237,6 +264,7 @@ class TestThinkingBudgetSentinel:
             prompt_token_ids=None,
         )
         assert isinstance(proc, ThinkingTokenBudgetLogitsProcessor)
+        assert reason is None
 
     def test_scheduler_output_propagates_applied(self):
         """Pin the CRITICAL-1 fix: scheduler's _process_batch_responses must
@@ -323,7 +351,7 @@ class TestThinkingBudgetSentinel:
             start_token = "<think>"
             end_tokens = ["</think>"]
 
-        proc = _attach_thinking_budget_processor(
+        proc, reason = _attach_thinking_budget_processor(
             tokenizer=_OversizeTok(),
             reasoning_parser=_FakeParser(),
             budget=512,
@@ -331,6 +359,7 @@ class TestThinkingBudgetSentinel:
             prompt_token_ids=None,
         )
         assert isinstance(proc, ThinkingTokenBudgetLogitsProcessor)
+        assert reason is None
         # Force sequence must be end_token_ids only — the oversized
         # message was dropped. If the cap check regresses, the sequence
         # would be 1000..1549+[200] = 551 tokens.

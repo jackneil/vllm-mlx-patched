@@ -22,9 +22,15 @@ from vllm_mlx.api.effort import ALLOWED_EFFORT_LEVELS
 class AnthropicContentBlock(BaseModel):
     """A content block in an Anthropic message."""
 
-    type: str  # "text", "image", "tool_use", "tool_result"
+    type: str  # "text", "image", "tool_use", "tool_result", "thinking"
     # text block
     text: str | None = None
+    # thinking block (assistant history — clients echo prior reasoning here)
+    thinking: str | None = None
+    # Optional opaque signature that accompanied our emitted thinking block
+    # (PR #14). We don't verify it; accepting it lets typed Anthropic SDK
+    # clients round-trip cleanly.
+    signature: str | None = None
     # tool_use block
     id: str | None = None
     name: str | None = None

@@ -514,6 +514,19 @@ class MLLMScheduler:
                 new_text = detok.last_segment
 
             # Create output
+            # MLLM scheduler path cannot enforce thinking_token_budget
+            # (no logits-processor hook on the MLLM batched generate path).
+            # Mirror engine/batched.py::_log_mllm_budget_noop by surfacing
+            # applied=False + noop_reason="mllm_path" whenever a budget was
+            # requested, so the server emits the honest
+            # x-thinking-budget-applied=false + x-thinking-budget-noop-reason
+            # headers. When no budget was requested, leave both fields as
+            # None.
+            _tb_budget = (
+                request.sampling_params.thinking_token_budget
+                if request.sampling_params
+                else None
+            )
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token],
@@ -521,6 +534,10 @@ class MLLMScheduler:
                 output_token_ids=list(request.output_tokens),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                thinking_budget_applied=False if _tb_budget is not None else None,
+                thinking_budget_noop_reason=(
+                    "mllm_path" if _tb_budget is not None else None
+                ),
             )
 
             # Check if finished
@@ -802,12 +819,27 @@ class MLLMScheduler:
                 break
 
         if final_output is None:
-            # Create empty output on error
+            # Create empty output on error. Carry the honest thinking-
+            # budget signal: if the request had a budget set, report it
+            # as a no-op with reason "mllm_path" (the MLLM scheduler path
+            # cannot enforce logits-processor-based budgets). Otherwise
+            # leave both fields as None. See sibling site in
+            # _process_batch_responses and engine/batched.py::_log_mllm_budget_noop.
+            _err_req = self.requests.get(request_id)
+            _tb_budget = (
+                _err_req.sampling_params.thinking_token_budget
+                if _err_req is not None and _err_req.sampling_params
+                else None
+            )
             final_output = RequestOutput(
                 request_id=request_id,
                 output_text="",
                 finished=True,
                 finish_reason="error",
+                thinking_budget_applied=False if _tb_budget is not None else None,
+                thinking_budget_noop_reason=(
+                    "mllm_path" if _tb_budget is not None else None
+                ),
             )
 
         # Cleanup

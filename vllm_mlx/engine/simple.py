@@ -407,6 +407,8 @@ class SimpleEngine(BaseEngine):
                         top_p,
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
+                        tb_applied=_tb_applied,
+                        tb_noop_reason=_tb_noop_reason,
                         **kwargs,
                     ):
                         yield output
@@ -653,6 +655,8 @@ class SimpleEngine(BaseEngine):
                 temperature,
                 top_p,
                 tools=template_tools,
+                tb_applied=_tb_applied,
+                tb_noop_reason=_tb_noop_reason,
                 **kwargs,
             ):
                 yield chunk
@@ -766,6 +770,8 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         specprefill_keep_pct: float | None = None,
+        tb_applied: bool | None = None,
+        tb_noop_reason: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -925,6 +931,8 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=finished,
                 finish_reason=resp.finish_reason or ("stop" if finished else None),
+                thinking_budget_applied=tb_applied,
+                thinking_budget_noop_reason=tb_noop_reason,
             )
 
             if finished:
@@ -938,6 +946,8 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+                thinking_budget_applied=tb_applied,
+                thinking_budget_noop_reason=tb_noop_reason,
             )
 
     async def _stream_generate_text(
@@ -947,6 +957,8 @@ class SimpleEngine(BaseEngine):
         temperature: float,
         top_p: float,
         tools: list | None = None,
+        tb_applied: bool | None = None,
+        tb_noop_reason: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Text-only generation via mlx_lm TextModel with MTP.
@@ -1354,6 +1366,8 @@ class SimpleEngine(BaseEngine):
                 finished=finished,
                 finish_reason=getattr(resp, "finish_reason", None)
                 or ("stop" if finished else None),
+                thinking_budget_applied=tb_applied,
+                thinking_budget_noop_reason=tb_noop_reason,
             )
 
             if finished:
@@ -1367,6 +1381,8 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+                thinking_budget_applied=tb_applied,
+                thinking_budget_noop_reason=tb_noop_reason,
             )
 
     def get_stats(self) -> dict[str, Any]:

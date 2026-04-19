@@ -165,7 +165,7 @@ class Request:
     #   - "tokenizer_encode_failed"  — start/end delimiter encode raised
     #   - "multi_token_delimiter"    — start/end delimiters not single-token
     #   - "mllm_path"                — MLLM engine ignores logits_processors
-    #   - "simple_engine"            — SimpleEngine requires --continuous-batching
+    #   - "simple_engine"            — SimpleEngine path does not run logits_processors (start server with --continuous-batching to enforce)
     # None when thinking_budget_applied is True or None.
     thinking_budget_noop_reason: Optional[str] = None
 
@@ -253,7 +253,7 @@ class RequestOutput:
     #   - "tokenizer_encode_failed"  — start/end delimiter encode raised
     #   - "multi_token_delimiter"    — start/end delimiters not single-token
     #   - "mllm_path"                — MLLM engine ignores logits_processors
-    #   - "simple_engine"            — SimpleEngine requires --continuous-batching
+    #   - "simple_engine"            — SimpleEngine path does not run logits_processors (start server with --continuous-batching to enforce)
     # None when thinking_budget_applied is True or None.
     thinking_budget_noop_reason: Optional[str] = None
 

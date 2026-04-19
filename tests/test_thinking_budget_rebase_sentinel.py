@@ -73,12 +73,23 @@ class TestThinkingBudgetSentinel:
         assert "thinking_budget_noop_reason" in Request.__dataclass_fields__, (
             "Request.thinking_budget_noop_reason removed — rebase regression"
         )
+        f = Request.__dataclass_fields__["thinking_budget_noop_reason"]
+        assert f.default is None, (
+            "Default for thinking_budget_noop_reason changed; "
+            "header emission depends on None sentinel."
+        )
 
     def test_rebase_sentinel_noop_reason_field_on_request_output(self):
+        """noop_reason field on RequestOutput is pinned to survive rebase."""
         from vllm_mlx.request import RequestOutput
 
         assert "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__, (
             "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
+        )
+        f = RequestOutput.__dataclass_fields__["thinking_budget_noop_reason"]
+        assert f.default is None, (
+            "Default for thinking_budget_noop_reason changed; "
+            "header emission depends on None sentinel."
         )
 
     def test_generation_output_has_applied_field(self):

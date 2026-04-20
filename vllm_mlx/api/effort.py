@@ -47,6 +47,9 @@ class EffortSource(str, Enum):
     ANTHROPIC_THINKING_ADAPTIVE = "anthropic_thinking_adaptive"
     OUTPUT_CONFIG_EFFORT = "output_config_effort"
     REASONING_EFFORT = "reasoning_effort"
+    # chat_template_kwargs parse path (vLLM-compatible extension field).
+    # Synthesized in server.py when clamping a template-kwargs-derived budget.
+    TEMPLATE_KWARGS = "template_kwargs"
     DEFAULT = "default"
 
 

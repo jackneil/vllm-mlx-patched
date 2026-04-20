@@ -82,6 +82,8 @@ def anthropic_to_openai(
     request: AnthropicRequest,
     context_window: int = 131072,
     reasoning_parser_start_token: str | None = None,
+    *,
+    engine_supports_processor: bool = True,
 ) -> tuple[ChatCompletionRequest, ResolvedBudget]:
     """
     Convert an Anthropic Messages API request to OpenAI Chat Completions format.
@@ -164,6 +166,21 @@ def anthropic_to_openai(
         output_config=request.output_config,
         reasoning_effort=None,  # not on the Anthropic path
         context_window=context_window,
+    )
+
+    # Layer 2 site 1 (Qwen3 runaway spec, 2026-04-20): apply server ceiling
+    # BEFORE constructing ChatCompletionRequest so the clamped budget
+    # propagates cleanly. Reads `server._max_thinking_token_budget` as a
+    # module-level global, same pattern as _streaming_max_seconds.
+    from .. import server as _server_module
+    from .budget_ceiling import apply_server_thinking_token_budget_ceiling
+
+    resolved, _clamped_from_adapter, _clamp_skip_adapter = (
+        apply_server_thinking_token_budget_ceiling(
+            resolved,
+            ceiling=_server_module._max_thinking_token_budget,
+            engine_supports_processor=engine_supports_processor,
+        )
     )
 
     openai_req = ChatCompletionRequest(

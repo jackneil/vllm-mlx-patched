@@ -1841,6 +1841,33 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         },
         template_kwargs=request.chat_template_kwargs,
     )
+
+    # Layer 2 site 2 (Qwen3 runaway spec, 2026-04-20): clamp chat_template_kwargs
+    # / top-level budget to the server ceiling BEFORE it lands in chat_kwargs.
+    # Without this, a client sending chat_template_kwargs.thinking_token_budget
+    # > ceiling would escape Layer 2 via the documented extension field.
+    _engine_supports_proc_early = _engine_supports_thinking_budget_processor(engine)
+    _clamped_from_early: int | None = None
+    if _budget is not None and _max_thinking_token_budget is not None:
+        # Synthesized ResolvedBudget with TEMPLATE_KWARGS source — keeps the
+        # x-thinking-budget-source response header honest about provenance
+        # (/dc review G2).
+        _synth = ResolvedBudget(
+            budget=_budget,
+            source=EffortSource.TEMPLATE_KWARGS,
+            max_tokens_floor=None,
+            effort_label=None,
+        )
+        _synth_out, _clamped_from_early, _ = (
+            apply_server_thinking_token_budget_ceiling(
+                _synth,
+                ceiling=_max_thinking_token_budget,
+                engine_supports_processor=_engine_supports_proc_early,
+            )
+        )
+        if _clamped_from_early is not None and _synth_out is not None:
+            _budget = _synth_out.budget
+
     if _budget is not None:
         chat_kwargs["thinking_token_budget"] = _budget
     if _msg is not None:
@@ -2162,7 +2189,22 @@ async def create_anthropic_message(
         reasoning_parser_start_token=getattr(_reasoning_parser, "start_token", None)
         if _reasoning_parser is not None
         else None,
+        engine_supports_processor=_engine_supports_thinking_budget_processor(engine),
     )
+
+    # Layer 2 site 4 (Qwen3 runaway spec, 2026-04-20): defensive re-clamp.
+    # Redundant with site 1 (adapter) but guards against future adapter
+    # refactors that might skip clamping. Helper is idempotent — no-op when
+    # budget already at/under ceiling.
+    _resolved_budget, _clamped_from_anth, _clamp_skip_anth = (
+        apply_server_thinking_token_budget_ceiling(
+            _resolved_budget,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_thinking_budget_processor(engine),
+        )
+    )
+    if _resolved_budget is not None:
+        openai_request.thinking_token_budget = _resolved_budget.budget
 
     # Also WARN if max_tokens is below the resolver's advisory floor.
     # Sibling of PR #12's sizing guardrail — catches the common "effort=high

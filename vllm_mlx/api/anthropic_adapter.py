@@ -156,6 +156,23 @@ def anthropic_to_openai(
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
+    # Layer 1 (Qwen3 runaway spec, 2026-04-20): auto-disable thinking on the
+    # Claude-Code-first-turn-with-tools fingerprint. Mutates
+    # request.chat_template_kwargs when firing and sets request._layer1_fired
+    # = True. Must run BEFORE resolve_effort so the resolver sees the final
+    # template-kwargs state.
+    #
+    # Reads reasoning_parser_name + disable flag from the server module (the
+    # engine does not expose reasoning_parser_name, per UPSTREAM_PIN inv. 14).
+    from .. import server as _server_module
+    from .thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
+
+    maybe_disable_thinking_for_qwen3_agent_first_turn(
+        request,
+        reasoning_parser_name=_server_module._reasoning_parser_name,
+        disabled=_server_module._disable_qwen3_first_turn_no_think,
+    )
+
     # Resolve thinking budget via the shared resolver. Replaces the old
     # inline thinking.type + thinking_token_budget resolution block.
     # The resolver handles top-level vs Anthropic `thinking` (including

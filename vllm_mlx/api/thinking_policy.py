@@ -106,4 +106,12 @@ def maybe_disable_thinking_for_qwen3_agent_first_turn(
         request.chat_template_kwargs = new_ctk
 
     qwen3_first_turn_no_think_applied_total.inc()
+    # Marker read by downstream handlers for response header emission.
+    # Using an attribute (not a tuple return) avoids breaking the ~30
+    # test call sites that unpack anthropic_to_openai as a 2-tuple.
+    try:
+        request._layer1_fired = True
+    except (AttributeError, TypeError):
+        # Pydantic-frozen model or __slots__ — fallback.
+        object.__setattr__(request, "_layer1_fired", True)
     return True

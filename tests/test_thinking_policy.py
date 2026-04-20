@@ -169,3 +169,34 @@ class TestNonFiringConditions:
         )
         # No messages means no "first turn" to protect — return False cleanly.
         assert fired is False
+
+
+def test_helper_sets_request_layer1_fired_marker_on_fire():
+    """When the helper fires, it also sets request._layer1_fired = True
+    so downstream handlers can emit the diagnostic header without a
+    signature change to anthropic_to_openai."""
+    req = _make_request(tools=[_tool()])
+    fired = maybe_disable_thinking_for_qwen3_agent_first_turn(
+        req, reasoning_parser_name="qwen3", disabled=False
+    )
+    assert fired is True
+    assert getattr(req, "_layer1_fired", False) is True
+
+
+def test_helper_does_not_set_marker_on_skip():
+    """When the helper does NOT fire, the marker must remain unset
+    — downstream handlers must not see a stale True. Uses a plain class
+    instead of MagicMock because Mock auto-creates attributes on access."""
+
+    class _PlainReq:
+        messages: list = []
+        tools = None
+        thinking = None
+        chat_template_kwargs = None
+
+    req = _PlainReq()
+    fired = maybe_disable_thinking_for_qwen3_agent_first_turn(
+        req, reasoning_parser_name="qwen3", disabled=False
+    )
+    assert fired is False
+    assert not hasattr(req, "_layer1_fired")

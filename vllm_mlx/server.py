@@ -1833,6 +1833,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
+    # Layer 1 (Qwen3 runaway spec, 2026-04-20): auto-disable thinking on the
+    # Claude-Code-first-turn-with-tools fingerprint. Mutates
+    # request.chat_template_kwargs when firing. Must run BEFORE
+    # _resolve_thinking_budget so the template_kwargs-based budget resolver
+    # sees the final state. Reads `_reasoning_parser_name` from the server
+    # module (set at CLI bind time — Task 0).
+    maybe_disable_thinking_for_qwen3_agent_first_turn(
+        request,
+        reasoning_parser_name=_reasoning_parser_name,
+        disabled=_disable_qwen3_first_turn_no_think,
+    )
+
     # Thinking budget: resolve from both parse paths.
     _budget, _msg = _resolve_thinking_budget(
         top_level={
@@ -1984,6 +1996,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
                     noop_reason=_streaming_noop,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from,
+                    clamp_skip_reason=_clamp_skip,
+                    qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
                 )
             )
         elif _resolved_budget.source != EffortSource.DEFAULT:
@@ -1991,7 +2007,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # even though budget_was_requested is False. Emit diagnostic
             # headers but skip x-thinking-budget-applied (applied=None).
             stream_headers.update(
-                _build_thinking_budget_headers(_resolved_budget, applied=None)
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=None,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from,
+                    clamp_skip_reason=_clamp_skip,
+                    qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
+                )
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -2086,6 +2109,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 _resolved_budget,
                 applied=(applied is True),
                 noop_reason=noop_reason,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from,
+                clamp_skip_reason=_clamp_skip,
+                qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
             ),
         )
 
@@ -2097,7 +2124,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
-            headers=_build_thinking_budget_headers(_resolved_budget, applied=None),
+            headers=_build_thinking_budget_headers(
+                _resolved_budget,
+                applied=None,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from,
+                clamp_skip_reason=_clamp_skip,
+                qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
+            ),
         )
 
     return chat_response
@@ -2229,6 +2263,12 @@ async def create_anthropic_message(
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
                     noop_reason=_streaming_noop,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from_anth,
+                    clamp_skip_reason=_clamp_skip_anth,
+                    qwen3_auto_no_think=getattr(
+                        anthropic_request, "_layer1_fired", False
+                    ),
                 )
             )
         elif _resolved_budget.source != EffortSource.DEFAULT:
@@ -2236,7 +2276,16 @@ async def create_anthropic_message(
             # without a nested thinking dict / top-level budget — surface
             # diagnostic headers without claiming enforcement status.
             headers.update(
-                _build_thinking_budget_headers(_resolved_budget, applied=None)
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=None,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from_anth,
+                    clamp_skip_reason=_clamp_skip_anth,
+                    qwen3_auto_no_think=getattr(
+                        anthropic_request, "_layer1_fired", False
+                    ),
+                )
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -2373,6 +2422,12 @@ async def create_anthropic_message(
                 _resolved_budget,
                 applied=(applied is True),
                 noop_reason=noop_reason,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from_anth,
+                clamp_skip_reason=_clamp_skip_anth,
+                qwen3_auto_no_think=getattr(
+                    anthropic_request, "_layer1_fired", False
+                ),
             )
         )
     elif _resolved_budget.source != EffortSource.DEFAULT:
@@ -2380,7 +2435,16 @@ async def create_anthropic_message(
         # without a nested thinking dict / top-level budget — surface
         # diagnostic headers without claiming enforcement status.
         _resp_headers.update(
-            _build_thinking_budget_headers(_resolved_budget, applied=None)
+            _build_thinking_budget_headers(
+                _resolved_budget,
+                applied=None,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from_anth,
+                clamp_skip_reason=_clamp_skip_anth,
+                qwen3_auto_no_think=getattr(
+                    anthropic_request, "_layer1_fired", False
+                ),
+            )
         )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),

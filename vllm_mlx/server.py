@@ -60,7 +60,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .api.budget_ceiling import apply_server_thinking_token_budget_ceiling
 from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
+from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -197,6 +199,20 @@ def _resolve_thinking_budget(top_level=None, template_kwargs=None):
         message = templ.get("thinking_budget_message")
 
     return budget, message
+
+
+def _engine_supports_thinking_budget_processor(engine) -> bool:
+    """True when the engine can actually enforce a thinking_token_budget
+    via the logits processor. Mirrors the multi-way check used by
+    `_streaming_header_value` and the Layer 2 clamp sites — extracted
+    here so drift across sites is impossible (/dc review finding M2)."""
+    from .engine.batched import BatchedEngine  # late import avoids cycle
+
+    return (
+        isinstance(engine, BatchedEngine)
+        and not getattr(engine, "_is_mllm", False)
+        and getattr(engine, "_reasoning_parser", None) is not None
+    )
 
 
 def _streaming_header_value(
@@ -1885,10 +1901,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         reasoning_effort=request.reasoning_effort,
         context_window=131072,
     )
+
+    # Layer 2 (Qwen3 runaway spec, 2026-04-20): apply server-side ceiling.
+    # Idempotent — no-op when ceiling None, budget None/0, or budget <= ceiling.
+    _engine_supports_proc = _engine_supports_thinking_budget_processor(engine)
+    _resolved_budget, _clamped_from, _clamp_skip = (
+        apply_server_thinking_token_budget_ceiling(
+            _resolved_budget,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_proc,
+        )
+    )
+
     # If reasoning_effort supplied a budget and top-level did not, propagate
-    # the resolved value downstream so the engine sees it.
+    # the (possibly-clamped) resolved value downstream so the engine sees it.
     if (
         request.thinking_token_budget is None
+        and _resolved_budget is not None
         and _resolved_budget.budget is not None
         and _resolved_budget.source != EffortSource.DEFAULT
     ):

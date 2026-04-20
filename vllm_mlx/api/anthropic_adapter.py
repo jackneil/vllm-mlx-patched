@@ -164,13 +164,26 @@ def anthropic_to_openai(
     #
     # Reads reasoning_parser_name + disable flag from the server module (the
     # engine does not expose reasoning_parser_name, per UPSTREAM_PIN inv. 14).
-    from .. import server as _server_module
+    # Guarded import: the unit-test matrix runs without uvicorn/fastapi, so
+    # server.py can't import in that environment. Fall back to defaults
+    # (Layer 1 off) — the adapter still works for pure-unit-test assertions.
     from .thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
+
+    try:
+        from .. import server as _server_module
+
+        _reasoning_parser_name = _server_module._reasoning_parser_name
+        _disable_qwen3_first_turn_no_think = (
+            _server_module._disable_qwen3_first_turn_no_think
+        )
+    except ImportError:
+        _reasoning_parser_name = None
+        _disable_qwen3_first_turn_no_think = False
 
     maybe_disable_thinking_for_qwen3_agent_first_turn(
         request,
-        reasoning_parser_name=_server_module._reasoning_parser_name,
-        disabled=_server_module._disable_qwen3_first_turn_no_think,
+        reasoning_parser_name=_reasoning_parser_name,
+        disabled=_disable_qwen3_first_turn_no_think,
     )
 
     # Resolve thinking budget via the shared resolver. Replaces the old
@@ -188,14 +201,22 @@ def anthropic_to_openai(
     # Layer 2 site 1 (Qwen3 runaway spec, 2026-04-20): apply server ceiling
     # BEFORE constructing ChatCompletionRequest so the clamped budget
     # propagates cleanly. Reads `server._max_thinking_token_budget` as a
-    # module-level global, same pattern as _streaming_max_seconds.
-    from .. import server as _server_module
+    # module-level global, same pattern as _streaming_max_seconds. Guarded
+    # import so the unit-test matrix (no uvicorn) still works — fall back
+    # to ceiling=None (feature disabled).
     from .budget_ceiling import apply_server_thinking_token_budget_ceiling
+
+    try:
+        from .. import server as _server_module
+
+        _ceiling = _server_module._max_thinking_token_budget
+    except ImportError:
+        _ceiling = None
 
     resolved, _clamped_from_adapter, _clamp_skip_adapter = (
         apply_server_thinking_token_budget_ceiling(
             resolved,
-            ceiling=_server_module._max_thinking_token_budget,
+            ceiling=_ceiling,
             engine_supports_processor=engine_supports_processor,
         )
     )

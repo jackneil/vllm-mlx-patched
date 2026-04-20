@@ -54,6 +54,26 @@ import requests
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(autouse=True)
+def _guard_no_server_ceiling():
+    """These tests exercise a LIVE server via HTTP — if the server under
+    test was started with --max-thinking-token-budget, the pre-clamp
+    budget assertions would silently flip. The guard is best-effort (the
+    in-process server module reflects whatever the current process set,
+    not the HTTP target). Operators: run this suite against a server
+    started WITHOUT the ceiling flag."""
+    try:
+        from vllm_mlx import server
+
+        assert server._max_thinking_token_budget is None, (
+            "In-process server module has a ceiling set; some fixture "
+            "bled state. Tests assume no ceiling."
+        )
+    except ImportError:
+        pass
+    yield
+
+
 # Two prompts chosen to exercise different paths:
 #   PROMPT_REASONING: asks for step-by-step work — the model will enter
 #       <think>…</think> and keep thinking until budget or </think>.

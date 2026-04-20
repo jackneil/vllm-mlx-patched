@@ -60,7 +60,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .api.budget_ceiling import apply_server_thinking_token_budget_ceiling
 from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
+from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -139,6 +141,15 @@ _default_top_p: float | None = None  # Set via --default-top-p
 # string, which the instance does not expose.
 _reasoning_parser_name: str | None = None
 
+# --max-thinking-token-budget N: Layer 2 server-side ceiling applied to
+# resolver output before it hits chat_kwargs. None (default) = no ceiling.
+# Set via CLI at serve time. See vllm_mlx/api/budget_ceiling.py.
+_max_thinking_token_budget: int | None = None
+
+# --disable-qwen3-first-turn-no-think: operator opt-out for Layer 1.
+# False (default) = feature enabled. See vllm_mlx/api/thinking_policy.py.
+_disable_qwen3_first_turn_no_think: bool = False
+
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
 
@@ -188,6 +199,80 @@ def _resolve_thinking_budget(top_level=None, template_kwargs=None):
         message = templ.get("thinking_budget_message")
 
     return budget, message
+
+
+def _log_thinking_budget_clamp(
+    msg_id: str,
+    model_name: str,
+    source: str,
+    clamped_from: int,
+    clamped_to: int,
+) -> None:
+    logger.warning(
+        "[thinking-budget-clamp] msg_id=%s model=%s source=%s "
+        "clamped_from=%d to=%d (server ceiling via --max-thinking-token-budget)",
+        msg_id,
+        model_name,
+        source,
+        clamped_from,
+        clamped_to,
+    )
+
+
+def _log_thinking_budget_clamp_skipped(
+    msg_id: str, model_name: str, reason: str, ceiling: int
+) -> None:
+    logger.debug(
+        "[thinking-budget-clamp-skipped] msg_id=%s model=%s reason=%s "
+        "ceiling=%d (engine/parser combination cannot enforce it)",
+        msg_id,
+        model_name,
+        reason,
+        ceiling,
+    )
+
+
+def _log_qwen3_auto_no_think(msg_id: str, model_name: str) -> None:
+    logger.debug(
+        "[qwen3-first-turn-no-think] msg_id=%s model=%s injected "
+        "chat_template_kwargs.enable_thinking=False (feature active; "
+        "override via --disable-qwen3-first-turn-no-think)",
+        msg_id,
+        model_name,
+    )
+
+
+def _log_startup_thinking_config() -> None:
+    """Called once per serve process after model load."""
+    ceiling_repr = (
+        str(_max_thinking_token_budget)
+        if _max_thinking_token_budget is not None
+        else "unset"
+    )
+    l1_mode = (
+        "opt-out via --disable-qwen3-first-turn-no-think"
+        if _disable_qwen3_first_turn_no_think
+        else "default-on"
+    )
+    logger.info(
+        "Thinking-budget configuration: ceiling=%s, qwen3_first_turn_no_think=%s",
+        ceiling_repr,
+        l1_mode,
+    )
+
+
+def _engine_supports_thinking_budget_processor(engine) -> bool:
+    """True when the engine can actually enforce a thinking_token_budget
+    via the logits processor. Mirrors the multi-way check used by
+    `_streaming_header_value` and the Layer 2 clamp sites — extracted
+    here so drift across sites is impossible (/dc review finding M2)."""
+    from .engine.batched import BatchedEngine  # late import avoids cycle
+
+    return (
+        isinstance(engine, BatchedEngine)
+        and not getattr(engine, "_is_mllm", False)
+        and getattr(engine, "_reasoning_parser", None) is not None
+    )
 
 
 def _streaming_header_value(
@@ -243,27 +328,43 @@ def _build_thinking_budget_headers(
     resolved: ResolvedBudget,
     applied: bool | None,
     noop_reason: str | None = None,
+    *,
+    ceiling: int | None = None,
+    clamped_from: int | None = None,
+    clamp_skip_reason: str | None = None,
+    qwen3_auto_no_think: bool = False,
 ) -> dict[str, str]:
     """Build the x-thinking-budget-* response headers from a ResolvedBudget.
 
     `applied` is the pre-existing bool/None the emission sites were computing
-    before this change (based on whether the logits processor attached and the
-    family can enforce). It stays separate because applied = "did it actually
-    work" != resolved = "what did we decide to try."
+    (based on whether the logits processor attached and the family can
+    enforce). It stays separate because applied = "did it actually work"
+    != resolved = "what did we decide to try."
 
     `noop_reason`, when present with applied=False, surfaces WHY the processor
     didn't attach (e.g. ``"simple_engine"``, ``"mllm_path"``,
-    ``"parser_not_configured"``, ``"tokenizer_encode_failed"``). Operators
-    need this to diagnose silent no-ops — without it, the only signal is
-    `applied=false` with no root cause (the arena incident on 2026-04-18).
+    ``"parser_not_configured"``, ``"tokenizer_encode_failed"``).
+
+    New keyword-only kwargs (added 2026-04-20 for Qwen3 runaway mitigation):
+    - ``ceiling``: when not None, emits ``x-thinking-budget-ceiling: N`` on
+      every response. Tells operators the server ceiling is configured.
+    - ``clamped_from``: when not None, emits ``x-thinking-budget-clamped-to: N``
+      using ``resolved.budget`` (post-clamp value). The original pre-clamp
+      budget is not emitted to avoid info leakage about operator policy.
+    - ``clamp_skip_reason``: when not None, emits
+      ``x-thinking-budget-clamp-skipped: <reason>``. Exclusive with
+      ``clamped_from`` (either we clamped or we skipped).
+    - ``qwen3_auto_no_think``: when True, emits
+      ``x-thinking-qwen3-auto-disabled: true``. Layer 1 fired.
     """
     headers: dict[str, str] = {}
 
-    # 1. x-thinking-budget-applied (existing header, unchanged semantics).
+    # 1. x-thinking-budget-applied (existing, unchanged semantics).
     if applied is not None:
         headers["x-thinking-budget-applied"] = "true" if applied else "false"
 
-    # 2. x-thinking-budget-resolved — the int (or "none") the resolver produced.
+    # 2. x-thinking-budget-resolved — reflects POST-clamp value so engine
+    # state and headers agree.
     headers["x-thinking-budget-resolved"] = (
         str(resolved.budget) if resolved.budget is not None else "none"
     )
@@ -276,11 +377,28 @@ def _build_thinking_budget_headers(
         headers["x-thinking-budget-max-tokens-floor"] = str(resolved.max_tokens_floor)
 
     # 5. x-thinking-budget-noop-reason — emitted ONLY when applied is False.
-    # Tells operators WHY the processor didn't attach (simple_engine vs
-    # mllm_path vs parser_not_configured vs tokenizer_encode_failed). Absent
-    # when applied is True or no budget was requested.
     if applied is False and noop_reason:
         headers["x-thinking-budget-noop-reason"] = noop_reason
+
+    # 6. NEW: x-thinking-budget-ceiling — emitted whenever ceiling configured.
+    if ceiling is not None:
+        headers["x-thinking-budget-ceiling"] = str(ceiling)
+
+    # 7. NEW: x-thinking-budget-clamped-to — emitted only when Layer 2 fired.
+    # Value is the post-clamp (ceiling) value, matching resolved.budget.
+    if clamped_from is not None:
+        headers["x-thinking-budget-clamped-to"] = (
+            str(resolved.budget) if resolved.budget is not None else "none"
+        )
+
+    # 8. NEW: x-thinking-budget-clamp-skipped — ceiling set but engine/parser
+    # cannot enforce it.
+    if clamp_skip_reason is not None:
+        headers["x-thinking-budget-clamp-skipped"] = clamp_skip_reason
+
+    # 9. NEW: x-thinking-qwen3-auto-disabled — Layer 1 fired.
+    if qwen3_auto_no_think:
+        headers["x-thinking-qwen3-auto-disabled"] = "true"
 
     return headers
 
@@ -835,6 +953,7 @@ def load_model(
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
+    _log_startup_thinking_config()
 
 
 def get_usage(output: GenerationOutput) -> Usage:
@@ -1773,6 +1892,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
+    # Layer 1 (Qwen3 runaway spec, 2026-04-20): auto-disable thinking on the
+    # Claude-Code-first-turn-with-tools fingerprint. Mutates
+    # request.chat_template_kwargs when firing. Must run BEFORE
+    # _resolve_thinking_budget so the template_kwargs-based budget resolver
+    # sees the final state. Reads `_reasoning_parser_name` from the server
+    # module (set at CLI bind time — Task 0).
+    maybe_disable_thinking_for_qwen3_agent_first_turn(
+        request,
+        reasoning_parser_name=_reasoning_parser_name,
+        disabled=_disable_qwen3_first_turn_no_think,
+    )
+
     # Thinking budget: resolve from both parse paths.
     _budget, _msg = _resolve_thinking_budget(
         top_level={
@@ -1781,6 +1912,31 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         },
         template_kwargs=request.chat_template_kwargs,
     )
+
+    # Layer 2 site 2 (Qwen3 runaway spec, 2026-04-20): clamp chat_template_kwargs
+    # / top-level budget to the server ceiling BEFORE it lands in chat_kwargs.
+    # Without this, a client sending chat_template_kwargs.thinking_token_budget
+    # > ceiling would escape Layer 2 via the documented extension field.
+    _engine_supports_proc_early = _engine_supports_thinking_budget_processor(engine)
+    _clamped_from_early: int | None = None
+    if _budget is not None and _max_thinking_token_budget is not None:
+        # Synthesized ResolvedBudget with TEMPLATE_KWARGS source — keeps the
+        # x-thinking-budget-source response header honest about provenance
+        # (/dc review G2).
+        _synth = ResolvedBudget(
+            budget=_budget,
+            source=EffortSource.TEMPLATE_KWARGS,
+            max_tokens_floor=None,
+            effort_label=None,
+        )
+        _synth_out, _clamped_from_early, _ = apply_server_thinking_token_budget_ceiling(
+            _synth,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_proc_early,
+        )
+        if _clamped_from_early is not None and _synth_out is not None:
+            _budget = _synth_out.budget
+
     if _budget is not None:
         chat_kwargs["thinking_token_budget"] = _budget
     if _msg is not None:
@@ -1841,10 +1997,43 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         reasoning_effort=request.reasoning_effort,
         context_window=131072,
     )
+
+    # Layer 2 (Qwen3 runaway spec, 2026-04-20): apply server-side ceiling.
+    # Idempotent — no-op when ceiling None, budget None/0, or budget <= ceiling.
+    _engine_supports_proc = _engine_supports_thinking_budget_processor(engine)
+    _resolved_budget, _clamped_from, _clamp_skip = (
+        apply_server_thinking_token_budget_ceiling(
+            _resolved_budget,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_proc,
+        )
+    )
+    _msg_id = getattr(request, "_msg_id", None) or f"msg_{uuid.uuid4().hex[:24]}"
+    if _clamped_from is not None and _resolved_budget is not None:
+        _log_thinking_budget_clamp(
+            msg_id=_msg_id,
+            model_name=getattr(request, "model", "unknown"),
+            source=_resolved_budget.source.value,
+            clamped_from=_clamped_from,
+            clamped_to=_resolved_budget.budget,
+        )
+    if _clamp_skip is not None and _max_thinking_token_budget is not None:
+        _log_thinking_budget_clamp_skipped(
+            msg_id=_msg_id,
+            model_name=getattr(request, "model", "unknown"),
+            reason=_clamp_skip,
+            ceiling=_max_thinking_token_budget,
+        )
+    if getattr(request, "_layer1_fired", False):
+        _log_qwen3_auto_no_think(
+            msg_id=_msg_id, model_name=getattr(request, "model", "unknown")
+        )
+
     # If reasoning_effort supplied a budget and top-level did not, propagate
-    # the resolved value downstream so the engine sees it.
+    # the (possibly-clamped) resolved value downstream so the engine sees it.
     if (
         request.thinking_token_budget is None
+        and _resolved_budget is not None
         and _resolved_budget.budget is not None
         and _resolved_budget.source != EffortSource.DEFAULT
     ):
@@ -1884,14 +2073,27 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
                     noop_reason=_streaming_noop,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from,
+                    clamp_skip_reason=_clamp_skip,
+                    qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
                 )
             )
-        elif _resolved_budget.source != EffortSource.DEFAULT:
+        elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+            request, "_layer1_fired", False
+        ):
             # Resolver produced a non-default value (e.g. reasoning_effort)
             # even though budget_was_requested is False. Emit diagnostic
             # headers but skip x-thinking-budget-applied (applied=None).
             stream_headers.update(
-                _build_thinking_budget_headers(_resolved_budget, applied=None)
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=None,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from,
+                    clamp_skip_reason=_clamp_skip,
+                    qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
+                )
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -1986,6 +2188,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 _resolved_budget,
                 applied=(applied is True),
                 noop_reason=noop_reason,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from,
+                clamp_skip_reason=_clamp_skip,
+                qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
             ),
         )
 
@@ -1997,7 +2203,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
         return JSONResponse(
             content=chat_response.model_dump(mode="json", exclude_none=True),
-            headers=_build_thinking_budget_headers(_resolved_budget, applied=None),
+            headers=_build_thinking_budget_headers(
+                _resolved_budget,
+                applied=None,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from,
+                clamp_skip_reason=_clamp_skip,
+                qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
+            ),
         )
 
     return chat_response
@@ -2091,7 +2304,53 @@ async def create_anthropic_message(
             if _reasoning_parser is not None
             else None
         ),
+        engine_supports_processor=_engine_supports_thinking_budget_processor(engine),
     )
+
+    # Layer 2 site 4 (Qwen3 runaway spec, 2026-04-20): defensive re-clamp.
+    # Redundant with site 1 (adapter) but guards against future adapter
+    # refactors that might skip clamping. Helper is idempotent — no-op when
+    # budget already at/under ceiling.
+    _resolved_budget, _clamped_from_anth, _clamp_skip_anth = (
+        apply_server_thinking_token_budget_ceiling(
+            _resolved_budget,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_thinking_budget_processor(
+                engine
+            ),
+        )
+    )
+    if _resolved_budget is not None:
+        openai_request.thinking_token_budget = _resolved_budget.budget
+    # Prefer adapter-side clamp state if it fired (site 4's defensive
+    # re-clamp is a no-op once site 1 already clamped, so _clamped_from_anth
+    # would be None even when the adapter DID clamp). This keeps the
+    # response headers truthful about what happened upstream.
+    if _clamped_from_anth is None:
+        _clamped_from_anth = getattr(anthropic_request, "_layer2_clamped_from", None)
+    if _clamp_skip_anth is None:
+        _clamp_skip_anth = getattr(anthropic_request, "_layer2_clamp_skip", None)
+    _msg_id_anth = f"msg_{uuid.uuid4().hex[:24]}"
+    if _clamped_from_anth is not None and _resolved_budget is not None:
+        _log_thinking_budget_clamp(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+            source=_resolved_budget.source.value,
+            clamped_from=_clamped_from_anth,
+            clamped_to=_resolved_budget.budget,
+        )
+    if _clamp_skip_anth is not None and _max_thinking_token_budget is not None:
+        _log_thinking_budget_clamp_skipped(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+            reason=_clamp_skip_anth,
+            ceiling=_max_thinking_token_budget,
+        )
+    if getattr(anthropic_request, "_layer1_fired", False):
+        _log_qwen3_auto_no_think(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+        )
 
     # Also WARN if max_tokens is below the resolver's advisory floor.
     # Sibling of PR #12's sizing guardrail — catches the common "effort=high
@@ -2116,14 +2375,31 @@ async def create_anthropic_message(
                     _resolved_budget,
                     applied=(streaming_applied == "true"),
                     noop_reason=_streaming_noop,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from_anth,
+                    clamp_skip_reason=_clamp_skip_anth,
+                    qwen3_auto_no_think=getattr(
+                        anthropic_request, "_layer1_fired", False
+                    ),
                 )
             )
-        elif _resolved_budget.source != EffortSource.DEFAULT:
+        elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+            anthropic_request, "_layer1_fired", False
+        ):
             # Resolver produced a non-default value (e.g. output_config.effort)
             # without a nested thinking dict / top-level budget — surface
             # diagnostic headers without claiming enforcement status.
             headers.update(
-                _build_thinking_budget_headers(_resolved_budget, applied=None)
+                _build_thinking_budget_headers(
+                    _resolved_budget,
+                    applied=None,
+                    ceiling=_max_thinking_token_budget,
+                    clamped_from=_clamped_from_anth,
+                    clamp_skip_reason=_clamp_skip_anth,
+                    qwen3_auto_no_think=getattr(
+                        anthropic_request, "_layer1_fired", False
+                    ),
+                )
             )
         return StreamingResponse(
             _disconnect_guard(
@@ -2260,14 +2536,27 @@ async def create_anthropic_message(
                 _resolved_budget,
                 applied=(applied is True),
                 noop_reason=noop_reason,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from_anth,
+                clamp_skip_reason=_clamp_skip_anth,
+                qwen3_auto_no_think=getattr(anthropic_request, "_layer1_fired", False),
             )
         )
-    elif _resolved_budget.source != EffortSource.DEFAULT:
+    elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+        anthropic_request, "_layer1_fired", False
+    ):
         # Resolver produced a non-default value (e.g. output_config.effort)
-        # without a nested thinking dict / top-level budget — surface
-        # diagnostic headers without claiming enforcement status.
+        # or Layer 1 fired — surface diagnostic headers (without claiming
+        # enforcement status via applied=None).
         _resp_headers.update(
-            _build_thinking_budget_headers(_resolved_budget, applied=None)
+            _build_thinking_budget_headers(
+                _resolved_budget,
+                applied=None,
+                ceiling=_max_thinking_token_budget,
+                clamped_from=_clamped_from_anth,
+                clamp_skip_reason=_clamp_skip_anth,
+                qwen3_auto_no_think=getattr(anthropic_request, "_layer1_fired", False),
+            )
         )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),

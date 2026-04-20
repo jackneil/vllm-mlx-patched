@@ -1,8 +1,24 @@
 """Integration tests for anthropic_adapter's use of the effort resolver."""
 
+import pytest
+
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 from vllm_mlx.api.anthropic_models import AnthropicRequest
 from vllm_mlx.api.effort import EffortSource
+
+
+@pytest.fixture(autouse=True)
+def _guard_no_server_ceiling():
+    """These tests assert pre-clamp budget values. A stray fixture setting
+    server._max_thinking_token_budget would silently flip assertions."""
+    from vllm_mlx import server
+
+    original = server._max_thinking_token_budget
+    server._max_thinking_token_budget = None
+    try:
+        yield
+    finally:
+        server._max_thinking_token_budget = original
 
 
 def _mk(body: dict) -> AnthropicRequest:

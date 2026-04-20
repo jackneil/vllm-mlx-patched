@@ -82,6 +82,8 @@ def anthropic_to_openai(
     request: AnthropicRequest,
     context_window: int = 131072,
     reasoning_parser_start_token: str | None = None,
+    *,
+    engine_supports_processor: bool = True,
 ) -> tuple[ChatCompletionRequest, ResolvedBudget]:
     """
     Convert an Anthropic Messages API request to OpenAI Chat Completions format.
@@ -154,6 +156,36 @@ def anthropic_to_openai(
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
+    # Layer 1 (Qwen3 runaway spec, 2026-04-20): auto-disable thinking on the
+    # Claude-Code-first-turn-with-tools fingerprint. Mutates
+    # request.chat_template_kwargs when firing and sets request._layer1_fired
+    # = True. Must run BEFORE resolve_effort so the resolver sees the final
+    # template-kwargs state.
+    #
+    # Reads reasoning_parser_name + disable flag from the server module (the
+    # engine does not expose reasoning_parser_name, per UPSTREAM_PIN inv. 14).
+    # Guarded import: the unit-test matrix runs without uvicorn/fastapi, so
+    # server.py can't import in that environment. Fall back to defaults
+    # (Layer 1 off) — the adapter still works for pure-unit-test assertions.
+    from .thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
+
+    try:
+        from .. import server as _server_module
+
+        _reasoning_parser_name = _server_module._reasoning_parser_name
+        _disable_qwen3_first_turn_no_think = (
+            _server_module._disable_qwen3_first_turn_no_think
+        )
+    except ImportError:
+        _reasoning_parser_name = None
+        _disable_qwen3_first_turn_no_think = False
+
+    maybe_disable_thinking_for_qwen3_agent_first_turn(
+        request,
+        reasoning_parser_name=_reasoning_parser_name,
+        disabled=_disable_qwen3_first_turn_no_think,
+    )
+
     # Resolve thinking budget via the shared resolver. Replaces the old
     # inline thinking.type + thinking_token_budget resolution block.
     # The resolver handles top-level vs Anthropic `thinking` (including
@@ -165,6 +197,43 @@ def anthropic_to_openai(
         reasoning_effort=None,  # not on the Anthropic path
         context_window=context_window,
     )
+
+    # Layer 2 site 1 (Qwen3 runaway spec, 2026-04-20): apply server ceiling
+    # BEFORE constructing ChatCompletionRequest so the clamped budget
+    # propagates cleanly. Reads `server._max_thinking_token_budget` as a
+    # module-level global, same pattern as _streaming_max_seconds. Guarded
+    # import so the unit-test matrix (no uvicorn) still works — fall back
+    # to ceiling=None (feature disabled).
+    from .budget_ceiling import apply_server_thinking_token_budget_ceiling
+
+    try:
+        from .. import server as _server_module
+
+        _ceiling = _server_module._max_thinking_token_budget
+    except ImportError:
+        _ceiling = None
+
+    resolved, _clamped_from_adapter, _clamp_skip_adapter = (
+        apply_server_thinking_token_budget_ceiling(
+            resolved,
+            ceiling=_ceiling,
+            engine_supports_processor=engine_supports_processor,
+        )
+    )
+    # Surface adapter-side clamp/skip state to the handler via request
+    # markers. Same pattern as _layer1_fired — avoids changing the
+    # 2-tuple return contract. Handler reads these back out to emit
+    # x-thinking-budget-clamped-to / clamp-skipped headers accurately.
+    if _clamped_from_adapter is not None:
+        try:
+            request._layer2_clamped_from = _clamped_from_adapter
+        except (AttributeError, TypeError):
+            object.__setattr__(request, "_layer2_clamped_from", _clamped_from_adapter)
+    if _clamp_skip_adapter is not None:
+        try:
+            request._layer2_clamp_skip = _clamp_skip_adapter
+        except (AttributeError, TypeError):
+            object.__setattr__(request, "_layer2_clamp_skip", _clamp_skip_adapter)
 
     openai_req = ChatCompletionRequest(
         model=request.model,

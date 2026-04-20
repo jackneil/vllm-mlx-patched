@@ -41,6 +41,8 @@ def serve_command(args):
     server._api_key = args.api_key
     server._default_timeout = args.timeout
     server._streaming_max_seconds = args.streaming_max_seconds
+    server._max_thinking_token_budget = args.max_thinking_token_budget
+    server._disable_qwen3_first_turn_no_think = args.disable_qwen3_first_turn_no_think
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -990,6 +992,20 @@ Examples:
             )
         return v
 
+    def _pos_int(raw: str) -> int:
+        try:
+            v = int(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--max-thinking-token-budget must be an integer (got {raw!r})."
+            )
+        if v <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--max-thinking-token-budget must be > 0 (got {v}). "
+                "Omit the flag to disable the ceiling."
+            )
+        return v
+
     serve_parser.add_argument(
         "--streaming-max-seconds",
         type=_nonneg_float,
@@ -1003,6 +1019,36 @@ Examples:
             "Mitigates the Qwen3.x 'interleaved thinking' trap and any "
             "other model-side non-termination. Set higher if you legitimately "
             "stream >260s responses; set to 0 to disable the cap."
+        ),
+    )
+    serve_parser.add_argument(
+        "--max-thinking-token-budget",
+        type=_pos_int,
+        default=None,
+        help=(
+            "Server-side ceiling applied to any resolved thinking_token_budget. "
+            "When set, any resolver output greater than N is clamped down to N "
+            "(respecting client budget=0 disable). Mirrors llama.cpp's "
+            "--reasoning-budget N pattern; addresses the Qwen3.x first-turn "
+            "runaway under Claude Code payloads. Recommended: 2048 for "
+            "Qwen3.6 + agentic-client serves. Omit to disable the ceiling. "
+            "See docs/testing/2026-04-19-qwen36-first-turn-runaway-under-"
+            "claude-code-payload.md."
+        ),
+    )
+    serve_parser.add_argument(
+        "--disable-qwen3-first-turn-no-think",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-out for the Qwen3 first-turn-no-think surgical auto-disable "
+            "(Layer 1). By default, requests to serves using --reasoning-parser "
+            "qwen3 that carry tools + no prior assistant message have "
+            "chat_template_kwargs.enable_thinking=False injected automatically "
+            "(mitigates the Qwen3.x first-turn runaway without operator "
+            "configuration). Set this flag to disable the auto-injection and "
+            "let Qwen3 run with its default thinking behavior. Client-explicit "
+            "thinking signals always override either way."
         ),
     )
     # Tool calling options

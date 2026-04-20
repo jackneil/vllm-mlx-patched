@@ -48,6 +48,14 @@ Every response that went through the resolver emits these headers:
 | `x-thinking-budget-source` | `top_level` \| `anthropic_thinking_enabled` \| `anthropic_thinking_disabled` \| `anthropic_thinking_adaptive` \| `output_config_effort` \| `reasoning_effort` \| `default` | Which input field won precedence. |
 | `x-thinking-budget-max-tokens-floor` | int as string | Recommended minimum `max_tokens` for this effort level. Absent when source is `default` or budget is 0. |
 | `x-thinking-budget-noop-reason` | `parser_not_configured` \| `tokenizer_encode_failed` \| `multi_token_delimiter` \| `mllm_path` \| `simple_engine` | Machine-readable reason the processor didn't attach. Only present when `applied=false`. See **Noop reasons** below. |
+| `x-thinking-budget-ceiling` | int as string | Configured `--max-thinking-token-budget` value. Emitted on every response when the flag is set, regardless of whether Layer 2 fired. Absent when the flag is unset. |
+| `x-thinking-budget-clamped-to` | int as string | Post-clamp budget. Emitted ONLY when Layer 2 actually clamped. Matches `x-thinking-budget-resolved`. |
+| `x-thinking-budget-clamp-skipped` | `mllm_path` \| `simple_engine` \| `parser_not_configured` \| `engine-no-op` | Emitted when ceiling is set but the engine/parser combination cannot enforce the clamp. Matches `noop-reason` vocabulary. |
+| `x-thinking-qwen3-auto-disabled` | `"true"` | Emitted when Layer 1 (Qwen3 surgical first-turn-no-think) fired on this request — `chat_template_kwargs.enable_thinking=False` was injected automatically. |
+
+### Server-side ceiling behavior (Layer 2)
+
+The `--max-thinking-token-budget N` flag applies AFTER the resolver precedence chain above. Clamping only raises `clamped_from`/`clamped_to` headers when the resolver output actually exceeded the ceiling; budgets below the ceiling pass through unchanged. The ceiling NEVER raises `budget=0` (client explicitly disabled thinking) — clamps are lower-bound only. When the engine/parser can't enforce the clamp (MLLM path, SimpleEngine, missing reasoning parser), `clamp-skipped` is emitted with the specific reason so operators can tell clamp-fired-truthfully from clamp-was-asked-for-but-couldn't-deliver.
 
 ## Per-family enforceability
 

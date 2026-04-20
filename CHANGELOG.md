@@ -10,6 +10,18 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ## Unreleased
 
+### Qwen3 first-turn runaway mitigation
+
+- **Qwen3 first-turn runaway — three-layer defense shipped.** Qwen3.x models on first-turn-with-tools requests can enter an "interleaved thinking" trap — generating reasoning indefinitely without emitting `</think>`. Mitigations:
+  - **Layer 1** (surgical auto-disable, default-on): when serving `--reasoning-parser qwen3` AND the request has `tools: [...]` AND no prior assistant message, the adapter injects `chat_template_kwargs={"enable_thinking": False}`. Uses Qwen's own chat-template branch → model skips think mode. Client-explicit `enable_thinking` or `thinking.type` always wins. Opt-out via `--disable-qwen3-first-turn-no-think`.
+  - **Layer 2** (opt-in `--max-thinking-token-budget N` CLI flag): operator-tunable ceiling on resolver output. Clamps any resolved budget > N down to N at all 4 resolve-sites. Respects client `budget=0` (never raises). Recommended `2048` for Qwen3.x + agentic clients.
+  - **Layer 3** (existing `--streaming-max-seconds 260`): remains as third-line wall-clock backstop.
+- **New response headers**: `x-thinking-budget-ceiling`, `x-thinking-budget-clamped-to`, `x-thinking-budget-clamp-skipped`, `x-thinking-qwen3-auto-disabled`.
+- **New counters**: `thinking_budget_clamp_fired_total`, `qwen3_first_turn_no_think_applied_total`.
+- **Changed**: `x-thinking-budget-resolved` now reflects the POST-clamp value when Layer 2 fires. `x-thinking-budget-max-tokens-floor` absent when Layer 2 clamped (pre-clamp floor is stale).
+- **Known limitation**: multi-turn in-context-learning back-fire. When Layer 1 fires on turn 1, Qwen3 may produce shallow thinking on turn 2+ even with explicit client thinking request. Root fix (synthesize `<think></think>` in prior-turn reconstruction) deferred. Skip-marked regression test documents the vector.
+- Investigation: [docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md](docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md). Upstream refs: [ml-explore/mlx#3267](https://github.com/ml-explore/mlx/issues/3267), [ggml-org/llama.cpp#21118](https://github.com/ggml-org/llama.cpp/issues/21118), [vllm-project/vllm#39103](https://github.com/vllm-project/vllm/issues/39103).
+
 ### Thinking budget — API correctness and observability
 
 - **#24** `fix(effort)`: `thinking.type="adaptive"` + explicit effort ceiling. When Claude Code (and other clients) send BOTH `thinking.type=adaptive` AND `output_config.effort=high` (or `reasoning_effort=high`), the resolver previously discarded the effort signal and returned `budget=None` — because `adaptive` short-circuited precedence. On Claude 4.5+ this works (self-regulation); on Qwen3.6 and other open-weight models it produced a first-turn runaway (thinking indefinitely until the 260s streaming cap fired). Fix: when `adaptive` is accompanied by an explicit effort signal, fall through to the effort branch so the model gets a ceiling. Closes the Qwen3.6 first-turn runaway documented in `docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md` (H4).

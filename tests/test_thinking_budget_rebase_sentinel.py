@@ -411,3 +411,48 @@ class TestThinkingBudgetSentinel:
             "logits_processors. The feature will silently stop working. "
             "Update vllm_mlx/scheduler.py to match the new API surface."
         )
+
+
+def test_budget_ceiling_helper_invoked_at_all_four_sites():
+    """Ensures upstream rebases don't silently revert the 2026-04-20 Qwen3
+    runaway fix. Helper must appear at all 4 Layer 2 call sites."""
+    import inspect
+
+    from vllm_mlx import server
+    from vllm_mlx.api import anthropic_adapter
+
+    anthropic_adapter_src = inspect.getsource(anthropic_adapter)
+    server_src = inspect.getsource(server)
+
+    helper = "apply_server_thinking_token_budget_ceiling"
+    assert anthropic_adapter_src.count(helper) >= 1, (
+        f"{helper} should be invoked at least once in anthropic_adapter.py "
+        "(adapter-level Layer 2 clamp, 2026-04-20 spec)"
+    )
+    # server.py has sites 2, 3, and 4 — expect at least 3 call-sites
+    # (plus the import line), so the total count should be >= 4.
+    assert server_src.count(helper) >= 4, (
+        f"{helper} should be invoked at least 3 times in server.py "
+        "(_resolve_thinking_budget site, OpenAI handler site, "
+        "Anthropic defensive re-clamp site — 2026-04-20 spec)"
+    )
+
+
+def test_thinking_policy_helper_invoked_at_both_sites():
+    """Layer 1 helper must fire at both adapter and OpenAI handler sites."""
+    import inspect
+
+    from vllm_mlx import server
+    from vllm_mlx.api import anthropic_adapter
+
+    helper = "maybe_disable_thinking_for_qwen3_agent_first_turn"
+    anth_src = inspect.getsource(anthropic_adapter)
+    srv_src = inspect.getsource(server)
+
+    assert (
+        helper in anth_src
+    ), f"{helper} must be invoked in anthropic_adapter.py (Layer 1, 2026-04-20)"
+    assert helper in srv_src, (
+        f"{helper} must be invoked in server.py create_chat_completion "
+        "(Layer 1, 2026-04-20)"
+    )

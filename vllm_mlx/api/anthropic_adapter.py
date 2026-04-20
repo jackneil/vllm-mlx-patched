@@ -199,6 +199,20 @@ def anthropic_to_openai(
             engine_supports_processor=engine_supports_processor,
         )
     )
+    # Surface adapter-side clamp/skip state to the handler via request
+    # markers. Same pattern as _layer1_fired — avoids changing the
+    # 2-tuple return contract. Handler reads these back out to emit
+    # x-thinking-budget-clamped-to / clamp-skipped headers accurately.
+    if _clamped_from_adapter is not None:
+        try:
+            request._layer2_clamped_from = _clamped_from_adapter
+        except (AttributeError, TypeError):
+            object.__setattr__(request, "_layer2_clamped_from", _clamped_from_adapter)
+    if _clamp_skip_adapter is not None:
+        try:
+            request._layer2_clamp_skip = _clamp_skip_adapter
+        except (AttributeError, TypeError):
+            object.__setattr__(request, "_layer2_clamp_skip", _clamp_skip_adapter)
 
     openai_req = ChatCompletionRequest(
         model=request.model,

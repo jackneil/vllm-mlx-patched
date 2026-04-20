@@ -2322,6 +2322,14 @@ async def create_anthropic_message(
     )
     if _resolved_budget is not None:
         openai_request.thinking_token_budget = _resolved_budget.budget
+    # Prefer adapter-side clamp state if it fired (site 4's defensive
+    # re-clamp is a no-op once site 1 already clamped, so _clamped_from_anth
+    # would be None even when the adapter DID clamp). This keeps the
+    # response headers truthful about what happened upstream.
+    if _clamped_from_anth is None:
+        _clamped_from_anth = getattr(anthropic_request, "_layer2_clamped_from", None)
+    if _clamp_skip_anth is None:
+        _clamp_skip_anth = getattr(anthropic_request, "_layer2_clamp_skip", None)
     _msg_id_anth = f"msg_{uuid.uuid4().hex[:24]}"
     if _clamped_from_anth is not None and _resolved_budget is not None:
         _log_thinking_budget_clamp(

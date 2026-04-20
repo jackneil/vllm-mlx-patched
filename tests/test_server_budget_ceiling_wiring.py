@@ -99,3 +99,27 @@ def test_anthropic_handler_post_adapter_defensive_reclamp():
     assert once_from == 8192
     assert twice is once  # no-op: same object returned
     assert twice_from is None  # already under ceiling
+
+
+def test_startup_banner_logs_ceiling_and_layer1_mode(caplog):
+    import logging as _logging
+
+    server._max_thinking_token_budget = 2048
+    server._disable_qwen3_first_turn_no_think = False
+    with caplog.at_level(_logging.INFO, logger="vllm_mlx.server"):
+        server._log_startup_thinking_config()
+    combined = " ".join(r.message for r in caplog.records)
+    assert "ceiling=2048" in combined
+    assert "default-on" in combined
+
+
+def test_startup_banner_unset_ceiling_repr(caplog):
+    import logging as _logging
+
+    server._max_thinking_token_budget = None
+    server._disable_qwen3_first_turn_no_think = True
+    with caplog.at_level(_logging.INFO, logger="vllm_mlx.server"):
+        server._log_startup_thinking_config()
+    combined = " ".join(r.message for r in caplog.records)
+    assert "ceiling=unset" in combined
+    assert "opt-out" in combined

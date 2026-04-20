@@ -201,6 +201,66 @@ def _resolve_thinking_budget(top_level=None, template_kwargs=None):
     return budget, message
 
 
+def _log_thinking_budget_clamp(
+    msg_id: str,
+    model_name: str,
+    source: str,
+    clamped_from: int,
+    clamped_to: int,
+) -> None:
+    logger.warning(
+        "[thinking-budget-clamp] msg_id=%s model=%s source=%s "
+        "clamped_from=%d to=%d (server ceiling via --max-thinking-token-budget)",
+        msg_id,
+        model_name,
+        source,
+        clamped_from,
+        clamped_to,
+    )
+
+
+def _log_thinking_budget_clamp_skipped(
+    msg_id: str, model_name: str, reason: str, ceiling: int
+) -> None:
+    logger.debug(
+        "[thinking-budget-clamp-skipped] msg_id=%s model=%s reason=%s "
+        "ceiling=%d (engine/parser combination cannot enforce it)",
+        msg_id,
+        model_name,
+        reason,
+        ceiling,
+    )
+
+
+def _log_qwen3_auto_no_think(msg_id: str, model_name: str) -> None:
+    logger.debug(
+        "[qwen3-first-turn-no-think] msg_id=%s model=%s injected "
+        "chat_template_kwargs.enable_thinking=False (feature active; "
+        "override via --disable-qwen3-first-turn-no-think)",
+        msg_id,
+        model_name,
+    )
+
+
+def _log_startup_thinking_config() -> None:
+    """Called once per serve process after model load."""
+    ceiling_repr = (
+        str(_max_thinking_token_budget)
+        if _max_thinking_token_budget is not None
+        else "unset"
+    )
+    l1_mode = (
+        "opt-out via --disable-qwen3-first-turn-no-think"
+        if _disable_qwen3_first_turn_no_think
+        else "default-on"
+    )
+    logger.info(
+        "Thinking-budget configuration: ceiling=%s, qwen3_first_turn_no_think=%s",
+        ceiling_repr,
+        l1_mode,
+    )
+
+
 def _engine_supports_thinking_budget_processor(engine) -> bool:
     """True when the engine can actually enforce a thinking_token_budget
     via the logits processor. Mirrors the multi-way check used by
@@ -893,6 +953,7 @@ def load_model(
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
+    _log_startup_thinking_config()
 
 
 def get_usage(output: GenerationOutput) -> Usage:
@@ -1951,6 +2012,26 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             engine_supports_processor=_engine_supports_proc,
         )
     )
+    _msg_id = getattr(request, "_msg_id", None) or f"msg_{uuid.uuid4().hex[:24]}"
+    if _clamped_from is not None and _resolved_budget is not None:
+        _log_thinking_budget_clamp(
+            msg_id=_msg_id,
+            model_name=getattr(request, "model", "unknown"),
+            source=_resolved_budget.source.value,
+            clamped_from=_clamped_from,
+            clamped_to=_resolved_budget.budget,
+        )
+    if _clamp_skip is not None and _max_thinking_token_budget is not None:
+        _log_thinking_budget_clamp_skipped(
+            msg_id=_msg_id,
+            model_name=getattr(request, "model", "unknown"),
+            reason=_clamp_skip,
+            ceiling=_max_thinking_token_budget,
+        )
+    if getattr(request, "_layer1_fired", False):
+        _log_qwen3_auto_no_think(
+            msg_id=_msg_id, model_name=getattr(request, "model", "unknown")
+        )
 
     # If reasoning_effort supplied a budget and top-level did not, propagate
     # the (possibly-clamped) resolved value downstream so the engine sees it.
@@ -2239,6 +2320,27 @@ async def create_anthropic_message(
     )
     if _resolved_budget is not None:
         openai_request.thinking_token_budget = _resolved_budget.budget
+    _msg_id_anth = f"msg_{uuid.uuid4().hex[:24]}"
+    if _clamped_from_anth is not None and _resolved_budget is not None:
+        _log_thinking_budget_clamp(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+            source=_resolved_budget.source.value,
+            clamped_from=_clamped_from_anth,
+            clamped_to=_resolved_budget.budget,
+        )
+    if _clamp_skip_anth is not None and _max_thinking_token_budget is not None:
+        _log_thinking_budget_clamp_skipped(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+            reason=_clamp_skip_anth,
+            ceiling=_max_thinking_token_budget,
+        )
+    if getattr(anthropic_request, "_layer1_fired", False):
+        _log_qwen3_auto_no_think(
+            msg_id=_msg_id_anth,
+            model_name=getattr(anthropic_request, "model", "unknown"),
+        )
 
     # Also WARN if max_tokens is below the resolver's advisory floor.
     # Sibling of PR #12's sizing guardrail — catches the common "effort=high

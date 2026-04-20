@@ -159,6 +159,19 @@ Every `type: "thinking"` block MUST also be schema-conformant with the Anthropic
 
 Test guards: `tests/test_anthropic_adapter_thinking_block.py` (ordering), `tests/test_anthropic_thinking_block_schema.py` (signature contract).
 
+### Invariant 14: `chat_template_kwargs` passthrough plumbing (added 2026-04-20)
+
+`chat_template_kwargs` is a pydantic field on both `ChatCompletionRequest` and `AnthropicRequest`, and survives the full path to `BatchedEngine._apply_chat_template` where it gets merged into the tokenizer's `apply_chat_template` call. Two uses:
+
+1. `{"enable_thinking": false}` — Qwen3 first-turn-no-think (Layer 1 of the 2026-04-20 Qwen3 runaway mitigation).
+2. `{"thinking_token_budget": N}` — existing vLLM-compatible budget passthrough path.
+
+Concretely, the chain is: client request → pydantic model → (Anthropic path only) `anthropic_to_openai` copies into `ChatCompletionRequest` → server `chat_kwargs["chat_template_kwargs"] = request.chat_template_kwargs` at all three chat_kwargs builder sites (OpenAI non-streaming, Anthropic non-streaming, Anthropic streaming) → `BatchedEngine.chat`/`stream_chat` explicit parameter → `_apply_chat_template` merges into `template_kwargs` before `tokenizer.apply_chat_template`.
+
+Test guard: `tests/test_chat_template_kwargs_plumbing.py`. If ANY of the server→engine kwargs sites drops `chat_template_kwargs`, Layer 1 becomes a silent no-op on that path.
+
+Additionally, `server._reasoning_parser_name` is a module attribute set from `args.reasoning_parser` at CLI bind time (`cli.py:~63-85`). Layer 1 reads this — NOT `engine._reasoning_parser_name` (which does not exist) — because Layer 1 needs the raw CLI string like `"qwen3"`, not the class instance on `server._reasoning_parser`.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

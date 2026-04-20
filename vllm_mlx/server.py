@@ -992,9 +992,7 @@ async def clear_cache():
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
         for name in ("multimodal_kv", "pixel_values", "pil_image"):
-            caches.append(
-                {"name": name, "cleared": True, "refused_tiers": []}
-            )
+            caches.append({"name": name, "cleared": True, "refused_tiers": []})
     except ImportError:
         pass  # not a VLM server; not an error
 
@@ -2088,9 +2086,11 @@ async def create_anthropic_message(
     # config (the adapter defaults to 131072 today).
     openai_request, _resolved_budget = anthropic_to_openai(
         anthropic_request,
-        reasoning_parser_start_token=getattr(_reasoning_parser, "start_token", None)
-        if _reasoning_parser is not None
-        else None,
+        reasoning_parser_start_token=(
+            getattr(_reasoning_parser, "start_token", None)
+            if _reasoning_parser is not None
+            else None
+        ),
     )
 
     # Also WARN if max_tokens is below the resolver's advisory floor.
@@ -2618,9 +2618,7 @@ async def _stream_anthropic_messages(
 
     while True:
         remaining = (
-            _stream_cap - (time.perf_counter() - start_time)
-            if _stream_cap
-            else None
+            _stream_cap - (time.perf_counter() - start_time) if _stream_cap else None
         )
         if remaining is not None and remaining <= 0:
             _log_cap_fired("prologue")
@@ -2982,9 +2980,7 @@ async def stream_chat_completion(
 
     while True:
         remaining = (
-            _stream_cap - (time.perf_counter() - start_time)
-            if _stream_cap
-            else None
+            _stream_cap - (time.perf_counter() - start_time) if _stream_cap else None
         )
         if remaining is not None and remaining <= 0:
             _log_cap_fired("prologue")

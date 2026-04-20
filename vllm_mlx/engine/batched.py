@@ -97,9 +97,8 @@ class MLLMModelWrapper:
         self._model = model
         # Detect if this is a Gemma 3/4 model (requires pixel_values as positional arg)
         model_type = str(getattr(model, "model_type", "")).lower()
-        self._is_gemma_multimodal = (
-            hasattr(model, "model_type")
-            and ("gemma3" in model_type or "gemma4" in model_type)
+        self._is_gemma_multimodal = hasattr(model, "model_type") and (
+            "gemma3" in model_type or "gemma4" in model_type
         )
 
     def __call__(self, *args, **kwargs):
@@ -267,9 +266,7 @@ class BatchedEngine(BaseEngine):
         # Forward prefill_step_size from CLI (default 2048) so MLLM models
         # can handle long prompts (e.g. Claude Code sends 29+ tools which
         # tokenise to ~1200+ tokens — the old MLLM default of 1024 rejected them).
-        prefill_step_size = getattr(
-            self._scheduler_config, "prefill_step_size", 2048
-        )
+        prefill_step_size = getattr(self._scheduler_config, "prefill_step_size", 2048)
 
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -456,7 +453,9 @@ class BatchedEngine(BaseEngine):
                     pass  # Fall through to plain-text fallback below
             except ValueError as e:
                 # No chat_template configured (e.g., MedGemma processor).
-                logger.warning(f"No chat template available: {e}, using plain-text fallback")
+                logger.warning(
+                    f"No chat template available: {e}, using plain-text fallback"
+                )
 
         # Fallback for models without apply_chat_template or no template configured
         prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)

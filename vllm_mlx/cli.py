@@ -371,7 +371,9 @@ def bench_compile_command(args):
                 tokenizer,
                 base_prompt,
                 max_tokens=args.max_tokens,
-                sampler=lambda logits: mx.argmax(logits, axis=-1),  # Greedy for determinism
+                sampler=lambda logits: mx.argmax(
+                    logits, axis=-1
+                ),  # Greedy for determinism
             ):
                 if response.finish_reason is not None:
                     prompt_tps = response.prompt_tps
@@ -446,9 +448,7 @@ def bench_compile_command(args):
     print(f"Model: {args.model}")
     print(f"Runs: {args.prompts}, Max tokens: {args.max_tokens}")
     print("=" * 60)
-    print(
-        f"{'':20s} {'Without compile':>18s} {'With compile':>18s} {'Change':>10s}"
-    )
+    print(f"{'':20s} {'Without compile':>18s} {'With compile':>18s} {'Change':>10s}")
     print("-" * 68)
     print(
         f"{'Prefill (tok/s)':20s} {b_prefill['mean']:>14.1f}     "
@@ -1019,6 +1019,7 @@ Examples:
     # Import locally: .tool_parsers imports from vllm_mlx top-level and a
     # top-level import here would risk a circular dependency during CLI init.
     from .tool_parsers import ToolParserManager
+
     tool_parser_choices = ToolParserManager.list_registered()
     serve_parser.add_argument(
         "--tool-call-parser",

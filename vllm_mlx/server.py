@@ -139,6 +139,15 @@ _default_top_p: float | None = None  # Set via --default-top-p
 # string, which the instance does not expose.
 _reasoning_parser_name: str | None = None
 
+# --max-thinking-token-budget N: Layer 2 server-side ceiling applied to
+# resolver output before it hits chat_kwargs. None (default) = no ceiling.
+# Set via CLI at serve time. See vllm_mlx/api/budget_ceiling.py.
+_max_thinking_token_budget: int | None = None
+
+# --disable-qwen3-first-turn-no-think: operator opt-out for Layer 1.
+# False (default) = feature enabled. See vllm_mlx/api/thinking_policy.py.
+_disable_qwen3_first_turn_no_think: bool = False
+
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
 

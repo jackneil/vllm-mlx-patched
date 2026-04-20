@@ -2083,7 +2083,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     qwen3_auto_no_think=getattr(request, "_layer1_fired", False),
                 )
             )
-        elif _resolved_budget.source != EffortSource.DEFAULT:
+        elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+            request, "_layer1_fired", False
+        ):
             # Resolver produced a non-default value (e.g. reasoning_effort)
             # even though budget_was_requested is False. Emit diagnostic
             # headers but skip x-thinking-budget-applied (applied=None).
@@ -2373,7 +2375,9 @@ async def create_anthropic_message(
                     ),
                 )
             )
-        elif _resolved_budget.source != EffortSource.DEFAULT:
+        elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+            anthropic_request, "_layer1_fired", False
+        ):
             # Resolver produced a non-default value (e.g. output_config.effort)
             # without a nested thinking dict / top-level budget — surface
             # diagnostic headers without claiming enforcement status.
@@ -2532,10 +2536,12 @@ async def create_anthropic_message(
                 ),
             )
         )
-    elif _resolved_budget.source != EffortSource.DEFAULT:
+    elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
+        anthropic_request, "_layer1_fired", False
+    ):
         # Resolver produced a non-default value (e.g. output_config.effort)
-        # without a nested thinking dict / top-level budget — surface
-        # diagnostic headers without claiming enforcement status.
+        # or Layer 1 fired — surface diagnostic headers (without claiming
+        # enforcement status via applied=None).
         _resp_headers.update(
             _build_thinking_budget_headers(
                 _resolved_budget,

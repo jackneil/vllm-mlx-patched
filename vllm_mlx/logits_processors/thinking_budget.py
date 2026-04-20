@@ -157,10 +157,7 @@ class ThinkingTokenBudgetLogitsProcessor:
                 self._think_count += len(new_tokens)
 
         # Check budget transition.
-        if (
-            self._in_think
-            and self._think_count >= self._budget
-        ):
+        if self._in_think and self._think_count >= self._budget:
             self._in_think = False
             self._in_end = True
             self._end_count = 0

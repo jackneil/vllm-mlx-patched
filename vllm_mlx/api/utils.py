@@ -411,7 +411,9 @@ class StreamingThinkRouter:
                         pieces.append(("text", before))
                     continue  # Process remainder
                 else:
-                    for plen in range(min(len(self._start_token), len(self._buffer)), 0, -1):
+                    for plen in range(
+                        min(len(self._start_token), len(self._buffer)), 0, -1
+                    ):
                         if self._buffer.endswith(self._start_token[:plen]):
                             emit = self._buffer[:-plen]
                             self._buffer = self._buffer[-plen:]

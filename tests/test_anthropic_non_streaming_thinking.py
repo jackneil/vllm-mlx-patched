@@ -52,7 +52,7 @@ class _FakeReasoningParser:
         start = text.index("<think>") + len("<think>")
         end = text.index("</think>")
         reasoning = text[start:end]
-        remainder = text[: text.index("<think>")] + text[end + len("</think>"):]
+        remainder = text[: text.index("<think>")] + text[end + len("</think>") :]
         return reasoning, remainder or None
 
 

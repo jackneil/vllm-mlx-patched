@@ -70,9 +70,9 @@ class TestThinkingBudgetSentinel:
         from vllm_mlx.request import Request
 
         assert hasattr(Request, "__dataclass_fields__")
-        assert "thinking_budget_noop_reason" in Request.__dataclass_fields__, (
-            "Request.thinking_budget_noop_reason removed — rebase regression"
-        )
+        assert (
+            "thinking_budget_noop_reason" in Request.__dataclass_fields__
+        ), "Request.thinking_budget_noop_reason removed — rebase regression"
         f = Request.__dataclass_fields__["thinking_budget_noop_reason"]
         assert f.default is None, (
             "Default for thinking_budget_noop_reason changed; "
@@ -83,9 +83,9 @@ class TestThinkingBudgetSentinel:
         """noop_reason field on RequestOutput is pinned to survive rebase."""
         from vllm_mlx.request import RequestOutput
 
-        assert "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__, (
-            "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
-        )
+        assert (
+            "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__
+        ), "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
         f = RequestOutput.__dataclass_fields__["thinking_budget_noop_reason"]
         assert f.default is None, (
             "Default for thinking_budget_noop_reason changed; "

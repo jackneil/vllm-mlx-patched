@@ -130,9 +130,7 @@ class AnthropicRequest(BaseModel):
                     f"{type(bt).__name__}: {bt!r}"
                 )
             if bt < 0:
-                raise ValueError(
-                    f"thinking.budget_tokens must be >= 0, got {bt}"
-                )
+                raise ValueError(f"thinking.budget_tokens must be >= 0, got {bt}")
         return v
 
 

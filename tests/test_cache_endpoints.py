@@ -203,9 +203,12 @@ def test_stats_walks_scheduler_attribute_chain():
     from vllm_mlx.server import _PrefixCacheEndpointAdapter
 
     scheduler = MagicMock()
-    scheduler.get_cache_stats = MagicMock(return_value={
-        "cache_hits": 100, "cache_misses": 5,
-    })
+    scheduler.get_cache_stats = MagicMock(
+        return_value={
+            "cache_hits": 100,
+            "cache_misses": 5,
+        }
+    )
     core_engine = MagicMock()
     core_engine.engine = MagicMock()
     core_engine.engine.scheduler = scheduler

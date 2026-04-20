@@ -18,7 +18,7 @@ class TestNonStreamingSequentialParsing:
 
         parser = Qwen3ReasoningParser()
         model_output = (
-            '<think>Let me check the weather.</think>'
+            "<think>Let me check the weather.</think>"
             '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>'
         )
 
@@ -29,6 +29,7 @@ class TestNonStreamingSequentialParsing:
 
         # Step 2: tool parsing on remainder
         from vllm_mlx.server import _parse_tool_calls_with_parser
+
         cleaned, tool_calls = _parse_tool_calls_with_parser(
             text_for_tools or model_output, _make_request()
         )

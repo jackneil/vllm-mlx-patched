@@ -409,6 +409,7 @@ class PrefixCacheManager:
         invocations stack, matching the pre-acquire counter behavior.
         """
         import uuid as _uuid
+
         self.acquire(f"_test_{_uuid.uuid4()}")
 
     def __len__(self) -> int:

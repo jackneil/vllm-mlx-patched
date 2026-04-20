@@ -49,16 +49,12 @@ def test_tool_choice_dict_function_passthrough():
 
 def test_tool_choice_dict_type_none_converted():
     """Dict-form {"type": "none"} should be normalized to string "none"."""
-    req = ChatCompletionRequest(
-        model="test", messages=[], tool_choice={"type": "none"}
-    )
+    req = ChatCompletionRequest(model="test", messages=[], tool_choice={"type": "none"})
     assert req.tool_choice == "none"
 
 
 def test_tool_choice_dict_type_none_uppercase_converted():
-    req = ChatCompletionRequest(
-        model="test", messages=[], tool_choice={"type": "None"}
-    )
+    req = ChatCompletionRequest(model="test", messages=[], tool_choice={"type": "None"})
     assert req.tool_choice == "none"
 
 

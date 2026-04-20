@@ -494,12 +494,13 @@ class TestClearInFlightGuard:
         cache.store([1, 2, 3], _mock_kv(1000))
         cache._mark_in_use_for_test()
         assert cache.clear() is False
-        assert len(cache) == 1, (
-            "refused clear must leave entries intact for live decoders"
-        )
+        assert (
+            len(cache) == 1
+        ), "refused clear must leave entries intact for live decoders"
 
 
 # ---- acquire/release production API ----
+
 
 def test_acquire_blocks_clear_release_allows_it():
     from vllm_mlx.memory_cache import MemoryAwarePrefixCache
@@ -510,7 +511,7 @@ def test_acquire_blocks_clear_release_allows_it():
     assert cache.clear() is False  # refused while req-A holds
 
     cache.release("req-A")
-    assert cache.clear() is True   # allowed after release
+    assert cache.clear() is True  # allowed after release
 
 
 def test_acquire_is_idempotent():

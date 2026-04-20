@@ -31,6 +31,7 @@ class _FakeProcessor:
 
 def _build_mllm_with_processor(processor):
     from vllm_mlx.models.mllm import MLXMultimodalLM
+
     mllm = MLXMultimodalLM.__new__(MLXMultimodalLM)
     mllm.model = MagicMock()
     mllm.processor = processor
@@ -55,8 +56,9 @@ class TestMLLMPromptTokensPrecompute(unittest.TestCase):
         ]
         expected = len("system: hello\nuser: hi")
 
-        with patch("mlx_vlm.stream_generate", return_value=iter(chunks)), patch(
-            "mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt
+        with (
+            patch("mlx_vlm.stream_generate", return_value=iter(chunks)),
+            patch("mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt),
         ):
             mllm = _build_mllm_with_processor(_FakeProcessor())
             outputs = list(
@@ -73,8 +75,9 @@ class TestMLLMPromptTokensPrecompute(unittest.TestCase):
             _FakeChunk("Hello", prompt_tokens=42),
             _FakeChunk(" world", prompt_tokens=42, finish_reason="stop"),
         ]
-        with patch("mlx_vlm.stream_generate", return_value=iter(chunks)), patch(
-            "mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt
+        with (
+            patch("mlx_vlm.stream_generate", return_value=iter(chunks)),
+            patch("mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt),
         ):
             mllm = _build_mllm_with_processor(_FakeProcessor())
             outputs = list(
@@ -92,9 +95,11 @@ class TestMLLMPromptTokensPrecompute(unittest.TestCase):
             _FakeChunk("", prompt_tokens=5, finish_reason="stop"),
         ]
         import logging
+
         logger = logging.getLogger("vllm_mlx.models.mllm")
-        with patch("mlx_vlm.stream_generate", return_value=iter(chunks)), patch(
-            "mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt
+        with (
+            patch("mlx_vlm.stream_generate", return_value=iter(chunks)),
+            patch("mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt),
         ):
             mllm = _build_mllm_with_processor(_FakeProcessor())
             with self.assertLogs(logger, level="WARNING") as cm:
@@ -114,8 +119,9 @@ class TestMLLMPromptTokensPrecompute(unittest.TestCase):
             def apply_chat_template(self, *a, **k):
                 return "prompt"
 
-        with patch("mlx_vlm.stream_generate", return_value=iter(chunks)), patch(
-            "mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt
+        with (
+            patch("mlx_vlm.stream_generate", return_value=iter(chunks)),
+            patch("mlx_vlm.prompt_utils.get_chat_template", side_effect=_fixed_prompt),
         ):
             mllm = _build_mllm_with_processor(_NoTokProcessor())
             outputs = list(

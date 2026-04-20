@@ -67,6 +67,7 @@ def serve_command(args):
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
+            server._reasoning_parser_name = args.reasoning_parser
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -82,6 +83,7 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+        server._reasoning_parser_name = None
 
     # Security summary at startup
     print("=" * 60)

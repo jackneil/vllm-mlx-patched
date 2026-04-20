@@ -91,6 +91,12 @@ class AnthropicRequest(BaseModel):
     # request ingress (HTTP 422) using ALLOWED_EFFORT_LEVELS. Likewise the
     # `thinking` validator rejects non-int / negative budget_tokens.
     output_config: dict | None = None
+    # vllm-mlx-patched extension: passthrough dict merged into the
+    # tokenizer's apply_chat_template call. Common uses:
+    # {"enable_thinking": false} to disable Qwen3 thinking at template
+    # level; {"thinking_token_budget": N} for the budget passthrough.
+    # Not part of the Anthropic API spec — fork-only extension.
+    chat_template_kwargs: dict | None = None
 
     @field_validator("output_config")
     @classmethod

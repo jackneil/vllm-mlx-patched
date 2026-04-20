@@ -395,6 +395,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        chat_template_kwargs: dict | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -429,6 +430,13 @@ class BatchedEngine(BaseEngine):
             }
             if tools:
                 template_kwargs["tools"] = tools
+
+            # Merge caller-supplied kwargs LAST so they can override engine
+            # defaults where they overlap. Common use:
+            # {"enable_thinking": False} for Qwen3 Layer-1 first-turn fix.
+            if chat_template_kwargs:
+                for _k, _v in chat_template_kwargs.items():
+                    template_kwargs[_k] = _v
 
             try:
                 return template_applicator.apply_chat_template(
@@ -694,6 +702,7 @@ class BatchedEngine(BaseEngine):
         videos: list[str] | None = None,
         thinking_token_budget: int | None = None,
         thinking_budget_message: str | None = None,
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -737,6 +746,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         return await self.generate(
@@ -813,6 +823,7 @@ class BatchedEngine(BaseEngine):
         videos: list[str] | None = None,
         thinking_token_budget: int | None = None,
         thinking_budget_message: str | None = None,
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -856,6 +867,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         # Compute prefix boundary for cache

@@ -178,6 +178,7 @@ def anthropic_to_openai(
         tool_choice=tool_choice,
         thinking_token_budget=resolved.budget,
         thinking_budget_message=request.thinking_budget_message,
+        chat_template_kwargs=request.chat_template_kwargs,
     )
 
     return openai_req, resolved

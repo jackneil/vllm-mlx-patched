@@ -132,6 +132,13 @@ _streaming_max_seconds: float = STREAMING_MAX_SECONDS_DEFAULT
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
+# CLI-bound reasoning-parser name ("qwen3", "gemma4", "qwen3_coder", or None).
+# Used by Layer 1 (thinking_policy) to decide whether to fire on the Qwen3
+# family. Set from cli.py:~63-82 at serve startup. Distinct from
+# `_reasoning_parser` (the class instance) — Layer 1 needs the raw CLI
+# string, which the instance does not expose.
+_reasoning_parser_name: str | None = None
+
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
 
@@ -1781,6 +1788,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if _msg is not None:
         chat_kwargs["thinking_budget_message"] = _msg
 
+    # Forward chat_template_kwargs passthrough dict (Layer 1 + vLLM parity).
+    # Merged into the tokenizer's apply_chat_template at engine time.
+    # Guard with `is not None` so we don't override engine defaults with None.
+    if request.chat_template_kwargs is not None:
+        chat_kwargs["chat_template_kwargs"] = request.chat_template_kwargs
+
     # Sizing guardrail: thinking_token_budget must fit inside max_tokens
     # with headroom for user-facing content. Without this check, a client
     # can set budget=8192 + max_tokens=1024 and the model will self-truncate
@@ -2145,6 +2158,10 @@ async def create_anthropic_message(
     if openai_request.thinking_budget_message is not None:
         chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
 
+    # Forward chat_template_kwargs passthrough (Layer 1 + vLLM parity).
+    if openai_request.chat_template_kwargs is not None:
+        chat_kwargs["chat_template_kwargs"] = openai_request.chat_template_kwargs
+
     start_time = time.perf_counter()
     timeout = _default_timeout
 
@@ -2473,6 +2490,10 @@ async def _stream_anthropic_messages(
         chat_kwargs["thinking_token_budget"] = openai_request.thinking_token_budget
     if openai_request.thinking_budget_message is not None:
         chat_kwargs["thinking_budget_message"] = openai_request.thinking_budget_message
+
+    # Forward chat_template_kwargs passthrough (Layer 1 + vLLM parity).
+    if openai_request.chat_template_kwargs is not None:
+        chat_kwargs["chat_template_kwargs"] = openai_request.chat_template_kwargs
 
     # Emit message_start
     message_start = {

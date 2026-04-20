@@ -23,8 +23,6 @@ behavior — injecting literal `<think>` text there would just look like
 gibberish prose to the model.
 """
 
-import json
-
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 from vllm_mlx.api.anthropic_models import AnthropicMessage, AnthropicRequest
 

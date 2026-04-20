@@ -252,27 +252,43 @@ def _build_thinking_budget_headers(
     resolved: ResolvedBudget,
     applied: bool | None,
     noop_reason: str | None = None,
+    *,
+    ceiling: int | None = None,
+    clamped_from: int | None = None,
+    clamp_skip_reason: str | None = None,
+    qwen3_auto_no_think: bool = False,
 ) -> dict[str, str]:
     """Build the x-thinking-budget-* response headers from a ResolvedBudget.
 
     `applied` is the pre-existing bool/None the emission sites were computing
-    before this change (based on whether the logits processor attached and the
-    family can enforce). It stays separate because applied = "did it actually
-    work" != resolved = "what did we decide to try."
+    (based on whether the logits processor attached and the family can
+    enforce). It stays separate because applied = "did it actually work"
+    != resolved = "what did we decide to try."
 
     `noop_reason`, when present with applied=False, surfaces WHY the processor
     didn't attach (e.g. ``"simple_engine"``, ``"mllm_path"``,
-    ``"parser_not_configured"``, ``"tokenizer_encode_failed"``). Operators
-    need this to diagnose silent no-ops — without it, the only signal is
-    `applied=false` with no root cause (the arena incident on 2026-04-18).
+    ``"parser_not_configured"``, ``"tokenizer_encode_failed"``).
+
+    New keyword-only kwargs (added 2026-04-20 for Qwen3 runaway mitigation):
+    - ``ceiling``: when not None, emits ``x-thinking-budget-ceiling: N`` on
+      every response. Tells operators the server ceiling is configured.
+    - ``clamped_from``: when not None, emits ``x-thinking-budget-clamped-to: N``
+      using ``resolved.budget`` (post-clamp value). The original pre-clamp
+      budget is not emitted to avoid info leakage about operator policy.
+    - ``clamp_skip_reason``: when not None, emits
+      ``x-thinking-budget-clamp-skipped: <reason>``. Exclusive with
+      ``clamped_from`` (either we clamped or we skipped).
+    - ``qwen3_auto_no_think``: when True, emits
+      ``x-thinking-qwen3-auto-disabled: true``. Layer 1 fired.
     """
     headers: dict[str, str] = {}
 
-    # 1. x-thinking-budget-applied (existing header, unchanged semantics).
+    # 1. x-thinking-budget-applied (existing, unchanged semantics).
     if applied is not None:
         headers["x-thinking-budget-applied"] = "true" if applied else "false"
 
-    # 2. x-thinking-budget-resolved — the int (or "none") the resolver produced.
+    # 2. x-thinking-budget-resolved — reflects POST-clamp value so engine
+    # state and headers agree.
     headers["x-thinking-budget-resolved"] = (
         str(resolved.budget) if resolved.budget is not None else "none"
     )
@@ -285,11 +301,28 @@ def _build_thinking_budget_headers(
         headers["x-thinking-budget-max-tokens-floor"] = str(resolved.max_tokens_floor)
 
     # 5. x-thinking-budget-noop-reason — emitted ONLY when applied is False.
-    # Tells operators WHY the processor didn't attach (simple_engine vs
-    # mllm_path vs parser_not_configured vs tokenizer_encode_failed). Absent
-    # when applied is True or no budget was requested.
     if applied is False and noop_reason:
         headers["x-thinking-budget-noop-reason"] = noop_reason
+
+    # 6. NEW: x-thinking-budget-ceiling — emitted whenever ceiling configured.
+    if ceiling is not None:
+        headers["x-thinking-budget-ceiling"] = str(ceiling)
+
+    # 7. NEW: x-thinking-budget-clamped-to — emitted only when Layer 2 fired.
+    # Value is the post-clamp (ceiling) value, matching resolved.budget.
+    if clamped_from is not None:
+        headers["x-thinking-budget-clamped-to"] = (
+            str(resolved.budget) if resolved.budget is not None else "none"
+        )
+
+    # 8. NEW: x-thinking-budget-clamp-skipped — ceiling set but engine/parser
+    # cannot enforce it.
+    if clamp_skip_reason is not None:
+        headers["x-thinking-budget-clamp-skipped"] = clamp_skip_reason
+
+    # 9. NEW: x-thinking-qwen3-auto-disabled — Layer 1 fired.
+    if qwen3_auto_no_think:
+        headers["x-thinking-qwen3-auto-disabled"] = "true"
 
     return headers
 

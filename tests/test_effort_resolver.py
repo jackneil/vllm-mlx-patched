@@ -388,3 +388,98 @@ def test_anthropic_thinking_empty_dict_is_silent(caplog):
     assert not any(
         "[thinking-budget-resolver]" in r.message for r in caplog.records
     )
+
+
+# ---- "adaptive + explicit effort" ceiling respect (Qwen3.6 first-turn runaway) ----
+
+
+def test_adaptive_plus_output_config_effort_uses_effort_ceiling():
+    """CRITICAL: `thinking.type=adaptive` is model-specific trained
+    behavior (Claude 4.5+ self-regulate). Open-weight models like
+    Qwen3.6 don't honor it — so when `adaptive` lands alone, budget=None
+    produces runaway thinking until the streaming cap fires.
+
+    Claude Code sends BOTH `thinking.type=adaptive` AND
+    `output_config.effort=high`. When both are present, use the effort
+    level as a ceiling so non-Claude models can't run away."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(
+        anthropic_thinking={"type": "adaptive"},
+        output_config={"effort": "high"},
+    )
+
+    assert result.budget == 8192, (
+        f"adaptive + effort=high must use effort's budget 8192; got {result.budget}"
+    )
+    assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
+
+
+def test_adaptive_plus_reasoning_effort_uses_effort_ceiling():
+    """Same for the OpenAI dialect path."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(
+        anthropic_thinking={"type": "adaptive"},
+        reasoning_effort="medium",
+    )
+
+    assert result.budget == 2048
+    assert result.source == EffortSource.REASONING_EFFORT
+
+
+def test_adaptive_alone_still_returns_none_budget():
+    """When `adaptive` is the ONLY signal (no effort ceiling), preserve
+    the existing `budget=None` natural behavior — we have no explicit
+    ceiling to apply."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(anthropic_thinking={"type": "adaptive"})
+
+    assert result.budget is None
+    assert result.source == EffortSource.ANTHROPIC_THINKING_ADAPTIVE
+
+
+def test_adaptive_plus_effort_precedence_prefers_output_config():
+    """When `adaptive` + BOTH `output_config.effort` AND `reasoning_effort`
+    are present, prefer output_config.effort (Anthropic path wins over
+    OpenAI path, matching the top-level precedence table)."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(
+        anthropic_thinking={"type": "adaptive"},
+        output_config={"effort": "low"},
+        reasoning_effort="high",
+    )
+
+    assert result.budget == 512  # low
+    assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
+
+
+def test_disabled_plus_effort_still_disabled():
+    """Regression: `type=disabled` must continue winning over effort —
+    a client sending disabled means "no thinking," even if they also
+    misguidedly include an effort level."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(
+        anthropic_thinking={"type": "disabled"},
+        output_config={"effort": "high"},
+    )
+
+    assert result.budget == 0
+    assert result.source == EffortSource.ANTHROPIC_THINKING_DISABLED
+
+
+def test_enabled_with_budget_plus_effort_uses_enabled_budget():
+    """Regression: explicit `type=enabled` + `budget_tokens` must win
+    over a coexisting effort level (explicit > heuristic)."""
+    from vllm_mlx.api.effort import EffortSource, resolve_effort
+
+    result = resolve_effort(
+        anthropic_thinking={"type": "enabled", "budget_tokens": 4096},
+        output_config={"effort": "high"},
+    )
+
+    assert result.budget == 4096
+    assert result.source == EffortSource.ANTHROPIC_THINKING_ENABLED

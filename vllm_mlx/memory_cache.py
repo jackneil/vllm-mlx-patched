@@ -886,6 +886,7 @@ class MemoryAwarePrefixCache:
         behavior the existing tests rely on).
         """
         import uuid as _uuid
+
         self.acquire(f"_test_{_uuid.uuid4()}")
 
     def get_stats(self) -> dict[str, Any]:

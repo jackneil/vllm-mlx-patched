@@ -10,7 +10,6 @@ import os
 
 import pytest
 
-
 pytestmark = pytest.mark.integration
 
 MODEL = os.getenv("THINKING_BUDGET_TEST_MODEL")
@@ -21,9 +20,7 @@ def _skip_if_no_model():
         pytest.skip("Set THINKING_BUDGET_TEST_MODEL=<hf-id> to run")
 
 
-PROMPT = (
-    "Solve step by step: what is the sum of all prime numbers under 50?"
-)
+PROMPT = "Solve step by step: what is the sum of all prime numbers under 50?"
 
 
 @pytest.fixture(scope="module")

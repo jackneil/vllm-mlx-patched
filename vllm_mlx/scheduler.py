@@ -150,9 +150,7 @@ def _attach_thinking_budget_processor(
         try:
             ids = tokenizer.encode(text, add_special_tokens=False)
         except Exception as e:
-            logger.debug(
-                "thinking_budget: tokenizer.encode(%r) raised %s", text, e
-            )
+            logger.debug("thinking_budget: tokenizer.encode(%r) raised %s", text, e)
             return None
         if not isinstance(ids, list) or not ids:
             return None
@@ -1405,6 +1403,7 @@ class Scheduler:
         # rather than AttributeError-ing on every engine step mid-decode.
         if not hasattr(bg, "_generation_batch"):
             import mlx_lm as _mlx_lm_mod
+
             _installed_v = getattr(_mlx_lm_mod, "__version__", "unknown")
             raise RuntimeError(
                 "vllm_mlx requires mlx_lm >= 0.31.2 (BatchGenerator must "
@@ -1424,6 +1423,7 @@ class Scheduler:
         global _INVARIANT_10_LOGGED
         if not _INVARIANT_10_LOGGED:
             import mlx_lm as _mlx_lm_mod
+
             logger.info(
                 "[BatchGenerator] invariant #10 upheld (mlx_lm %s split "
                 "_prompt_batch + _generation_batch detected)",
@@ -1856,9 +1856,7 @@ class Scheduler:
                 else None
             )
             _tokenizer_name = (
-                type(self.tokenizer).__name__
-                if hasattr(self, "tokenizer")
-                else None
+                type(self.tokenizer).__name__ if hasattr(self, "tokenizer") else None
             )
             if _parser_name is None:
                 _hint = (
@@ -2678,9 +2676,7 @@ class Scheduler:
                         _req.thinking_budget_applied if _req is not None else None
                     )
                     _noop_reason = (
-                        _req.thinking_budget_noop_reason
-                        if _req is not None
-                        else None
+                        _req.thinking_budget_noop_reason if _req is not None else None
                     )
                     output.outputs.append(
                         RequestOutput(

@@ -280,6 +280,7 @@ class SimpleEngine(BaseEngine):
             )
             try:
                 from ..metrics import thinking_budget_noop_total
+
                 thinking_budget_noop_total.inc()
             except ImportError:
                 pass
@@ -356,6 +357,7 @@ class SimpleEngine(BaseEngine):
             )
             try:
                 from ..metrics import thinking_budget_noop_total
+
                 thinking_budget_noop_total.inc()
             except ImportError:
                 pass
@@ -518,6 +520,7 @@ class SimpleEngine(BaseEngine):
             )
             try:
                 from ..metrics import thinking_budget_noop_total
+
                 thinking_budget_noop_total.inc()
             except ImportError:
                 pass
@@ -570,7 +573,9 @@ class SimpleEngine(BaseEngine):
                 if template_tools:
                     template_kwargs["tools"] = template_tools
                 try:
-                    prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
+                    prompt_ids = tokenizer.apply_chat_template(
+                        messages, **template_kwargs
+                    )
                     prompt_token_count = len(prompt_ids)
                 except (TypeError, ValueError):
                     # No chat template (e.g., MedGemma) — estimate prompt tokens
@@ -633,6 +638,7 @@ class SimpleEngine(BaseEngine):
             )
             try:
                 from ..metrics import thinking_budget_noop_total
+
                 thinking_budget_noop_total.inc()
             except ImportError:
                 pass

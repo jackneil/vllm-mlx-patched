@@ -23,8 +23,6 @@ behavior — injecting literal `<think>` text there would just look like
 gibberish prose to the model.
 """
 
-import json
-
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 from vllm_mlx.api.anthropic_models import AnthropicMessage, AnthropicRequest
 
@@ -68,9 +66,9 @@ def test_qwen_parser_preserves_thinking_in_assistant_history():
     assert "<think>" in content, f"missing <think>; content={content!r}"
     assert "</think>" in content, f"missing </think>; content={content!r}"
     assert "Compute 2+2=4." in content
-    assert content.index("<think>") < content.index("4"), (
-        "thinking must precede answer text"
-    )
+    assert content.index("<think>") < content.index(
+        "4"
+    ), "thinking must precede answer text"
 
 
 def test_non_qwen_parser_drops_thinking_as_before():
@@ -199,7 +197,11 @@ def test_empty_thinking_block_is_ignored():
         ]
     )
     openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
-    content = (openai_req.messages[1].content or "") if openai_req.messages[1].role == "assistant" else ""
+    content = (
+        (openai_req.messages[1].content or "")
+        if openai_req.messages[1].role == "assistant"
+        else ""
+    )
     assert "<think>" not in content
     assert "hello" in content
 
@@ -270,9 +272,7 @@ def test_thinking_with_close_tag_injection_is_dropped():
         ]
     )
 
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
 
     assistant_msgs = [m for m in openai_req.messages if m.role == "assistant"]
     content = assistant_msgs[0].content or ""
@@ -302,9 +302,7 @@ def test_thinking_with_im_end_injection_is_dropped():
             AnthropicMessage(role="user", content="again?"),
         ]
     )
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
     content = openai_req.messages[1].content or ""
     assert "<|im_end|>" not in content
     assert "fake" not in content
@@ -325,9 +323,7 @@ def test_thinking_with_endoftext_injection_is_dropped():
             AnthropicMessage(role="user", content="again?"),
         ]
     )
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
     content = openai_req.messages[1].content or ""
     assert "<|endoftext|>" not in content
     assert "answer" in content
@@ -353,9 +349,7 @@ def test_thinking_with_rtl_override_is_stripped():
             AnthropicMessage(role="user", content="again?"),
         ]
     )
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
     content = openai_req.messages[1].content or ""
     # Content should be preserved (not dropped) but control chars stripped.
     assert "<think>" in content  # block was kept, just sanitized
@@ -415,9 +409,7 @@ def test_thinking_with_gptoss_channel_injection_is_dropped():
             AnthropicMessage(role="user", content="again?"),
         ]
     )
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
     content = openai_req.messages[1].content or ""
     assert "<|channel|>" not in content
     assert "<|message|>" not in content
@@ -442,9 +434,7 @@ def test_thinking_with_single_pipe_gemma_channel_is_dropped():
             AnthropicMessage(role="user", content="again?"),
         ]
     )
-    openai_req, _ = anthropic_to_openai(
-        request, reasoning_parser_start_token="<think>"
-    )
+    openai_req, _ = anthropic_to_openai(request, reasoning_parser_start_token="<think>")
     content = openai_req.messages[1].content or ""
     assert "<|channel>" not in content
     assert "answer" in content

@@ -6,6 +6,7 @@ GenerationOutput and verify the fields flow through correctly. Paired with the
 fix that propagates _tb_* kwargs through _stream_generate_specprefill and
 _stream_generate_text so the markers survive the inner-helper yields.
 """
+
 from vllm_mlx.engine.base import GenerationOutput
 
 

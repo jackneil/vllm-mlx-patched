@@ -70,7 +70,7 @@ def test_memory_aware_cache_clear_refused_while_request_in_flight(
     assert cache.clear() is False  # refused — req-A is live
 
     scheduler.remove_finished_request("req-A")
-    assert cache.clear() is True   # released — clear succeeds
+    assert cache.clear() is True  # released — clear succeeds
 
 
 def test_prefix_cache_manager_clear_refused_while_request_in_flight(
@@ -125,9 +125,7 @@ def test_multiple_requests_released_independently(mock_model, mock_tokenizer):
     assert cache.clear() is True
 
 
-def test_paged_cache_path_does_not_require_acquire_release(
-    mock_model, mock_tokenizer
-):
+def test_paged_cache_path_does_not_require_acquire_release(mock_model, mock_tokenizer):
     """When paged cache is active, memory_aware_cache and prefix_cache are
     both None, so the acquire/release helpers must no-op cleanly. The
     paged tier's guard is authoritative via block refcounts."""

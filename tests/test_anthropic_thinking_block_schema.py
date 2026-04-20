@@ -83,9 +83,9 @@ def test_non_thinking_blocks_have_no_signature():
 
     for block in out.content:
         if block.type != "thinking":
-            assert block.signature is None, (
-                f"{block.type} block should not have a signature"
-            )
+            assert (
+                block.signature is None
+            ), f"{block.type} block should not have a signature"
 
 
 def test_different_reasoning_produces_different_signatures():

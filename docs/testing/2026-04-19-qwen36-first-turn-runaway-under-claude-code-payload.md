@@ -1,9 +1,99 @@
 # Qwen3.6-35B-A3B: first-turn runaway under Claude Code payload shape
 
-**Status:** TODO — likely a qwen3 reasoning parser or stop-gate issue specific to heavy single-turn input (no prior assistant history).
+**Status:** Root cause identified upstream (model behavior, not a vllm-mlx parser bug). Defensive fix designed, measurement-verified, ready to wire in. Empirical synthetic repro negative (168 trials). Real Claude Code payload capture needed to deterministically verify fix end-to-end.
 **Reported:** 2026-04-19, surfaced via `hank-secure-llm` `model_qa` harness after restarting with the post-`fa66768` build.
+**Investigated:** 2026-04-20.
 **Impact:** High for Claude-Code users of Qwen3.6 on desktop. Every first-turn request stalls until the 260s `--streaming-max-seconds` cap fires. Observable as 4:25 wall-clock for a "say OK" prompt.
-**Scope:** `vllm_mlx/reasoning/qwen3_parser.py` and/or `vllm_mlx/server.py:_stream_anthropic_messages` stop detection. Not the `anthropic_adapter.py` round-trip fix (`22c9c6a`, PR #22) — that fix addresses multi-turn history; this is single-turn.
+**Scope:** Model generation behavior, not `vllm_mlx/reasoning/qwen3_parser.py` (falsified — see [Investigation](#investigation-update--2026-04-20) below). Existing 260s cap (commit `64a8085`) catches it cleanly but with poor UX; defensive fix brings the bound in to ~1s via a properly-sized thinking-token budget.
+
+## Investigation update — 2026-04-20
+
+After pulling external evidence ([`ggml-org/llama.cpp#21118`](https://github.com/ggml-org/llama.cpp/issues/21118), [`vllm-project/vllm#17655`](https://github.com/vllm-project/vllm/issues/17655)) and running falsification tests against the live fleet, here's what's actually happening:
+
+### Mechanism (from upstream)
+
+Per the llama.cpp thread: "Qwen3.5 models are in-context learning to **not emit a `</think>` tag** when the reasoning from previous turns in the same `tool_call → tool → tool_call → ...` loop is not present. Most of the newer reasoning models expect this, and it was coined 'interleaved thinking.'"
+
+Translation for our single-turn case: when the request includes `tools: [...]` plus a large Claude-Code-style system prompt, Qwen3.6's sampler enters interleaved-thinking mode (expecting an agent loop is about to begin) and **never emits `</think>`** because the model is "waiting for the tool-result round-trip" that never happens on first turn. The stream runs until our server-side 260s cap fires.
+
+### Falsification attempts — synthetic repro failed (0/168 hangs)
+
+To verify the mechanism I ran 168 streaming trials against the running serve (port 8000, Qwen3.6-35B-A3B-4bit, same flags as production: `--continuous-batching --enable-auto-tool-choice --tool-call-parser qwen3 --reasoning-parser qwen3`):
+
+**Matrix phase — 8 cells isolating `tools` × `effort` × `long_system` (1 trial each):** wall-clock 1.36-3.44s, all ended `end_turn`.
+
+**Stress phase — 4 Claude-Code-shaped variants × 30 trials = 120, with `DELETE /v1/cache` between every trial (cold prefix cache):**
+
+| Variant | Payload | N | timeouts | natural `end_turn` | wall median | wall max |
+|---|---|---|---|---|---|---|
+| A | tools only | 30 | 0 | 30 | 1.20s | 4.11s |
+| B | tools + long system + `output_config.effort=high` | 30 | 0 | 29 (1 `tool_use`) | 2.50s | 2.92s |
+| C | tools + long system + `thinking.type=enabled` | 30 | 0 | 29 (1 `tool_use`) | 2.50s | 2.93s |
+| D | tools + long system + `effort=high` + `thinking.type=enabled` | 30 | 0 | 30 | 2.50s | 2.99s |
+
+**Zero hangs across 168 trials.** So the synthetic payload — 3 tool definitions, a 100-line system array with `cache_control.type=ephemeral`, both thinking flags set, trivial "reply OK" prompt — does not reproduce. The hang requires something specific in Claude Code's actual payload that we haven't captured (candidate diffs: specific tool descriptions/schemas, system-reminder block contents, or the exact token sequence interaction with the chat template).
+
+### H1/H2/H3 from the original hypotheses
+
+- **H1 (parser loses `</think>` detection mid-stream):** not supported. `vllm_mlx/reasoning/qwen3_parser.py` is 69 lines of simple string-match logic; no stateful regression path visible. Commit `55d25cf` only changed the NO-tags short-circuit — can't affect streams where tags are (or aren't) present.
+- **H2 (chat template pre-injects `<think>` without `</think>`):** partially correct but the mechanism per llama.cpp#21118 is richer — it's in-context learning from tools + system-prompt shape, not just a template defect.
+- **H3 (StreamingThinkRouter state leaks across requests):** **falsified by code inspection.** `StreamingThinkRouter` is instantiated per request at `vllm_mlx/server.py:2548`, inside the `_stream_anthropic_messages` function scope. Each stream gets a fresh router.
+- **H4 (`thinking.type=adaptive` × `output_config.effort=high` interact):** falsified by variant D — both set simultaneously, 30/30 clean `end_turn`.
+
+The upstream-mechanism explanation from llama.cpp#21118 remains the best-supported reading. We just can't hit it via synthetic curl.
+
+### Defensive fix — bound thinking tokens, not wall-clock
+
+The current safety net (`--streaming-max-seconds 260`, commit `64a8085`) works but is the wrong unit: it lets the model think for 260 seconds before giving up. The right unit is **thinking tokens**. The `thinking_token_budget` infrastructure (commit `7be87fa`, port of vLLM #20859) is already wired into both streaming OpenAI and Anthropic paths — server.py:1840, 2143, 2472. It's reachable per-request via the `thinking_token_budget` field or the effort-resolver system, but there's **no server-side default floor**.
+
+Empirical measurement against live port 8000, fresh cache, complex multi-step prompt ("train catch-up problem, show reasoning"):
+
+| `thinking_token_budget` | thinking words emitted | text chars | wall | stop |
+|---|---|---|---|---|
+| unset (baseline) | 749 | 1,345 | 18.25s | end_turn |
+| 1000 | 602 | 1,216 | 14.35s | end_turn |
+| 500 | 270 | 3,149 | 24.66s | end_turn |
+| 200 | 88 | 2,923 | 12.93s | end_turn |
+| 100 | 34 | 5,410 | 21.21s | end_turn |
+| 50 | 0 (force-close before first flush) | 1,988 | 7.14s | end_turn |
+
+Monotonic, deterministic bound. At `budget=100` the model gets 34 words of think and then emits text; at `budget=0` thinking is skipped entirely. `end_turn` fires in every case — no cap, no truncation. **This is the right knob.**
+
+### Initial fix proposal — superseded by three-layer design (2026-04-20)
+
+The proposal in this section was the starting point. After swarm-research, firecrawl investigation of upstream projects, and a three-round /dc review, the final design is a **three-layer defense** rather than a single flag:
+
+1. **Layer 1 (surgical, default-on):** detect `reasoning_parser="qwen3" + tools + no prior assistant` → inject `chat_template_kwargs.enable_thinking=False`. Uses Qwen's own chat-template mechanism.
+2. **Layer 2 (opt-in ceiling):** `--max-thinking-token-budget N` CLI flag clamps resolved budget down via shared helper at 4 resolve-sites.
+3. **Layer 3 (existing):** `--streaming-max-seconds 260` wall-clock cap as backstop.
+
+Full design + verified-bound measurements + upstream references at `docs/superpowers/specs/2026-04-20-qwen3-runaway-fix-design.md` (local, gitignored per repo convention). Implementation plan at `docs/superpowers/plans/2026-04-20-qwen3-runaway-fix.md` (local, 3237 lines, 23 tasks, reviewed across 3 /dc rounds). Execution pending.
+
+The original proposal below kept for historical record:
+
+### Initial proposal — `--default-thinking-token-budget` CLI flag (superseded)
+
+Mirror the existing `--streaming-max-seconds` pattern in `cli.py`:
+
+1. Add `--default-thinking-token-budget N` to the serve subparser (default: unset = no floor, preserving current behavior for operators who don't opt in).
+2. When set: any request that reaches `_chat_completions_dispatch_kwargs` (server.py ~line 1817) **without** an explicit `thinking_token_budget` (request field, `chat_template_kwargs`, or effort-resolver result) inherits the server default.
+3. Operators serving Qwen3.6 to Claude Code users set `--default-thinking-token-budget 2048` (or similar) — tight enough to bound first-turn runaway to ~5-10s, loose enough to not starve legitimate reasoning.
+
+This is orthogonal to `--streaming-max-seconds` — the wall-clock cap remains as a second line of defense for any other model-side non-termination.
+
+### Why not file upstream against ml-explore/mlx-lm
+
+The mechanism is **model behavior** (Qwen3.6 weights + chat template in-context-learning to withhold `</think>`), not an MLX or vllm-mlx bug. llama.cpp#21118 ran into the same thing with a different runtime. An upstream MLX or vllm-mlx issue asking them to force-close `</think>` would be reinventing what our `thinking_token_budget` already does — correctly, we just haven't defaulted it.
+
+### Next diagnostic (if needed for fix verification)
+
+Because 168 synthetic trials failed to reproduce, any fix we ship can't be deterministically end-to-end verified against the bug on this box — only against the bound mechanism. To close the loop:
+
+1. **Add request-body capture to `hank-secure-llm/app/src-tauri/src/proxy.rs`** under a conditional: dump full body to `/tmp/cc-hang-<timestamp>.json` when proxy observes `chunks_sent > 1000 AND message_stop_count == 0 AND duration_ms > 200000`. Negligible overhead (writes only on hang), fires only on the specific symptom.
+2. **Wait for next hang in the wild.** Per the sister arena doc, hangs are "non-deterministic" — some runs pass, some hang. Don't need to force it.
+3. **Replay captured body via `curl`** — deterministic reproducer. Then toggle `--default-thinking-token-budget` and measure end-to-end fix.
+
+Until that capture exists, the fix ships on the basis of the measured bound mechanism + the upstream-validated root cause.
 
 ## Symptom
 
@@ -46,35 +136,11 @@ Captured earlier via a mock-upstream mirror on 2026-04-18:
 - Actual user message is tiny (the prompt text)
 - **No prior assistant messages** on first turn — so PR #22's interleaved-thinking round-trip doesn't apply
 
-## Hypotheses
+## Reproduction status
 
-**H1. Long system prompt triggers a parser state where `</think>` detection degrades.** `qwen3_parser.py` tracks `<think>` start detection — if the parser is sensitive to the large ephemeral-cached system prompt (which contains unusual tokens like `<system-reminder>`), it may fail to recognize or emit `</think>` at the right moment, keeping thinking budget uncapped until the 260s server wall-cap fires.
-
-**H2. Chat template + Claude Code's `thinking.type: "adaptive"` combine to pre-inject `<think>` but no `</think>`.** The PR #10 fix (`23cecdc`) addresses budget=0 with pre-injected `<think>`. If `adaptive` mode pre-injects differently and the end-token detection isn't wired, the model never gets force-closed via the logits processor, runs to cap.
-
-**H3. Large tool-definition payload (3 tools, ~4KB JSON schema total) triggers a threshold where MoE expert routing degrades on Qwen3.6 specifically.** MoE-3B-active might allocate reasoning to experts that don't converge on `</think>` emission under heavy instruction-tuning-prompt stress.
-
-**H4. `thinking.type = "adaptive"` interacts with `output_config.effort = "high"` in a way that breaks one or both.** Only one should win per the effort-resolver precedence table (`vllm_mlx/api/effort.py:57-63`); but if both are applied against the same model, the budget/thinking pipeline may double-configure and break.
-
-## Minimal reproduction (Python, no Claude Code needed)
-
-The Claude Code payload can be captured once and replayed as a fixture. Target: find the minimal payload that reproduces the >60s wall-clock on Qwen3.6. Bisect by progressively stripping:
-1. Start with Claude Code's full captured body (paste from a mirror upstream — see `hank-llm-arena/docs/2026-04-19-qwen36-stream-runaway.md` for capture technique).
-2. Binary-chop the system prompt length.
-3. Drop tool definitions one by one.
-4. Swap `thinking.type: "adaptive"` → removed, → `"enabled"`, etc.
-5. Vary effort between `low` and `high`.
-
-Whichever combination still reproduces identifies the trigger.
-
-## Observable signals during the hang (for log bisection)
-
-During the 265s period, `vllm-mlx` server logs should show:
-- `[REQUEST] POST /v1/messages` with the right payload dimensions
-- `[stream_outputs] <req-id> first token after <N>s` — is N reasonable?
-- Streaming token generation — does `chunks_sent` monotonically grow?
-- Does the thinking budget logits processor attach? (`x-thinking-budget-applied: true/false` header on the response)
-- When the 260s cap fires: look for the log line added by PR #23 that announces the cap and emits the tail frame. Confirms the cap is the terminator, not a natural stop.
+- **Synthetic (curl, 168 trials across 8 factor-matrix cells and 4 Claude-Code-shape variants with cache clear):** negative. All trials ended `end_turn` under 4.11s wall-clock.
+- **Wild (hank-secure-llm model_qa harness via Claude Code):** positive, non-deterministic. "Same prompt may succeed or hang across runs" per the sister arena doc.
+- **Next step to bridge the gap:** capture a real Claude Code request body (add a body-dump on-hang-signature path in `hank-secure-llm/app/src-tauri/src/proxy.rs`), then replay via curl. See [Next diagnostic](#next-diagnostic-if-needed-for-fix-verification).
 
 ## What this blocks downstream
 

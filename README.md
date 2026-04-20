@@ -337,6 +337,24 @@ Without this env var on all MLX processes, the watchdog will fire on the unprote
 
 See [docs/testing/2026-04-19-metal-innocent-victim-concurrent-mlx-lm-training.md](docs/testing/2026-04-19-metal-innocent-victim-concurrent-mlx-lm-training.md) for the full diagnostic trail (kernel gpuEvent reports, 12 matching crashes across two days, upstream issue cross-references).
 
+### Qwen3 first-turn runaway mitigation
+
+Qwen3.x models (notably Qwen3.6-35B-A3B) can enter an "interleaved thinking" trap on first-turn requests that include tool definitions but no prior assistant message — the model generates thinking tokens indefinitely without emitting `</think>`. This manifests as 4+ minute waits in Claude Code.
+
+**vllm-mlx-patched applies two mitigations automatically:**
+
+1. **Surgical auto-disable** — when serving a Qwen3 model (`--reasoning-parser qwen3`) AND the request includes tools AND there's no prior assistant message, we inject `chat_template_kwargs={"enable_thinking": false}`. Uses Qwen's own chat-template mechanism (pre-emits `<think>\n\n</think>\n\n` in the prompt → model skips think mode entirely). Client-explicit `enable_thinking` or `thinking.type` always wins. Disable via `--disable-qwen3-first-turn-no-think`.
+
+2. **Optional server-side ceiling** — set `--max-thinking-token-budget N` to clamp any resolved thinking budget above N down to N. Recommended `2048` for Qwen3.x + agentic-client serves. Respects client `budget=0` (never raises), only applies when the engine supports the logits processor. Mirrors llama.cpp's `--reasoning-budget N` pattern.
+
+The existing `--streaming-max-seconds 260` wall-clock cap remains as third-line backstop.
+
+**Observability:** new response headers `x-thinking-budget-ceiling`, `x-thinking-budget-clamped-to`, `x-thinking-budget-clamp-skipped`, `x-thinking-qwen3-auto-disabled`. New counters `thinking_budget_clamp_fired_total` and `qwen3_first_turn_no_think_applied_total`.
+
+**Known limitation:** turn-1 auto-disable can cause multi-turn in-context-learning back-fire — on turn 2+ the model may produce shallow thinking even when the client explicitly requests it (Qwen3 conditions on prior-turn absence of `<think>`). Root fix (synthesizing `<think></think>` in prior-turn reconstruction) deferred to a follow-up PR; a skip-marked regression test documents the vector.
+
+**Upstream references:** [ml-explore/mlx#3267](https://github.com/ml-explore/mlx/issues/3267), [ggml-org/llama.cpp#20182](https://github.com/ggml-org/llama.cpp/issues/20182), [ggml-org/llama.cpp#21118](https://github.com/ggml-org/llama.cpp/issues/21118), [vllm-project/vllm#39103](https://github.com/vllm-project/vllm/issues/39103). Full investigation: [docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md](docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md).
+
 ### Long Context Patch (mlx-vlm)
 
 Gemma 3's default `sliding_window=1024` limits context to ~10K tokens on Apple Silicon (Metal GPU timeout at higher context — same AGX watchdog as above, triggered on the long attention dispatch). To enable longer context (up to ~50K tokens), patch mlx-vlm:

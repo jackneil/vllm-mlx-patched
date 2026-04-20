@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B: first-turn runaway under Claude Code payload shape
 
-**Status:** Root cause identified upstream (model behavior, not a vllm-mlx parser bug). Defensive fix designed, measurement-verified, ready to wire in. Empirical synthetic repro negative (168 trials). Real Claude Code payload capture needed to deterministically verify fix end-to-end.
+**Status:** Fix landed (2026-04-20). Design at `docs/superpowers/specs/2026-04-20-qwen3-runaway-fix-design.md` (local/gitignored). Layer 1 (surgical auto-disable) is default-on; Layer 2 (`--max-thinking-token-budget N` ceiling) is opt-in. The existing `--streaming-max-seconds 260` cap remains as third-line backstop. Rest of this document stays as historical record of the investigation.
 **Reported:** 2026-04-19, surfaced via `hank-secure-llm` `model_qa` harness after restarting with the post-`fa66768` build.
 **Investigated:** 2026-04-20.
 **Impact:** High for Claude-Code users of Qwen3.6 on desktop. Every first-turn request stalls until the 260s `--streaming-max-seconds` cap fires. Observable as 4:25 wall-clock for a "say OK" prompt.

@@ -138,18 +138,24 @@ Adding a new provider dialect means extending `EffortSource` + the resolver. It 
 
 Test guard: `tests/test_effort_resolver.py` + `tests/test_anthropic_adapter_effort.py`.
 
-### Invariant 12: Five-header contract on budget-resolved responses
+### Invariant 12: Header contract on budget-resolved responses
 
 Every chat-completion or messages response that went through the resolver MUST emit:
 - `x-thinking-budget-applied` (`true` | `false`, absent when no budget requested)
-- `x-thinking-budget-resolved` (int as string, or `"none"`)
-- `x-thinking-budget-source` (one of the `EffortSource` enum values)
-- `x-thinking-budget-max-tokens-floor` (int as string, absent when source=default or budget=0)
+- `x-thinking-budget-resolved` (int as string, or `"none"`). **NB:** reflects POST-clamp value when Layer 2 fires — engine state and header agree.
+- `x-thinking-budget-source` (one of the `EffortSource` enum values: `top_level` | `anthropic_thinking_disabled` | `anthropic_thinking_enabled` | `anthropic_thinking_adaptive` | `output_config_effort` | `reasoning_effort` | `template_kwargs` | `default`)
+- `x-thinking-budget-max-tokens-floor` (int as string, absent when source=default, budget=0, OR Layer 2 clamped — the pre-clamp floor is stale in that case)
 - `x-thinking-budget-noop-reason` (string; emitted ONLY when `applied=false`; one of `parser_not_configured` / `tokenizer_encode_failed` / `multi_token_delimiter` / `mllm_path` / `simple_engine`)
 
-Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` forwards the `x-thinking-` prefix to clients. Arena's admin UI reads these headers to show a per-request "effort honored" indicator. The `noop-reason` header is what operators use to diagnose why the feature is a no-op (e.g., `simple_engine` means the server needs `--continuous-batching`).
+Added 2026-04-20 for the Qwen3 runaway mitigation:
+- `x-thinking-budget-ceiling` (int as string) — emitted on every response when `--max-thinking-token-budget` is set, regardless of whether Layer 2 fired.
+- `x-thinking-budget-clamped-to` (int as string) — emitted only when Layer 2 actually clamped. Value matches `x-thinking-budget-resolved` (post-clamp).
+- `x-thinking-budget-clamp-skipped` (string) — emitted when ceiling is set but the engine/parser combination cannot enforce it. Same reason codes as `noop-reason`.
+- `x-thinking-qwen3-auto-disabled` (`"true"`) — emitted when Layer 1 (Qwen3 surgical first-turn-no-think) fired on the request.
 
-Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py`.
+Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` forwards the `x-thinking-` prefix to clients. Arena's admin UI reads these headers to show a per-request "effort honored" indicator. The `noop-reason` / `clamp-skipped` headers are what operators use to diagnose why the feature is a no-op.
+
+Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py` + end-to-end integration in `tests/test_qwen3_first_turn_no_think_integration.py` / `tests/test_thinking_budget_ceiling_integration.py`.
 
 ### Invariant 13: Non-streaming Anthropic thinking-block ordering and schema
 

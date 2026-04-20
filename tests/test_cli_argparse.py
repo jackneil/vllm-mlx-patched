@@ -32,6 +32,7 @@ def serve_help_output():
 def _parse_choices_from_help(help_text: str, option: str) -> set[str]:
     """Extract the {choice1,choice2,...} set for a given option from --help output."""
     import re
+
     # argparse formats choices as: --option {a,b,c}
     # Match the first occurrence after the option name
     pattern = rf"{re.escape(option)}\s+\{{([^}}]+)\}}"

@@ -1888,13 +1888,16 @@ class MLXMultimodalLM:
         # when truthy, otherwise use this precomputed count so usage reporting is
         # never silently zero.
         import logging as _logging
+
         _precomputed_prompt_tokens = 0
         try:
             _tok = getattr(self.processor, "tokenizer", None)
             if _tok is not None and hasattr(_tok, "encode"):
                 _precomputed_prompt_tokens = len(_tok.encode(formatted_prompt))
             elif hasattr(self.processor, "encode"):
-                _precomputed_prompt_tokens = len(self.processor.encode(formatted_prompt))
+                _precomputed_prompt_tokens = len(
+                    self.processor.encode(formatted_prompt)
+                )
             else:
                 _precomputed_prompt_tokens = 0
         except Exception as _e:

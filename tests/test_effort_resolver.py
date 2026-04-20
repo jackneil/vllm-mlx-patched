@@ -156,9 +156,9 @@ def test_output_config_effort_max_floor_capped_at_ceiling():
     )
     assert result.budget == 65536
     assert result.max_tokens_floor is not None
-    assert result.max_tokens_floor <= 32768, (
-        f"max_tokens_floor={result.max_tokens_floor} exceeds 32768 ceiling"
-    )
+    assert (
+        result.max_tokens_floor <= 32768
+    ), f"max_tokens_floor={result.max_tokens_floor} exceeds 32768 ceiling"
 
 
 def test_output_config_effort_max_floor_respects_prompt_headroom():
@@ -171,9 +171,9 @@ def test_output_config_effort_max_floor_respects_prompt_headroom():
     )
     assert result.budget == 2048  # 4096 // 2
     assert result.max_tokens_floor is not None
-    assert result.max_tokens_floor <= 4096 - 1024, (
-        f"floor={result.max_tokens_floor} leaves no prompt headroom"
-    )
+    assert (
+        result.max_tokens_floor <= 4096 - 1024
+    ), f"floor={result.max_tokens_floor} leaves no prompt headroom"
 
 
 def test_output_config_effort_max_capped_at_65k():
@@ -289,6 +289,7 @@ def test_reasoning_effort_loses_to_output_config():
 
 # ---- PR-C Task C.1: ALLOWED_EFFORT_LEVELS export ----
 
+
 def test_allowed_effort_levels_covers_table_and_aliases():
     """ALLOWED_EFFORT_LEVELS must be the union of _EFFORT_TABLE keys and
     _EFFORT_ALIASES keys plus "max" (handled dynamically). Adding a new
@@ -299,9 +300,7 @@ def test_allowed_effort_levels_covers_table_and_aliases():
         _EFFORT_TABLE,
     )
 
-    expected = (
-        set(_EFFORT_TABLE.keys()) | set(_EFFORT_ALIASES.keys()) | {"max"}
-    )
+    expected = set(_EFFORT_TABLE.keys()) | set(_EFFORT_ALIASES.keys()) | {"max"}
     assert set(ALLOWED_EFFORT_LEVELS) == expected
 
 
@@ -341,9 +340,7 @@ def test_anthropic_thinking_unknown_type_logs_warn_with_prefix(caplog):
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
         result = resolve_effort(anthropic_thinking={"type": "invalidtype"})
     assert result.source == EffortSource.DEFAULT
-    assert any(
-        "[thinking-budget-resolver]" in r.message for r in caplog.records
-    )
+    assert any("[thinking-budget-resolver]" in r.message for r in caplog.records)
 
 
 def test_anthropic_thinking_non_str_type_logs_warn(caplog):
@@ -354,9 +351,7 @@ def test_anthropic_thinking_non_str_type_logs_warn(caplog):
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
         result = resolve_effort(anthropic_thinking={"type": 42})
     assert result.source == EffortSource.DEFAULT
-    assert any(
-        "[thinking-budget-resolver]" in r.message for r in caplog.records
-    )
+    assert any("[thinking-budget-resolver]" in r.message for r in caplog.records)
 
 
 def test_anthropic_thinking_none_does_not_warn(caplog):
@@ -367,9 +362,7 @@ def test_anthropic_thinking_none_does_not_warn(caplog):
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
         result = resolve_effort(anthropic_thinking=None)
     assert result.source == EffortSource.DEFAULT
-    assert not any(
-        "[thinking-budget-resolver]" in r.message for r in caplog.records
-    )
+    assert not any("[thinking-budget-resolver]" in r.message for r in caplog.records)
 
 
 def test_anthropic_thinking_empty_dict_is_silent(caplog):
@@ -385,9 +378,7 @@ def test_anthropic_thinking_empty_dict_is_silent(caplog):
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.api.effort"):
         result = resolve_effort(anthropic_thinking={})
     assert result.source == EffortSource.DEFAULT
-    assert not any(
-        "[thinking-budget-resolver]" in r.message for r in caplog.records
-    )
+    assert not any("[thinking-budget-resolver]" in r.message for r in caplog.records)
 
 
 # ---- "adaptive + explicit effort" ceiling respect (Qwen3.6 first-turn runaway) ----
@@ -409,9 +400,9 @@ def test_adaptive_plus_output_config_effort_uses_effort_ceiling():
         output_config={"effort": "high"},
     )
 
-    assert result.budget == 8192, (
-        f"adaptive + effort=high must use effort's budget 8192; got {result.budget}"
-    )
+    assert (
+        result.budget == 8192
+    ), f"adaptive + effort=high must use effort's budget 8192; got {result.budget}"
     assert result.source == EffortSource.OUTPUT_CONFIG_EFFORT
 
 

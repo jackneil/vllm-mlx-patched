@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 
-
 _SCHEDULER = Path(__file__).parent.parent / "vllm_mlx" / "scheduler.py"
 
 # Functions whose body is allowed to reference the forbidden attributes.
@@ -46,9 +45,7 @@ def _collect_allowlist_line_ranges(tree: ast.Module) -> list[tuple[int, int]]:
     return ranges
 
 
-def _is_in_allowlist(
-    lineno: int, ranges: list[tuple[int, int]]
-) -> bool:
+def _is_in_allowlist(lineno: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= lineno <= end for start, end in ranges)
 
 
@@ -154,6 +151,7 @@ def test_startup_assertion_rejects_pre_0_31_2_batch_generator():
     RuntimeError with mlx_lm >= 0.31.2 requirement in its message. This
     test mirrors the assertion shape used in
     `Scheduler._create_batch_generator` so the contract stays locked."""
+
     class _LegacyBG:
         """Pre-0.31.2 mlx_lm had a single `active_batch` slot."""
 
@@ -164,6 +162,7 @@ def test_startup_assertion_rejects_pre_0_31_2_batch_generator():
     assert not hasattr(bg, "_generation_batch")
 
     import mlx_lm as _mlx_lm_mod
+
     _v = getattr(_mlx_lm_mod, "__version__", "unknown")
 
     with pytest.raises(RuntimeError, match="mlx_lm >= 0.31.2"):

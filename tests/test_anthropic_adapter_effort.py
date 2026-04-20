@@ -155,6 +155,7 @@ def test_thinking_budget_tokens_rejects_negative():
 
 def test_thinking_budget_tokens_accepts_positive_int():
     from vllm_mlx.api.anthropic_models import AnthropicRequest
+
     req = AnthropicRequest(
         model="t",
         messages=[{"role": "user", "content": "hi"}],
@@ -167,6 +168,7 @@ def test_thinking_budget_tokens_accepts_positive_int():
 def test_thinking_budget_tokens_accepts_zero():
     """budget_tokens=0 is valid — means 'no thinking'. Don't reject it."""
     from vllm_mlx.api.anthropic_models import AnthropicRequest
+
     req = AnthropicRequest(
         model="t",
         messages=[{"role": "user", "content": "hi"}],

@@ -147,9 +147,9 @@ def test_openai_stream_cap_emits_length_finish(patched_server):
             if choice.get("finish_reason") == "length":
                 found_length = True
                 break
-    assert found_length, (
-        "no chunk with finish_reason=length found after streaming cap hit"
-    )
+    assert (
+        found_length
+    ), "no chunk with finish_reason=length found after streaming cap hit"
 
 
 def test_cap_zero_disables_cap(patched_server, monkeypatch):
@@ -318,9 +318,9 @@ def test_anthropic_stream_cap_with_thinking_history_preservation(
         return m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
 
     assistant_msgs = [m for m in captured_messages if _role(m) == "assistant"]
-    assert assistant_msgs, (
-        f"no assistant message reached the engine; captured={captured_messages!r}"
-    )
+    assert (
+        assistant_msgs
+    ), f"no assistant message reached the engine; captured={captured_messages!r}"
     assistant_content = _content(assistant_msgs[0]) or ""
     assert "<think>" in assistant_content, (
         f"thinking-history preservation failed under cap-firing flow; "
@@ -329,7 +329,9 @@ def test_anthropic_stream_cap_with_thinking_history_preservation(
     assert "prior reasoning" in assistant_content
 
 
-def test_openai_cap_with_tool_calls_emits_tool_calls_finish(patched_server, monkeypatch):
+def test_openai_cap_with_tool_calls_emits_tool_calls_finish(
+    patched_server, monkeypatch
+):
     """When cap fires AFTER tool-call markup has been detected mid-stream,
     the synthetic final chunk must emit finish_reason="tool_calls", not
     "length" — strict OpenAI clients treat an unterminated tool call with
@@ -367,7 +369,7 @@ def test_openai_cap_with_tool_calls_emits_tool_calls_finish(patched_server, monk
                         "name": "foo",
                         "description": "f",
                         "parameters": {"type": "object", "properties": {}},
-                    }
+                    },
                 }
             ],
             "messages": [{"role": "user", "content": "call foo"}],
@@ -397,9 +399,9 @@ def test_openai_cap_with_tool_calls_emits_tool_calls_finish(patched_server, monk
             fr = choice.get("finish_reason")
             if fr:
                 terminal_reasons.add(fr)
-    assert terminal_reasons, (
-        "no finish_reason chunk emitted after cap fired with tool markup"
-    )
+    assert (
+        terminal_reasons
+    ), "no finish_reason chunk emitted after cap fired with tool markup"
     assert terminal_reasons <= {"length", "tool_calls"}
 
 
@@ -518,9 +520,9 @@ def test_prologue_branch_is_reachable_by_code_path(patched_server, monkeypatch, 
     cap_warnings = [
         r.message for r in caplog.records if "[streaming-timeout]" in r.message
     ]
-    assert any("cap=prologue" in m for m in cap_warnings), (
-        f"prologue path did not fire under forced clock; cap warnings: {cap_warnings}"
-    )
+    assert any(
+        "cap=prologue" in m for m in cap_warnings
+    ), f"prologue path did not fire under forced clock; cap warnings: {cap_warnings}"
 
 
 def test_cap_fire_log_includes_request_id_and_model(patched_server, caplog):
@@ -552,12 +554,12 @@ def test_cap_fire_log_includes_request_id_and_model(patched_server, caplog):
         r.message for r in caplog.records if "[streaming-timeout]" in r.message
     ]
     assert cap_warnings, "no [streaming-timeout] WARN emitted"
-    assert any("msg_id=msg_" in m for m in cap_warnings), (
-        f"msg_id missing from cap warnings; got: {cap_warnings}"
-    )
-    assert any("model=fake-model" in m for m in cap_warnings), (
-        f"model name missing from cap warnings; got: {cap_warnings}"
-    )
+    assert any(
+        "msg_id=msg_" in m for m in cap_warnings
+    ), f"msg_id missing from cap warnings; got: {cap_warnings}"
+    assert any(
+        "model=fake-model" in m for m in cap_warnings
+    ), f"model name missing from cap warnings; got: {cap_warnings}"
 
 
 def test_cap_fire_log_discriminates_wait_for_path(patched_server, caplog):
@@ -590,9 +592,9 @@ def test_cap_fire_log_discriminates_wait_for_path(patched_server, caplog):
     cap_warnings = [
         r.message for r in caplog.records if "[streaming-timeout]" in r.message
     ]
-    assert any("cap=wait_for" in m for m in cap_warnings), (
-        f"wait_for discriminator missing; got: {cap_warnings}"
-    )
+    assert any(
+        "cap=wait_for" in m for m in cap_warnings
+    ), f"wait_for discriminator missing; got: {cap_warnings}"
 
 
 def test_cap_cleanup_broadened_except_emits_tail_frames(patched_server):
@@ -643,6 +645,6 @@ def test_cap_cleanup_broadened_except_emits_tail_frames(patched_server):
 
     body = "\n".join(body_lines)
     # The cleanup exception must not short-circuit tail emission.
-    assert "message_stop" in body, (
-        f"tail frames missing when cleanup raised; last 400 chars: {body[-400:]}"
-    )
+    assert (
+        "message_stop" in body
+    ), f"tail frames missing when cleanup raised; last 400 chars: {body[-400:]}"

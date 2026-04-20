@@ -1111,9 +1111,7 @@ async def clear_cache():
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
         for name in ("multimodal_kv", "pixel_values", "pil_image"):
-            caches.append(
-                {"name": name, "cleared": True, "refused_tiers": []}
-            )
+            caches.append({"name": name, "cleared": True, "refused_tiers": []})
     except ImportError:
         pass  # not a VLM server; not an error
 
@@ -1931,12 +1929,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             max_tokens_floor=None,
             effort_label=None,
         )
-        _synth_out, _clamped_from_early, _ = (
-            apply_server_thinking_token_budget_ceiling(
-                _synth,
-                ceiling=_max_thinking_token_budget,
-                engine_supports_processor=_engine_supports_proc_early,
-            )
+        _synth_out, _clamped_from_early, _ = apply_server_thinking_token_budget_ceiling(
+            _synth,
+            ceiling=_max_thinking_token_budget,
+            engine_supports_processor=_engine_supports_proc_early,
         )
         if _clamped_from_early is not None and _synth_out is not None:
             _budget = _synth_out.budget
@@ -2303,9 +2299,11 @@ async def create_anthropic_message(
     # config (the adapter defaults to 131072 today).
     openai_request, _resolved_budget = anthropic_to_openai(
         anthropic_request,
-        reasoning_parser_start_token=getattr(_reasoning_parser, "start_token", None)
-        if _reasoning_parser is not None
-        else None,
+        reasoning_parser_start_token=(
+            getattr(_reasoning_parser, "start_token", None)
+            if _reasoning_parser is not None
+            else None
+        ),
         engine_supports_processor=_engine_supports_thinking_budget_processor(engine),
     )
 
@@ -2317,7 +2315,9 @@ async def create_anthropic_message(
         apply_server_thinking_token_budget_ceiling(
             _resolved_budget,
             ceiling=_max_thinking_token_budget,
-            engine_supports_processor=_engine_supports_thinking_budget_processor(engine),
+            engine_supports_processor=_engine_supports_thinking_budget_processor(
+                engine
+            ),
         )
     )
     if _resolved_budget is not None:
@@ -2539,9 +2539,7 @@ async def create_anthropic_message(
                 ceiling=_max_thinking_token_budget,
                 clamped_from=_clamped_from_anth,
                 clamp_skip_reason=_clamp_skip_anth,
-                qwen3_auto_no_think=getattr(
-                    anthropic_request, "_layer1_fired", False
-                ),
+                qwen3_auto_no_think=getattr(anthropic_request, "_layer1_fired", False),
             )
         )
     elif _resolved_budget.source != EffortSource.DEFAULT or getattr(
@@ -2557,9 +2555,7 @@ async def create_anthropic_message(
                 ceiling=_max_thinking_token_budget,
                 clamped_from=_clamped_from_anth,
                 clamp_skip_reason=_clamp_skip_anth,
-                qwen3_auto_no_think=getattr(
-                    anthropic_request, "_layer1_fired", False
-                ),
+                qwen3_auto_no_think=getattr(anthropic_request, "_layer1_fired", False),
             )
         )
     return Response(
@@ -2911,9 +2907,7 @@ async def _stream_anthropic_messages(
 
     while True:
         remaining = (
-            _stream_cap - (time.perf_counter() - start_time)
-            if _stream_cap
-            else None
+            _stream_cap - (time.perf_counter() - start_time) if _stream_cap else None
         )
         if remaining is not None and remaining <= 0:
             _log_cap_fired("prologue")
@@ -3275,9 +3269,7 @@ async def stream_chat_completion(
 
     while True:
         remaining = (
-            _stream_cap - (time.perf_counter() - start_time)
-            if _stream_cap
-            else None
+            _stream_cap - (time.perf_counter() - start_time) if _stream_cap else None
         )
         if remaining is not None and remaining <= 0:
             _log_cap_fired("prologue")

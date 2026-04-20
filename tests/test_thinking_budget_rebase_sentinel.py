@@ -70,9 +70,9 @@ class TestThinkingBudgetSentinel:
         from vllm_mlx.request import Request
 
         assert hasattr(Request, "__dataclass_fields__")
-        assert "thinking_budget_noop_reason" in Request.__dataclass_fields__, (
-            "Request.thinking_budget_noop_reason removed — rebase regression"
-        )
+        assert (
+            "thinking_budget_noop_reason" in Request.__dataclass_fields__
+        ), "Request.thinking_budget_noop_reason removed — rebase regression"
         f = Request.__dataclass_fields__["thinking_budget_noop_reason"]
         assert f.default is None, (
             "Default for thinking_budget_noop_reason changed; "
@@ -83,9 +83,9 @@ class TestThinkingBudgetSentinel:
         """noop_reason field on RequestOutput is pinned to survive rebase."""
         from vllm_mlx.request import RequestOutput
 
-        assert "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__, (
-            "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
-        )
+        assert (
+            "thinking_budget_noop_reason" in RequestOutput.__dataclass_fields__
+        ), "RequestOutput.thinking_budget_noop_reason removed — rebase regression"
         f = RequestOutput.__dataclass_fields__["thinking_budget_noop_reason"]
         assert f.default is None, (
             "Default for thinking_budget_noop_reason changed; "
@@ -449,9 +449,9 @@ def test_thinking_policy_helper_invoked_at_both_sites():
     anth_src = inspect.getsource(anthropic_adapter)
     srv_src = inspect.getsource(server)
 
-    assert helper in anth_src, (
-        f"{helper} must be invoked in anthropic_adapter.py (Layer 1, 2026-04-20)"
-    )
+    assert (
+        helper in anth_src
+    ), f"{helper} must be invoked in anthropic_adapter.py (Layer 1, 2026-04-20)"
     assert helper in srv_src, (
         f"{helper} must be invoked in server.py create_chat_completion "
         "(Layer 1, 2026-04-20)"

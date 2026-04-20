@@ -180,7 +180,7 @@ def resolve_effort(
                 "[thinking-budget-resolver] anthropic_thinking dict is "
                 "missing `type` key (keys=%s); falling through to "
                 "lower-precedence signals. Clients should include "
-                "`type: \"enabled\"|\"disabled\"|\"adaptive\"` explicitly.",
+                '`type: "enabled"|"disabled"|"adaptive"` explicitly.',
                 sorted(anthropic_thinking.keys()),
             )
 

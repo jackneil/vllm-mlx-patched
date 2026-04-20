@@ -113,11 +113,12 @@ def test_server_forwards_chat_template_kwargs_through_engine_on_anthropic_stream
     fake._reasoning_parser.channel_strip_prefix = None
     fake.stream_chat = stream_chat
 
-    with patch.object(srv, "_engine", fake), patch.object(
-        srv, "_model_name", fake.model_name
-    ), patch.object(
-        srv, "_reasoning_parser", fake._reasoning_parser
-    ), patch.object(srv, "_reasoning_parser_name", "qwen3"):
+    with (
+        patch.object(srv, "_engine", fake),
+        patch.object(srv, "_model_name", fake.model_name),
+        patch.object(srv, "_reasoning_parser", fake._reasoning_parser),
+        patch.object(srv, "_reasoning_parser_name", "qwen3"),
+    ):
         client = TestClient(srv.app)
         resp = client.post(
             "/v1/messages",

@@ -16,8 +16,10 @@ from vllm_mlx import cli, server
 def _parse_serve_args(*argv_extra):
     """Drive cli.main's argparse up to the server attribute assignments.
     Patch load_model and uvicorn.run so we don't actually boot."""
-    with patch("vllm_mlx.server.load_model"), patch("uvicorn.run"), patch.object(
-        sys, "argv", ["vllm-mlx", "serve", "some-model", *argv_extra]
+    with (
+        patch("vllm_mlx.server.load_model"),
+        patch("uvicorn.run"),
+        patch.object(sys, "argv", ["vllm-mlx", "serve", "some-model", *argv_extra]),
     ):
         try:
             cli.main()

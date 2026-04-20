@@ -132,9 +132,7 @@ def test_chat_template_kwargs_budget_also_clamped(
     assert captured[0].get("thinking_token_budget") == 2048
 
 
-def test_no_clamp_when_resolved_below_ceiling(
-    qwen3_fake_server_ceiling, monkeypatch
-):
+def test_no_clamp_when_resolved_below_ceiling(qwen3_fake_server_ceiling, monkeypatch):
     fake, captured = qwen3_fake_server_ceiling
     monkeypatch.setattr(srv, "_max_thinking_token_budget", 8192)
 

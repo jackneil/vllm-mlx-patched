@@ -22,7 +22,9 @@ class TestDetectStartsThinking(unittest.TestCase):
 
         tok = self._make_tokenizer("<|channel>thought\n<channel|>")
         result = _detect_starts_thinking(
-            tok, start_token="<|channel>", end_tokens=["<channel|>", "<|channel>response"]
+            tok,
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
         )
         self.assertFalse(result)
 
@@ -97,7 +99,9 @@ class TestDetectStartsThinking(unittest.TestCase):
         tok = self._make_tokenizer("<|channel>thought\n<|channel>response\nsome text")
         tok.chat_template = "has <|channel> and add_generation_prompt"
         result = _detect_starts_thinking(
-            tok, start_token="<|channel>", end_tokens=["<channel|>", "<|channel>response"]
+            tok,
+            start_token="<|channel>",
+            end_tokens=["<channel|>", "<|channel>response"],
         )
         self.assertFalse(result)
 

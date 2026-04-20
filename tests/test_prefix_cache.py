@@ -689,6 +689,7 @@ if __name__ == "__main__":
 
 # ---- acquire/release production API ----
 
+
 def test_prefix_cache_manager_acquire_blocks_clear():
     from vllm_mlx.prefix_cache import PrefixCacheManager
 

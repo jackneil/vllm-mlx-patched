@@ -178,9 +178,12 @@ class TestStreamingThinkRouterConfigurableTokens(unittest.TestCase):
             end_tokens=["<channel|>", "<|channel>response"],
             channel_strip_prefix="thought\n",
         )
-        pieces = r.process(
-            "<|channel>thought\nI should call read_file<channel|>Here is the file."
-        ) + r.flush()
+        pieces = (
+            r.process(
+                "<|channel>thought\nI should call read_file<channel|>Here is the file."
+            )
+            + r.flush()
+        )
         self.assertIn(("thinking", "I should call read_file"), pieces)
         text_pieces = [t for b, t in pieces if b == "text"]
         self.assertTrue(any("Here is the file." in t for t in text_pieces))
@@ -196,9 +199,7 @@ class TestStreamingThinkRouterConfigurableTokens(unittest.TestCase):
         pieces = r.process("l>thou")
         self.assertEqual("".join(t for b, t in pieces if b == "thinking"), "")
         pieces = r.process("ght\nstep 1")
-        self.assertEqual(
-            "".join(t for b, t in pieces if b == "thinking"), "step 1"
-        )
+        self.assertEqual("".join(t for b, t in pieces if b == "thinking"), "step 1")
         self.assertEqual(r.process(" and step 2"), [("thinking", " and step 2")])
         pieces = r.process("<channel|>answer") + r.flush()
         text_pieces = [t for b, t in pieces if b == "text"]
@@ -211,9 +212,12 @@ class TestStreamingThinkRouterConfigurableTokens(unittest.TestCase):
             end_tokens=["<channel|>", "<|channel>response"],
             channel_strip_prefix="thought\n",
         )
-        pieces = r.process(
-            "<|channel>thought\nfirst<channel|>middle<|channel>thought\nsecond<channel|>end"
-        ) + r.flush()
+        pieces = (
+            r.process(
+                "<|channel>thought\nfirst<channel|>middle<|channel>thought\nsecond<channel|>end"
+            )
+            + r.flush()
+        )
         thinking = [t for b, t in pieces if b == "thinking"]
         self.assertIn("first", thinking)
         self.assertIn("second", thinking)
@@ -237,9 +241,10 @@ class TestStreamingThinkRouterConfigurableTokens(unittest.TestCase):
             channel_strip_prefix="thought\n",
         )
         # Alt end appears first → closes thinking there
-        pieces = r.process(
-            "<|channel>thought\nA<|channel>response\nB<channel|>C"
-        ) + r.flush()
+        pieces = (
+            r.process("<|channel>thought\nA<|channel>response\nB<channel|>C")
+            + r.flush()
+        )
         self.assertIn(("thinking", "A"), pieces)
         joined = "".join(t for b, t in pieces if b == "text")
         self.assertIn("B", joined)

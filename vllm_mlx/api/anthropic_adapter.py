@@ -207,9 +207,9 @@ def openai_to_anthropic(
         if choice.message.reasoning:
             sig = (
                 "vllm-mlx:"
-                + hashlib.sha256(
-                    choice.message.reasoning.encode("utf-8")
-                ).hexdigest()[:32]
+                + hashlib.sha256(choice.message.reasoning.encode("utf-8")).hexdigest()[
+                    :32
+                ]
             )
             content.append(
                 AnthropicResponseContentBlock(

@@ -76,7 +76,9 @@ def test_noop_reason_emitted_when_applied_false():
         effort_label=None,
     )
     headers = _build_thinking_budget_headers(
-        resolved, applied=False, noop_reason="mllm_path",
+        resolved,
+        applied=False,
+        noop_reason="mllm_path",
     )
     assert headers["x-thinking-budget-applied"] == "false"
     assert headers["x-thinking-budget-noop-reason"] == "mllm_path"
@@ -105,7 +107,9 @@ def test_noop_reason_omitted_when_none_even_on_false():
         effort_label=None,
     )
     headers = _build_thinking_budget_headers(
-        resolved, applied=False, noop_reason=None,
+        resolved,
+        applied=False,
+        noop_reason=None,
     )
     assert "x-thinking-budget-noop-reason" not in headers
 
@@ -128,9 +132,7 @@ def test_warn_when_max_tokens_below_floor(caplog):
         _warn_if_max_tokens_below_floor(resolved, max_tokens=4000)
     msgs = [r.message for r in caplog.records]
     assert any(
-        "[thinking-budget-resolver]" in m
-        and "4000" in m and "16384" in m
-        for m in msgs
+        "[thinking-budget-resolver]" in m and "4000" in m and "16384" in m for m in msgs
     )
 
 
@@ -140,8 +142,10 @@ def test_no_warn_when_max_tokens_meets_floor(caplog):
     from vllm_mlx.api.effort import EffortSource, ResolvedBudget
 
     resolved = ResolvedBudget(
-        budget=8192, source=EffortSource.REASONING_EFFORT,
-        max_tokens_floor=16384, effort_label="high",
+        budget=8192,
+        source=EffortSource.REASONING_EFFORT,
+        max_tokens_floor=16384,
+        effort_label="high",
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
         _warn_if_max_tokens_below_floor(resolved, max_tokens=20000)

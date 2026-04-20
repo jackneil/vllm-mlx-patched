@@ -588,25 +588,36 @@ def test_dialect_parity_same_budget_same_output(spec: ModelSpec) -> None:
     MAX = 16384
 
     bodies = [
-        {"max_tokens": MAX, "temperature": 0.3,
-         "thinking_token_budget": 8192},
-        {"max_tokens": MAX, "temperature": 0.3,
-         "chat_template_kwargs": {
-             "thinking": {"type": "enabled", "budget_tokens": 8192}
-         }},
+        {"max_tokens": MAX, "temperature": 0.3, "thinking_token_budget": 8192},
+        {
+            "max_tokens": MAX,
+            "temperature": 0.3,
+            "chat_template_kwargs": {
+                "thinking": {"type": "enabled", "budget_tokens": 8192}
+            },
+        },
         {"max_tokens": MAX, "temperature": 0.3, "reasoning_effort": "high"},
-        {"max_tokens": MAX, "temperature": 0.3,
-         "chat_template_kwargs": {"output_config": {"effort": "high"}}},
+        {
+            "max_tokens": MAX,
+            "temperature": 0.3,
+            "chat_template_kwargs": {"output_config": {"effort": "high"}},
+        },
     ]
-    labels = ["top_level", "anthropic_thinking_enabled",
-              "openai_reasoning_effort", "output_config_effort"]
+    labels = [
+        "top_level",
+        "anthropic_thinking_enabled",
+        "openai_reasoning_effort",
+        "output_config_effort",
+    ]
     r_chars: list[int] = []
 
     for body, _label in zip(bodies, labels):
         body["model"] = spec.model
         body["messages"] = [{"role": "user", "content": PROMPT}]
         resp = requests.post(
-            f"{spec.url}/v1/chat/completions", json=body, timeout=_TIMEOUT_SEC,
+            f"{spec.url}/v1/chat/completions",
+            json=body,
+            timeout=_TIMEOUT_SEC,
         )
         resp.raise_for_status()
         msg = (resp.json().get("choices") or [{}])[0].get("message") or {}

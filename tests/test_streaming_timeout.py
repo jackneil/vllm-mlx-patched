@@ -95,7 +95,11 @@ def test_anthropic_stream_cap_emits_clean_tail_frames(patched_server):
     assert "message_delta" in body, f"missing message_delta; body: {body[-500:]}"
     # Find the delta event and inspect its JSON for stop_reason.
     delta_data_line = next(
-        (l for l in body_lines if l.startswith("data:") and '"message_delta"' in l),
+        (
+            line
+            for line in body_lines
+            if line.startswith("data:") and '"message_delta"' in line
+        ),
         None,
     )
     assert delta_data_line, "message_delta frame not found in body"
@@ -132,11 +136,11 @@ def test_openai_stream_cap_emits_length_finish(patched_server):
 
     # Find a chunk whose finish_reason is "length"
     found_length = False
-    for l in lines:
-        if not l.startswith("data:") or l.strip() == "data: [DONE]":
+    for line in lines:
+        if not line.startswith("data:") or line.strip() == "data: [DONE]":
             continue
         try:
-            payload = json.loads(l.split("data: ", 1)[1])
+            payload = json.loads(line.split("data: ", 1)[1])
         except (json.JSONDecodeError, IndexError):
             continue
         for choice in payload.get("choices", []):
@@ -181,9 +185,9 @@ def test_cap_zero_disables_cap(patched_server, monkeypatch):
 
     delta_data_line = next(
         (
-            l
-            for l in body.split("\n")
-            if l.startswith("data:") and '"message_delta"' in l
+            line
+            for line in body.split("\n")
+            if line.startswith("data:") and '"message_delta"' in line
         ),
         None,
     )
@@ -219,11 +223,11 @@ def test_openai_stream_cap_with_include_usage_emits_usage(patched_server):
 
     # Find a chunk whose payload has "usage" populated.
     usage_seen = False
-    for l in lines:
-        if not l.startswith("data:") or l.strip() == "data: [DONE]":
+    for line in lines:
+        if not line.startswith("data:") or line.strip() == "data: [DONE]":
             continue
         try:
-            payload = json.loads(l.split("data: ", 1)[1])
+            payload = json.loads(line.split("data: ", 1)[1])
         except (json.JSONDecodeError, IndexError):
             continue
         if payload.get("usage") is not None:
@@ -293,7 +297,11 @@ def test_anthropic_stream_cap_with_thinking_history_preservation(
     body = "\n".join(body_lines)
     assert "message_stop" in body
     delta_line = next(
-        (l for l in body_lines if l.startswith("data:") and '"message_delta"' in l),
+        (
+            line
+            for line in body_lines
+            if line.startswith("data:") and '"message_delta"' in line
+        ),
         None,
     )
     assert delta_line
@@ -378,11 +386,11 @@ def test_openai_cap_with_tool_calls_emits_tool_calls_finish(patched_server, monk
     # invariant is "some final chunk emits a stop reason so the client
     # sees clean termination."
     terminal_reasons = set()
-    for l in lines:
-        if not l.startswith("data:") or l.strip() == "data: [DONE]":
+    for line in lines:
+        if not line.startswith("data:") or line.strip() == "data: [DONE]":
             continue
         try:
-            payload = json.loads(l.split("data: ", 1)[1])
+            payload = json.loads(line.split("data: ", 1)[1])
         except (json.JSONDecodeError, IndexError):
             continue
         for choice in payload.get("choices", []):

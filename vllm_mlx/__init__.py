@@ -12,6 +12,13 @@ Features:
 - Support for LLM and multimodal models
 """
 
+import os as _os
+
+# AGX Compute Data Master watchdog workaround (ml-explore/mlx#3267, wontfix).
+# Must be set before MLX imports so the Metal driver picks it up at init.
+# See docs/testing/2026-04-19-metal-innocent-victim-concurrent-mlx-lm-training.md.
+_os.environ.setdefault("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1")
+
 __version__ = "0.2.5"
 
 # All imports are lazy to allow usage on non-Apple Silicon platforms

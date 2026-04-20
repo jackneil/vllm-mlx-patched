@@ -320,9 +320,26 @@ curl http://localhost:8000/health
 # Should show: "model_type": "mllm"
 ```
 
+### Apple Silicon GPU watchdog (`AGX_RELAX_CDM_CTXSTORE_TIMEOUT`)
+
+Apple's AGX GPU firmware has a Compute Data Master context-store timeout that can fire under heavy Metal compute load (concurrent MLX processes, long-context SDPA prefill, MLX training running alongside a serving fleet). When it fires, the kernel discards every in-flight Metal command buffer system-wide — killing every MLX process with a buffer in flight (not just the process the watchdog attributes the stall to).
+
+**vllm-mlx-patched sets `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` automatically** at package import in `vllm_mlx/__init__.py`, which is the upstream-recommended workaround from [ml-explore/mlx#3267](https://github.com/ml-explore/mlx/issues/3267) (MLX maintainer closed as `wontfix` — this is OS-controlled behavior, no MLX-side fix possible). You don't need to do anything for vllm-mlx processes.
+
+**You should set it yourself for other MLX processes on the same box.** If you run `mlx_lm.lora`, `mlx-vlm`, `mlx-audio`, or ad-hoc `python -m mlx_*` commands alongside vllm-mlx, set it in their launch environment too:
+
+```bash
+export AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1
+python -m mlx_lm.lora --config train.yaml
+```
+
+Without this env var on all MLX processes, the watchdog will fire on the unprotected process's dispatch and still take every other MLX process down with it as a collateral discard.
+
+See [docs/testing/2026-04-19-metal-innocent-victim-concurrent-mlx-lm-training.md](docs/testing/2026-04-19-metal-innocent-victim-concurrent-mlx-lm-training.md) for the full diagnostic trail (kernel gpuEvent reports, 12 matching crashes across two days, upstream issue cross-references).
+
 ### Long Context Patch (mlx-vlm)
 
-Gemma 3's default `sliding_window=1024` limits context to ~10K tokens on Apple Silicon (Metal GPU timeout at higher context). To enable longer context (up to ~50K tokens), patch mlx-vlm:
+Gemma 3's default `sliding_window=1024` limits context to ~10K tokens on Apple Silicon (Metal GPU timeout at higher context — same AGX watchdog as above, triggered on the long attention dispatch). To enable longer context (up to ~50K tokens), patch mlx-vlm:
 
 **Location:** `~/.../site-packages/mlx_vlm/models/gemma3/language.py`
 

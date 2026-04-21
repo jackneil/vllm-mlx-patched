@@ -385,7 +385,15 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
 
 
 def _dequantize_cache(cache: list[Any]) -> list[Any]:
-    """Dequantize QuantizedKVCache layers back to regular KVCache."""
+    """Dequantize QuantizedKVCache layers back to regular KVCache.
+
+    After dequantize, slice the keys/values down to ``offset`` so readers
+    that bypass ``offset`` (e.g. Gemma 4 KV-shared layers reading
+    cache.state directly, Qwen3 kickoff on supersequence matches) cannot
+    see stale tokens from a previous owner of the buffer. Mirrors the
+    plain-KVCache slice in ``_trim_cache_offset`` —
+    waybarrios/vllm-mlx#384, jackneil/vllm-mlx-patched#29.
+    """
     import mlx.core as mx
     from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
@@ -400,6 +408,14 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
             result.append(kv)
         else:
             result.append(layer)

@@ -552,3 +552,47 @@ def test_acquire_release_multiple_requests_independent():
 
     cache.release("req-B")
     assert cache.clear() is True
+
+
+def test_compute_model_fingerprint_is_deterministic_and_config_sensitive():
+    """#29 — fingerprint helper must (1) round-trip identically for the same
+    config and (2) differ when any of the load-bearing config attrs change.
+    """
+    from vllm_mlx.memory_cache import _compute_model_fingerprint
+
+    def _mk(**overrides):
+        cfg = MagicMock()
+        defaults = dict(
+            num_hidden_layers=28,
+            hidden_size=1024,
+            vocab_size=151936,
+            num_key_value_heads=8,
+            head_dim=128,
+            intermediate_size=3072,
+            model_type="qwen3",
+        )
+        defaults.update(overrides)
+        for k, v in defaults.items():
+            setattr(cfg, k, v)
+        m = MagicMock()
+        m.config = cfg
+        return m
+
+    base = _compute_model_fingerprint(_mk())
+    assert isinstance(base, str) and len(base) == 16
+    # Same config -> same fingerprint.
+    assert _compute_model_fingerprint(_mk()) == base
+    # Each of these MUST flip the fingerprint.
+    for field in (
+        "num_hidden_layers",
+        "hidden_size",
+        "vocab_size",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "model_type",
+    ):
+        other_val = "xxx" if field == "model_type" else 9999
+        assert _compute_model_fingerprint(_mk(**{field: other_val})) != base, (
+            f"fingerprint should differ when {field} changes"
+        )

@@ -39,6 +39,9 @@ _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
+# Bump this when the cache on-disk format or KV semantics change.
+# Loading a cache with a different version is rejected automatically.
+_CACHE_PERSIST_VERSION = 3
 
 
 def _get_available_memory() -> int:
@@ -420,6 +423,46 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
         else:
             result.append(layer)
     return result
+
+
+def _compute_model_fingerprint(model: Any) -> str:
+    """Compute a fingerprint from model architecture for cache compatibility.
+
+    Used to reject disk-persisted caches created by a different model or a
+    different quantisation of the same model. The fingerprint is a short
+    hex digest of (num_hidden_layers, hidden_size, vocab_size,
+    num_key_value_heads, head_dim, intermediate_size, model_type) —
+    lightweight and deterministic.
+
+    Ported from waybarrios/vllm-mlx#365, commit 01261c1.
+    """
+    import hashlib
+
+    cfg = None
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    if cfg is None:
+        cfg = model
+
+    parts: list[str] = []
+    for key in (
+        "num_hidden_layers",
+        "hidden_size",
+        "vocab_size",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "model_type",
+    ):
+        val = getattr(cfg, key, None)
+        if val is not None:
+            parts.append(f"{key}={val}")
+
+    fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
+    return fingerprint
 
 
 class MemoryAwarePrefixCache:

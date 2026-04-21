@@ -65,6 +65,44 @@ class TestTrimCacheOffset:
         # Source entry untouched.
         assert qcache.offset == 128
 
+    def test_fetch_returns_sliced_cache_on_lcp_match(self):
+        """End-to-end: MemoryAwarePrefixCache.fetch on a request that shares
+        only a prefix with a longer stored entry must return a cache whose
+        arrays are already sliced. This is the full regression of #29
+        above the unit level.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        model = MagicMock()
+        pc = MemoryAwarePrefixCache(
+            model, MemoryCacheConfig(max_memory_mb=64, max_entries=10)
+        )
+
+        stored_layer = KVCache()
+        shared = mx.ones((1, 2, 60, 4), dtype=mx.float32)
+        private = mx.full((1, 2, 60, 4), 7.0, dtype=mx.float32)
+        stored_layer.keys = mx.concatenate([shared, private], axis=2)
+        stored_layer.values = stored_layer.keys
+        stored_layer.offset = 120
+        pc.store(list(range(1, 121)), [stored_layer])
+
+        new_tokens = list(range(1, 60)) + [999, 1000, 1001]
+        fetched, remaining = pc.fetch(new_tokens)
+
+        assert fetched is not None
+        tc = fetched[0]
+        assert tc.offset == 59
+        assert tc.keys.shape[-2] == 59
+        # The 7.0 private content from the stored entry must NOT be visible.
+        assert float(mx.max(tc.keys).item()) == 1.0
+        assert remaining == [999, 1000, 1001]
+        # Source entry unaffected (fetched is a new wrapper over sliced arrays).
+        assert stored_layer.keys.shape[-2] == 120
+        assert stored_layer.offset == 120
+
 
 class TestDequantizeCacheSlice:
     """Regression tests for _dequantize_cache slicing after dequantization.

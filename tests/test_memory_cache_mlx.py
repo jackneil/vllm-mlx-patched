@@ -103,6 +103,41 @@ class TestTrimCacheOffset:
         assert stored_layer.keys.shape[-2] == 120
         assert stored_layer.offset == 120
 
+    def test_rotating_kv_cache_slice_applies_but_type_stripped(self):
+        """RotatingKVCache has ``.offset`` and array-typed ``.keys`` so it
+        enters the KVCache branch of ``_trim_cache_offset`` (not the
+        catch-all else). The slice fix from #29 therefore applies — no
+        stale tokens past the trimmed offset — but a separate pre-existing
+        quirk is that the returned wrapper is a plain ``KVCache`` rather
+        than a ``RotatingKVCache``. Locking that in here so a future
+        refactor either preserves the type (fixing the pre-existing loss)
+        or fails this test loudly.
+
+        Tracking for proper RotatingKVCache handling (max_size / keep /
+        _idx preservation): follow-up PR, referencing
+        waybarrios/vllm-mlx#296 commit b61f57c.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        from vllm_mlx.memory_cache import _trim_cache_offset
+
+        layer = RotatingKVCache(max_size=128, keep=0)
+        layer.keys = mx.ones((1, 4, 128, 8), dtype=mx.float32)
+        layer.values = mx.ones((1, 4, 128, 8), dtype=mx.float32)
+        layer.offset = 128
+
+        trimmed = _trim_cache_offset([layer], 50)
+        tc = trimmed[0]
+
+        # Slice fix applies: shape matches new offset (the #29 invariant).
+        assert tc.offset == 78
+        assert tc.keys.shape[-2] == 78
+        # Pre-existing quirk: type-stripped to plain KVCache. When
+        # waybarrios/vllm-mlx#296 is ported, this may change to preserve
+        # RotatingKVCache — at which point update this assertion.
+        assert isinstance(tc, KVCache)
+
 
 class TestDequantizeCacheSlice:
     """Regression tests for _dequantize_cache slicing after dequantization.

@@ -288,9 +288,26 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             and not isinstance(layer_cache.keys, (list, tuple))
         ):
             tc = KVCache.__new__(KVCache)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice arrays down to new_offset rather than shrinking only
+            # the offset pointer. Sharing the oversized array across
+            # requests exposes stale tokens to paths that read
+            # cache.state directly — waybarrios/vllm-mlx#384,
+            # jackneil/vllm-mlx-patched#29.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
             trimmed.append(tc)
         else:
             trimmed.append(layer_cache)

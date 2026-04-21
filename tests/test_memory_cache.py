@@ -596,3 +596,85 @@ def test_compute_model_fingerprint_is_deterministic_and_config_sensitive():
         assert _compute_model_fingerprint(_mk(**{field: other_val})) != base, (
             f"fingerprint should differ when {field} changes"
         )
+
+
+def test_save_then_load_roundtrip_with_fingerprint(tmp_path):
+    """#29 — save-then-load roundtrip on an empty cache must succeed
+    (returns False for save-nothing, 0 for load-nothing) and must not
+    crash from the new version/fingerprint plumbing.
+    """
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+    model = MagicMock()
+    model.config = MagicMock(
+        num_hidden_layers=28,
+        hidden_size=1024,
+        vocab_size=151936,
+        num_key_value_heads=8,
+        head_dim=128,
+        intermediate_size=3072,
+        model_type="qwen3",
+    )
+    cache = MemoryAwarePrefixCache(
+        model, MemoryCacheConfig(max_memory_mb=8, max_entries=4)
+    )
+
+    d = str(tmp_path)
+    assert cache.save_to_disk(d) is False
+    assert cache.load_from_disk(d) == 0
+
+
+def test_load_rejects_older_version(tmp_path):
+    """#29 — a cache written with version<3 must be discarded on load."""
+    import json
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+    d = tmp_path
+    (d / "index.json").write_text(
+        json.dumps({"version": 2, "num_entries": 3, "entries": []})
+    )
+
+    model = MagicMock()
+    model.config = MagicMock(num_hidden_layers=1)
+    cache = MemoryAwarePrefixCache(model, MemoryCacheConfig(max_memory_mb=8))
+
+    assert cache.load_from_disk(str(d)) == 0
+
+
+def test_load_rejects_fingerprint_mismatch(tmp_path):
+    """#29 — a v3 cache whose fingerprint differs from current model's
+    must be rejected.
+    """
+    import json
+
+    from vllm_mlx.memory_cache import (
+        _CACHE_PERSIST_VERSION,
+        MemoryAwarePrefixCache,
+        MemoryCacheConfig,
+    )
+
+    d = tmp_path
+    (d / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": "deadbeefdeadbeef",
+                "num_entries": 0,
+                "entries": [],
+            }
+        )
+    )
+
+    model = MagicMock()
+    model.config = MagicMock(
+        num_hidden_layers=28,
+        hidden_size=1024,
+        vocab_size=151936,
+        num_key_value_heads=8,
+        head_dim=128,
+        intermediate_size=3072,
+        model_type="qwen3",
+    )
+    cache = MemoryAwarePrefixCache(model, MemoryCacheConfig(max_memory_mb=8))
+    assert cache.load_from_disk(str(d)) == 0

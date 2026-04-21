@@ -497,6 +497,7 @@ class MemoryAwarePrefixCache:
         """
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
+        self._model_fingerprint = _compute_model_fingerprint(model)
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1030,7 +1031,8 @@ class MemoryAwarePrefixCache:
             return False
 
         index = {
-            "version": 2,
+            "version": _CACHE_PERSIST_VERSION,
+            "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -1108,8 +1110,20 @@ class MemoryAwarePrefixCache:
             index = json.load(f)
 
         version = index.get("version", 1)
-        if version < 2:
-            logger.warning(f"[cache_persist] unsupported version {version}, skipping")
+        if version != _CACHE_PERSIST_VERSION:
+            logger.warning(
+                f"[cache_persist] version mismatch: disk={version} "
+                f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
+            )
+            return 0
+
+        disk_fp = index.get("model_fingerprint", "")
+        if disk_fp and disk_fp != self._model_fingerprint:
+            logger.warning(
+                f"[cache_persist] model fingerprint mismatch: "
+                f"disk={disk_fp} current={self._model_fingerprint}, "
+                f"discarding incompatible cache"
+            )
             return 0
 
         loaded = 0

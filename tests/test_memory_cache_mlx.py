@@ -37,3 +37,30 @@ class TestTrimCacheOffset:
         assert tc.offset == 60
         assert tc.keys.shape[-2] == 60
         assert tc.values.shape[-2] == 60
+
+    def test_quantized_kv_cache_offset_shrinks(self):
+        """Regression guard for the QuantizedKVCache branch of
+        _trim_cache_offset. Our fork's branch shrinks offset correctly
+        and preserves group_size/bits. The dequantize-time slice in a
+        later commit depends on this invariant being stable.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+        from vllm_mlx.memory_cache import _trim_cache_offset
+
+        base = KVCache()
+        base.keys = mx.ones((1, 4, 128, 64), dtype=mx.float32)
+        base.values = mx.ones((1, 4, 128, 64), dtype=mx.float32)
+        base.offset = 128
+        qcache = base.to_quantized(group_size=64, bits=8)
+
+        trimmed = _trim_cache_offset([qcache], 68)
+        tc = trimmed[0]
+
+        assert isinstance(tc, QuantizedKVCache)
+        assert tc.offset == 60
+        assert tc.group_size == qcache.group_size
+        assert tc.bits == qcache.bits
+        # Source entry untouched.
+        assert qcache.offset == 128

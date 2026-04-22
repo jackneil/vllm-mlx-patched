@@ -593,9 +593,9 @@ def test_compute_model_fingerprint_is_deterministic_and_config_sensitive():
         "model_type",
     ):
         other_val = "xxx" if field == "model_type" else 9999
-        assert _compute_model_fingerprint(_mk(**{field: other_val})) != base, (
-            f"fingerprint should differ when {field} changes"
-        )
+        assert (
+            _compute_model_fingerprint(_mk(**{field: other_val})) != base
+        ), f"fingerprint should differ when {field} changes"
 
 
 def test_save_then_load_roundtrip_with_fingerprint(tmp_path):

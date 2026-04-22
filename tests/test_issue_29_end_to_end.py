@@ -74,9 +74,7 @@ def test_issue_29_pre_fix_persisted_cache_is_discarded(tmp_path):
             {
                 "version": 2,
                 "num_entries": 5,
-                "entries": [
-                    {"index": i, "num_tokens": 50 + i} for i in range(5)
-                ],
+                "entries": [{"index": i, "num_tokens": 50 + i} for i in range(5)],
             }
         )
     )

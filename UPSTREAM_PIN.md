@@ -231,6 +231,40 @@ prevents pre-fix entries from silently contaminating a session. Pinned
 by `tests/test_memory_cache.py::test_load_rejects_older_version` and
 `test_load_rejects_fingerprint_mismatch`.
 
+### Added 2026-04-22: mlx_lm ArraysCache concurrent-prefill fix pin
+
+### Invariant 17: `mlx-lm` pin includes ArraysCache.extend batch-dim fix
+
+`pyproject.toml` MUST pin `mlx-lm` to a version >= 0.31.3 (first PyPI
+release to contain ml-explore/mlx-lm#1169 + #1177), OR to a git SHA
+descending from `3cd9a52df261edbcfd74ba8f72ca345380bb1bbd` on
+`ml-explore/mlx-lm` main. Pre-fix, `ArraysCache.extend` silently dropped
+the batch dimension when one side had a None slot — under concurrent
+heavy-payload serving of Qwen3.5/3.6-35B-A3B, Qwen3-Next, and other
+hybrid-cache models (Gated-DeltaNet + full-attn), this surfaced as
+degenerate zero-token responses and deterministic deadlocks
+(`message_start` then no content, client timeout at 30s). Gemma 4 was
+unaffected because it routes through the MLLM scheduler path with a
+different cache (no `ArraysCache`).
+
+Pinned by:
+- `tests/test_mlx_lm_arrays_cache_concurrent.py` — unit sentinel on
+  `ArraysCache.extend` contract (runs on every CI, no model required).
+- `tests/test_qwen3_concurrent_heavy_payload.py` — end-to-end integration
+  test, gated by `QWEN3_CONCURRENT_TEST_URL` + `QWEN3_CONCURRENT_TEST_MODEL`
+  env vars (skipped by default in CI).
+- `[tool.uv] override-dependencies` in `pyproject.toml` — forces the git
+  pin even when the `[audio]` extra's `mlx-audio>=0.4.1` transitively
+  pins `mlx-lm==0.31.1`.
+
+When `mlx-lm 0.31.3` reaches PyPI AND `mlx-audio` releases a version
+permitting `mlx-lm>=0.31.3`, drop the `git+` URL and the `override-dependencies`
+entry and return to a plain `mlx-lm>=0.31.3` pin. Do NOT downgrade the
+sentinel test's `minimum = (0, 31, 3)` check.
+
+Reference: `docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`
+and `docs/superpowers/plans/2026-04-22-qwen3-concurrent-deadlock.md`.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

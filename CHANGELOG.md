@@ -10,10 +10,18 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ## Unreleased
 
-### Qwen3.x hybrid-cache concurrent-prefill fix (mlx-lm#1169 + #1177)
+### Qwen3.x hybrid-cache concurrent-prefill fix (mlx-lm#1169 + #1177) — PARTIAL
 
 - **#31** `fix(mlx-lm)`: pin to mlx-lm 0.31.3 (git SHA `3cd9a52d`) for the
-  ArraysCache.extend concurrent-prefill fix.
+  ArraysCache.extend concurrent-prefill fix. **Partial fix** — closes the
+  *homogeneous* concurrent-pair case; Claude Code's real-world
+  *heterogeneous* pair (heavy sonnet + light haiku at the same model)
+  still deadlocks on Qwen3.5/3.6-35B-A3B and is tracked under refined
+  hypothesis H1 (CB scheduler mispack of mixed-shape prefill batches)
+  in `docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`.
+  The heterogeneous case has an xfail integration test
+  (`tests/test_qwen3_concurrent_heavy_payload.py::test_heterogeneous_pair_current_failure_mode`)
+  which flips to a hard regression guard when the fix lands.
 - **Fix concurrent heavy-payload deadlock / degenerate-response on
   Qwen3.5-35B-A3B, Qwen3.6-35B-A3B, Qwen3-Next and other hybrid-cache
   models.** Bug doc: [`docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`](docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md).

@@ -12,6 +12,8 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ### Qwen3.x hybrid-cache concurrent-prefill fix (mlx-lm#1169 + #1177)
 
+- **#31** `fix(mlx-lm)`: pin to mlx-lm 0.31.3 (git SHA `3cd9a52d`) for the
+  ArraysCache.extend concurrent-prefill fix.
 - **Fix concurrent heavy-payload deadlock / degenerate-response on
   Qwen3.5-35B-A3B, Qwen3.6-35B-A3B, Qwen3-Next and other hybrid-cache
   models.** Bug doc: [`docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`](docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md).

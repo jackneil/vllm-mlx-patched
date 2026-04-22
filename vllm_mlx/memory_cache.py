@@ -39,6 +39,9 @@ _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
+# Bump this when the cache on-disk format or KV semantics change.
+# Loading a cache with a different version is rejected automatically.
+_CACHE_PERSIST_VERSION = 3
 
 
 def _get_available_memory() -> int:
@@ -288,9 +291,26 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             and not isinstance(layer_cache.keys, (list, tuple))
         ):
             tc = KVCache.__new__(KVCache)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice arrays down to new_offset rather than shrinking only
+            # the offset pointer. Sharing the oversized array across
+            # requests exposes stale tokens to paths that read
+            # cache.state directly — waybarrios/vllm-mlx#384,
+            # jackneil/vllm-mlx-patched#29.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
             trimmed.append(tc)
         else:
             trimmed.append(layer_cache)
@@ -368,7 +388,15 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
 
 
 def _dequantize_cache(cache: list[Any]) -> list[Any]:
-    """Dequantize QuantizedKVCache layers back to regular KVCache."""
+    """Dequantize QuantizedKVCache layers back to regular KVCache.
+
+    After dequantize, slice the keys/values down to ``offset`` so readers
+    that bypass ``offset`` (e.g. Gemma 4 KV-shared layers reading
+    cache.state directly, Qwen3 kickoff on supersequence matches) cannot
+    see stale tokens from a previous owner of the buffer. Mirrors the
+    plain-KVCache slice in ``_trim_cache_offset`` —
+    waybarrios/vllm-mlx#384, jackneil/vllm-mlx-patched#29.
+    """
     import mlx.core as mx
     from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
@@ -383,10 +411,58 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
             result.append(kv)
         else:
             result.append(layer)
     return result
+
+
+def _compute_model_fingerprint(model: Any) -> str:
+    """Compute a fingerprint from model architecture for cache compatibility.
+
+    Used to reject disk-persisted caches created by a different model or a
+    different quantisation of the same model. The fingerprint is a short
+    hex digest of (num_hidden_layers, hidden_size, vocab_size,
+    num_key_value_heads, head_dim, intermediate_size, model_type) —
+    lightweight and deterministic.
+
+    Ported from waybarrios/vllm-mlx#365, commit 01261c1.
+    """
+    import hashlib
+
+    cfg = None
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    if cfg is None:
+        cfg = model
+
+    parts: list[str] = []
+    for key in (
+        "num_hidden_layers",
+        "hidden_size",
+        "vocab_size",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "model_type",
+    ):
+        val = getattr(cfg, key, None)
+        if val is not None:
+            parts.append(f"{key}={val}")
+
+    fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
+    return fingerprint
 
 
 class MemoryAwarePrefixCache:
@@ -421,6 +497,7 @@ class MemoryAwarePrefixCache:
         """
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
+        self._model_fingerprint = _compute_model_fingerprint(model)
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -954,7 +1031,8 @@ class MemoryAwarePrefixCache:
             return False
 
         index = {
-            "version": 2,
+            "version": _CACHE_PERSIST_VERSION,
+            "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -1032,8 +1110,20 @@ class MemoryAwarePrefixCache:
             index = json.load(f)
 
         version = index.get("version", 1)
-        if version < 2:
-            logger.warning(f"[cache_persist] unsupported version {version}, skipping")
+        if version != _CACHE_PERSIST_VERSION:
+            logger.warning(
+                f"[cache_persist] version mismatch: disk={version} "
+                f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
+            )
+            return 0
+
+        disk_fp = index.get("model_fingerprint", "")
+        if disk_fp and disk_fp != self._model_fingerprint:
+            logger.warning(
+                f"[cache_persist] model fingerprint mismatch: "
+                f"disk={disk_fp} current={self._model_fingerprint}, "
+                f"discarding incompatible cache"
+            )
             return 0
 
         loaded = 0

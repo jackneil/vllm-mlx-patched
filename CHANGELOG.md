@@ -10,6 +10,14 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ## Unreleased
 
+### KV cache LCP contamination fix (issue #29)
+
+- **Fix `--continuous-batching` producing garbage on request 2+** ([#29](https://github.com/jackneil/vllm-mlx-patched/issues/29)) — sessions that loaded a persisted prefix cache could return degenerate repetitive output (`ongo`, `diễn`, ...) for the second and later requests. Root cause was twofold:
+  1. `_trim_cache_offset` and `_dequantize_cache` returned caches that shrank `.offset` but reused the over-sized source `keys`/`values` arrays. Attention paths that read `cache.state` directly (Gemma 4 KV-shared layers upstream, Qwen3 kickoff on supersequence matches in our fork) saw stale tokens from the previous owner of the buffer.
+  2. Disk-persisted entries from older fork versions had no consistency gate at load time.
+- Ports `waybarrios/vllm-mlx#385` (`9630c5d`, array-slice fix) and `waybarrios/vllm-mlx#365` (`01261c1`, persist-format v3 + model fingerprint). Existing caches at `~/.cache/vllm-mlx/prefix_cache/` auto-discarded and rebuilt on the next server start.
+- Regression coverage: `tests/test_memory_cache_mlx.py` (MLX-backed slice tests), `tests/test_memory_cache.py` (fingerprint helper + load gate), `tests/test_issue_29_end_to_end.py` (end-to-end lockdown).
+
 ### Qwen3 first-turn runaway mitigation
 
 - **Qwen3 first-turn runaway — three-layer defense shipped.** Qwen3.x models on first-turn-with-tools requests can enter an "interleaved thinking" trap — generating reasoning indefinitely without emitting `</think>`. Mitigations:

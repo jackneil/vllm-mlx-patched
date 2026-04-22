@@ -1,13 +1,21 @@
 # Qwen3.5 / Qwen3.6 35B-A3B: concurrent heavy-payload requests deadlock
 
-**Status:** TODO — concurrent-request shared-state bug, Qwen3.x-specific. PR #30 (issue #29) fixed KV-cache LCP contamination in the single-request path but did not cover the concurrent-prefill case.
-**Reported:** 2026-04-21, surfaced via `hank-secure-llm`'s `model_qa` harness run against post-PR-#30 `origin/main`.
+**Status:** PARTIAL FIX as of 2026-04-22 (build after 1f333f1) — **homogeneous** concurrent heavy pairs now pass in ~3.7s. **Heterogeneous** concurrent pairs (one heavy + one light) still deadlock on Qwen3.5/3.6; this is Claude Code's actual pattern (haiku tools=0 + sonnet tools=3 per scenario). Full fix still pending.
+**Reported:** 2026-04-21, refined 2026-04-22 after partial fix shipped. Surfaced via `hank-secure-llm`'s `model_qa` harness run.
 **Impact:** High for Claude Code users on Qwen-35B-A3B. Claude Code always fires haiku + sonnet requests in parallel on every scenario; both deadlock → every request times out. Single-request access works fine, so a naive single-curl test from a developer laptop masks the bug completely.
 **Scope:** `vllm_mlx/` — one of `StreamingThinkRouter` (`api/utils.py:240`), the continuous-batching scheduler `step()` (`scheduler.py:2588` or `mllm_scheduler.py:595`), or a sibling LCP-contamination path that PR #30's slice fix didn't cover.
 
-## Symptom
+## Symptom (refined 2026-04-22)
 
-Fire **two identical heavy-payload requests concurrently** at Qwen3.5-35B-A3B-4bit or Qwen3.6-35B-A3B-4bit — both hang after emitting only `message_start`. No chunks after that, no `content_block_start`, no `message_stop`. The backend's HTTP response is 200 with SSE content-type, TTFB ~10ms — so the upstream accepted the request and opened the stream, but no tokens are produced for either.
+The current trigger is **heterogeneous concurrent payloads** — one request with tools + large system prompt, one without, arriving within ~50ms. Both hang after emitting only `message_start`.
+
+After the partial fix (build post-1f333f1):
+- 1 request in isolation: ✅ ~2s
+- 2 concurrent **identical** heavy payloads: ✅ ~3.7s (homogeneous pair — **fixed**)
+- 2 concurrent **heterogeneous** payloads (heavy + light): ❌ **still hangs 30s+**
+- Same heterogeneous pair against Gemma-4-26b-a4b: ✅ 2.6s (unaffected)
+
+Claude Code's default behavior hits the remaining trigger: every scenario fires one haiku request (`tools=0`, minimal messages) plus one sonnet request (`tools=3`, full tool schemas + long system prompt) **concurrently** at the same model after proxy rewrite. The harness shows every Qwen scenario timing out even though bare single curls succeed. No chunks after that, no `content_block_start`, no `message_stop`. The backend's HTTP response is 200 with SSE content-type, TTFB ~10ms — so the upstream accepted the request and opened the stream, but no tokens are produced for either.
 
 - 1 request in isolation: completes in ~2s (`end_turn`, 2 output tokens), works fine.
 - 2 concurrent requests: **both hang** until connection timeout. Deterministic.
@@ -19,44 +27,63 @@ Stored at `docs/testing/claude-shape-heavy-payload.json` in this repo (~21 KB, ~
 
 The single-request **minimal** payload in `docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md` (no system prompt, no tools) works fine on the current build — that earlier runaway bug is fixed. This is a distinct, concurrency-only issue.
 
-## Reproduction
+## Reproduction (heterogeneous pair — current failure mode)
+
+Build a light payload (no tools, no cache_control system block) alongside the heavy one and fire them concurrently:
 
 ```bash
-# Fire two heavy curls in parallel. Both will hang 30s+.
-for i in 1 2; do
-  curl -sS -m 30 -N -o /tmp/c$i.sse -w "c$i HTTP %{http_code} t=%{time_total}s\n" \
+python3 -c "
+import json
+light = {
+    'model': 'mlx-community/Qwen3.6-35B-A3B-4bit',
+    'max_tokens': 200, 'stream': True,
+    'output_config': {'effort':'high'}, 'thinking':{'type':'adaptive'},
+    'messages': [{'role':'user','content':'Reply with OK'}],
+}
+json.dump(light, open('/tmp/shape-light.json','w'))
+"
+
+( curl -sS -m 30 -N -o /tmp/h1.sse -w "heavy t=%{time_total}s\n" \
     -X POST https://llm.hank.ai/v1/messages \
-    -H "Authorization: Bearer $NEURAL_ARENA_KEY" \
-    -H "Content-Type: application/json" \
-    -d @docs/testing/claude-shape-heavy-payload.json &
-done
+    -H "Authorization: Bearer $NEURAL_ARENA_KEY" -H "Content-Type: application/json" \
+    -d @docs/testing/claude-shape-heavy-payload.json ) &
+( curl -sS -m 30 -N -o /tmp/h2.sse -w "light t=%{time_total}s\n" \
+    -X POST https://llm.hank.ai/v1/messages \
+    -H "Authorization: Bearer $NEURAL_ARENA_KEY" -H "Content-Type: application/json" \
+    -d @/tmp/shape-light.json ) &
 wait
 
-# Check what each received:
-for i in 1 2; do
-  echo "c$i events: $(grep -c '^event:' /tmp/c$i.sse) stops: $(grep -c message_stop /tmp/c$i.sse)"
-done
+echo "heavy: $(grep -c '^event:' /tmp/h1.sse) events, $(grep -c message_stop /tmp/h1.sse) stops"
+echo "light: $(grep -c '^event:' /tmp/h2.sse) events, $(grep -c message_stop /tmp/h2.sse) stops"
 
-# Failing output (both hang):
-#   c1 HTTP 200 t=30.00s
-#   c2 HTTP 200 t=30.00s
-#   c1 events: 1 stops: 0
-#   c2 events: 1 stops: 0
+# Failing output (both hang, observed 2026-04-22):
+#   heavy t=30.00s   HTTP 200
+#   light t=30.00s   HTTP 200
+#   heavy: 1 events, 0 stops
+#   light: 1 events, 0 stops
 ```
 
-Run the same command swapping `d['model'] = 'mlx-community/gemma-4-26b-a4b-it-4bit'` — completes in ~4.8s, both 6 events + 2 `message_stop`s. Gemma is the control.
+Swap both `model` fields to `mlx-community/gemma-4-26b-a4b-it-4bit` — completes in ~2.6s with 6 events + 2 `message_stop`s each. Gemma is the control and remains unaffected.
+
+### Homogeneous pair — now passes (partial fix landed 2026-04-22)
+
+Running the same command with **both** requests pointing at `docs/testing/claude-shape-heavy-payload.json` (identical payloads) now completes in ~3.7s on Qwen3.5/3.6. That code path is resolved; the remaining bug is specifically about the two queued requests having **different shapes** (different `tools` count, different system block, different message length) at prefill time.
 
 The bug reproduces through any path that lets two concurrent requests hit vllm-mlx — arena's `/v1/messages` proxy is a dumb `httpx.AsyncClient.stream()` passthrough (verified in `hank_llm_arena/proxy.py:proxy_v1`, no concurrency guards).
 
-## Hypotheses for investigation
+## Hypotheses for investigation (refined after partial fix)
 
-**H1. `StreamingThinkRouter` shared state leak across concurrent requests.** `vllm_mlx/api/utils.py:240` — if router state (token accumulators, `<think>` detection position, end-gate flag) isn't strictly per-request, two concurrent Qwen streams could have one router's state poison the other's end-token detection, so both stall waiting for `</think>`. Matches symptom: `message_start` emits, then nothing.
+Since the partial fix resolved homogeneous pairs but not heterogeneous, the remaining bug is most likely in code that treats a batch of two same-shape requests correctly but mishandles a batch where shapes differ. Candidates:
 
-**H2. Continuous-batching scheduler (`scheduler.py:2588` `step()` or `mllm_scheduler.py:595`) mishandles concurrent prefills of large prompts.** Both requests enter prefill at nearly the same time. If the scheduler has a state field that isn't properly keyed per-request — or a serialized critical section that deadlocks when two large prefills are queued — both would stall before generating any token.
+**H1 (most likely). Continuous-batching prefill scheduler mispacks heterogeneous batches.** In `scheduler.py:2588` or `mllm_scheduler.py:595`'s `step()`, when two requests enter the prefill queue with very different token counts (e.g., heavy=4500 tokens vs light=30 tokens), the padding / slot allocation / attention mask construction for the mixed batch may be computing an incorrect sequence boundary. One request's tokens get masked away, it never gets to generate a logit, and its stream hangs. The other request may be stuck waiting on a shared step barrier.
 
-**H3. Prefix cache / LCP contamination path that PR #30's slice fix didn't cover.** PR #30 fixed the dequant + rotating KVCache trim branches in `vllm_mlx/memory_cache.py`. If a sibling code path (e.g., memory_cache write-back for concurrent allocations, or a CB-specific LCP fetch used only when batches > 1) still leaks, the second-arriving request could grab a corrupted cache view and never progress. PR #29 (`9630c5d`, upstream #384) covered Gemma-4 specifically — the Qwen equivalent may need the analogous fix.
+**H2. `StreamingThinkRouter` state-sharing specifically on mixed-length batches.** `vllm_mlx/api/utils.py:240`. If each request's router is a per-request instance but they share a tokenizer decode pipeline keyed by the batch index (not the request id), a mixed batch could route the wrong token stream into each router.
 
-**H4. Qwen3 reasoning parser (`vllm_mlx/reasoning/qwen3_parser.py`) loses its `</think>` detection mid-stream under concurrent input contexts.** Parser state is per-request in the happy path but might reference a shared tokenizer state or module-level cache. Under concurrent heavy prefills, the parser for both requests might stay in "thinking" mode indefinitely.
+**H3. Prefix cache LCP fetch incorrectly applied across requests with different prompts.** PR #30's fix sliced dequant + rotating KVCache trim. For a mixed batch, one request's prompt has no shared prefix with the other, but the CB LCP pass might still be computing a common prefix and serving stale tokens to one side. PR #384 (`9630c5d`) handled Gemma specifically; Qwen-3_5_moe has different attention group sizes and may hit a separate code path.
+
+**H4. Attention group / KV head sizing for Qwen3-MoE in mixed batches.** Qwen3-MoE has GQA with specific group counts. If the KV head packing / unpacking assumes uniform sequence length across a batch and the mixed-shape case computes an off-by-one slice, reads return garbage and generation stalls.
+
+The symptom (both requests stall at `message_start`, no tokens emitted) and the shape-sensitivity (same shape OK, different shape breaks) together strongly suggest H1 — a CB scheduler step that only proceeds when both concurrent requests reach some expected alignment that mixed-shape batches never satisfy.
 
 ## Observable signals while reproducing
 
@@ -68,14 +95,13 @@ During the hang, in `vllm-mlx` server logs look for:
 
 ## Success criteria for the fix
 
-This file should be kept in-repo and a regression test added. The new test must:
+This file should be kept in-repo and a regression test added. The new test must cover **three** concurrency shapes, not just one — the partial fix passed the homogeneous case but missed heterogeneous:
 
-1. Spin up a single Qwen3.5 or Qwen3.6 model in a local pytest fixture.
-2. Fire two concurrent POSTs to `/v1/messages` with the heavy payload (or a smaller functional equivalent that still triggers).
-3. Assert both complete within a budget (e.g., 15s) with `stop_reason: end_turn` and at least one `content_block_delta` each.
-4. Run the same test against Gemma-4-26b-a4b as a non-regression sanity (must also pass — ensures the fix doesn't regress continuous batching in general).
+1. **Heterogeneous concurrent pair** (primary — this is the open bug): one heavy request (~4.5k token system + 3 tools + `effort=high` + `thinking.adaptive`) and one light request (no system, no tools, `Reply OK` prompt) via `asyncio.gather` at the SAME model. Both must complete in <15s with `stop_reason: end_turn` and ≥1 `content_block_delta` each.
+2. **Homogeneous heavy pair** (regression guard for the partial fix): two identical heavy requests. Must still complete in <15s each.
+3. **Same tests against Gemma-4-26b-a4b** (cross-family non-regression): both homogeneous and heterogeneous pairs must complete — ensures the Qwen-specific fix doesn't regress CB for other families.
 
-A shell-level equivalent that wraps the curl block above is acceptable, but a Python `httpx.AsyncClient` variant with both requests awaited via `asyncio.gather` is preferred — it lets the test log per-request state machine progression (router id, cache slab id, scheduler queue position) for diagnostic value if a future regression appears.
+A Python `httpx.AsyncClient` variant is preferred — it lets the test log per-request state machine progression (`router_id`, `kv_cache_slab_id`, `scheduler_queue_position`, and crucially the batch slot assignment + prefill sequence boundaries) for diagnostic value. Because the partial fix slipped through with only the homogeneous case covered, the new test should explicitly name the heterogeneous case and assert both requests made forward progress independently (not just one of them).
 
 ## Why this was hard to catch
 

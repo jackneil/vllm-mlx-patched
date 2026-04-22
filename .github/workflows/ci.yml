@@ -131,6 +131,8 @@ jobs:
             tests/test_simple_engine.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
+            tests/test_mlx_lm_arrays_cache_concurrent.py \
+            tests/test_mlx_lm_api_contract.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pytest configuration and shared fixtures."""
 
+import os
+
 import pytest
 
 
@@ -39,11 +41,32 @@ def pytest_collection_modifyitems(config, items):
             if "slow" in item.keywords:
                 item.add_marker(skip_slow)
 
-    # Skip integration tests unless server URL is explicitly provided
-    skip_integration = pytest.mark.skip(reason="Integration tests require --server-url")
-    for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip_integration)
+    # Skip integration tests unless activated — tests opt out of the blanket
+    # skip when their own body fixture (e.g. ``_skip_if_not_configured``) can
+    # decide whether to run based on env vars, by not declaring ``--server-url``
+    # as their activation mechanism. In practice, we skip by default and let
+    # env-var-gated tests (``QWEN3_CONCURRENT_TEST_URL``, etc.) or an explicit
+    # ``--server-url`` opt in.
+    server_url_provided = config.getoption("--server-url") != "http://localhost:8000"
+    env_integration_activated = any(
+        os.environ.get(var)
+        for var in (
+            "QWEN3_CONCURRENT_TEST_URL",
+            "THINKING_BUDGET_TEST_MODEL",
+            "VLLM_MLX_INTEGRATION_MODEL",
+            "VLLM_MLX_INTEGRATION",
+        )
+    )
+    if not (server_url_provided or env_integration_activated):
+        skip_integration = pytest.mark.skip(
+            reason=(
+                "Integration tests require --server-url or an env-var activation "
+                "(e.g. QWEN3_CONCURRENT_TEST_URL, THINKING_BUDGET_TEST_MODEL)"
+            )
+        )
+        for item in items:
+            if "integration" in item.keywords:
+                item.add_marker(skip_integration)
 
 
 @pytest.fixture(scope="session")

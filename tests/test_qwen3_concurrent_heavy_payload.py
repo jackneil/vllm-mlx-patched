@@ -15,37 +15,46 @@ degenerate zero-token responses under concurrent heavy-payload load.
 
 Pre-fix symptom (mlx_lm 0.31.2 and earlier):
     - 8 concurrent unique prefixes → all complete in ~0.8s with
-      ``content_block_delta`` count == 0 and ``completion=0 tokens``
-      logged server-side. Degenerate output per mlx-lm#1169's
-      "neighbour's conv/SSM state contamination" description.
+      ``content_block_delta`` count == 0, ``completion=0 tokens``
+      logged server-side, and ``output_tokens == 0`` in the usage
+      block. Degenerate output per mlx-lm#1169's "neighbour's
+      conv/SSM state contamination" description.
 
 Post-fix behaviour (mlx_lm 0.31.3+):
     - 8 concurrent unique prefixes → all complete in 10-25s with
-      proper ``content_block_delta`` events and non-zero output tokens.
+      proper ``content_block_delta`` events, non-zero ``output_tokens``,
+      and a well-defined ``stop_reason`` (``end_turn`` / ``tool_use`` /
+      ``max_tokens``).
 
 Run explicitly (requires a live vllm-mlx server on a reachable URL)::
 
-    # Start the server:
-    vllm-mlx serve mlx-community/Qwen3.5-35B-A3B-4bit \\
+    # Start the server (uses the same model ID as the bug-doc fixture):
+    vllm-mlx serve mlx-community/Qwen3.6-35B-A3B-4bit \\
         --host 127.0.0.1 --port 19001 --continuous-batching \\
         --enable-auto-tool-choice --tool-call-parser qwen3 \\
         --reasoning-parser qwen3 --max-thinking-token-budget 2048
 
     # Run:
     QWEN3_CONCURRENT_TEST_URL=http://127.0.0.1:19001 \\
-    QWEN3_CONCURRENT_TEST_MODEL=mlx-community/Qwen3.5-35B-A3B-4bit \\
+    QWEN3_CONCURRENT_TEST_MODEL=mlx-community/Qwen3.6-35B-A3B-4bit \\
         pytest tests/test_qwen3_concurrent_heavy_payload.py -m integration -v
+
+Substitute ``Qwen3.5-35B-A3B-4bit`` freely — both were verified on the
+original repro. Any hybrid-cache model (uses ArraysCache for
+linear-attn / Gated-DeltaNet layers) reproduces the bug class.
 
 Optional env knobs:
     QWEN3_CONCURRENT_TEST_CONCURRENCY=8  # default; 2 is insufficient to
-                                         # force concurrent prefill on a
-                                         # cold cache
+                                         # reliably force concurrent prefill
+                                         # on a cold cache. Values below 2
+                                         # are rejected.
     QWEN3_CONCURRENT_TEST_TIMEOUT_S=60   # per-request curl-style budget
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import uuid
@@ -67,13 +76,21 @@ _HEAVY_PAYLOAD = (
     / "claude-shape-heavy-payload.json"
 )
 
+_VALID_STOP_REASONS = {"end_turn", "tool_use", "max_tokens", "stop_sequence"}
+
 
 def _skip_if_not_configured() -> None:
     if not URL or not MODEL:
         pytest.skip(
             "Set QWEN3_CONCURRENT_TEST_URL=http://host:port and "
-            "QWEN3_CONCURRENT_TEST_MODEL=mlx-community/Qwen3.5-35B-A3B-4bit "
+            "QWEN3_CONCURRENT_TEST_MODEL=mlx-community/Qwen3.6-35B-A3B-4bit "
             "(or another hybrid-cache model) to run."
+        )
+    if CONCURRENCY < 2:
+        pytest.skip(
+            f"QWEN3_CONCURRENT_TEST_CONCURRENCY={CONCURRENCY} is below 2; "
+            "the bug requires at least 2 concurrent requests to exercise "
+            "batched prefill. Set >=2 (default 8) to run."
         )
     if not _HEAVY_PAYLOAD.exists():
         pytest.skip(f"Heavy payload fixture missing: {_HEAVY_PAYLOAD}")
@@ -86,41 +103,55 @@ def _load_base_payload() -> dict:
     return base
 
 
-def _unique_payload(idx: int, base: dict) -> dict:
-    """Return a deep-copied payload with a unique user-message prefix.
+def _inject_nonce(payload: dict, idx: int) -> dict:
+    """Return a deep-copied payload with a unique-per-request nonce injected
+    into BOTH the system prompt and the user message.
 
-    The bug reproduces only when requests don't share prefix-cache
-    entries — so we inject a unique nonce into the first content
-    block's text. Identical prompts get deduped on the second-arriving
-    request and don't force concurrent prefill.
+    The bug reproduces only when concurrent requests don't share a prefix
+    in the KV cache — otherwise the second-arriving request hits cache
+    dedup and doesn't enter the concurrent-prefill window. The fixture's
+    system prompt is ~20k chars of shared text, so injecting the nonce
+    into ONLY the user message (a 39-char suffix) lets most of the
+    prefill share. Inject into BOTH to guarantee divergence at token 0.
     """
-    d = json.loads(json.dumps(base))
+    d = copy.deepcopy(payload)
     nonce = uuid.uuid4().hex
-    msg = d["messages"][0]
-    content = msg.get("content")
     tag = f"[req-{idx} nonce={nonce}] "
-    if isinstance(content, list) and content:
-        block = content[0]
+
+    system = d.get("system")
+    if isinstance(system, list) and system:
+        block = system[0]
         if isinstance(block, dict) and "text" in block:
             block["text"] = tag + block["text"]
         else:
-            content.insert(0, {"type": "text", "text": tag})
+            system.insert(0, {"type": "text", "text": tag})
+    elif isinstance(system, str):
+        d["system"] = tag + system
     else:
-        msg["content"] = tag + str(content or "")
+        d["system"] = tag.rstrip()
+
+    if d.get("messages"):
+        msg = d["messages"][0]
+        content = msg.get("content")
+        if isinstance(content, list) and content:
+            block = content[0]
+            if isinstance(block, dict) and "text" in block:
+                block["text"] = tag + block["text"]
+            else:
+                content.insert(0, {"type": "text", "text": tag})
+        else:
+            msg["content"] = tag + str(content or "")
     return d
 
 
 async def _one_request(session, idx: int, payload: dict) -> dict:
     """Fire one streaming POST, accumulate events, return a per-request summary."""
-    import httpx
-
     summary = {
         "idx": idx,
         "http_status": None,
         "events": 0,
         "message_stop_count": 0,
         "content_block_delta_count": 0,
-        "total_bytes": 0,
         "stop_reason": None,
         "output_tokens": None,
         "exception": None,
@@ -137,12 +168,12 @@ async def _one_request(session, idx: int, payload: dict) -> dict:
             async for line in resp.aiter_lines():
                 if not line:
                     continue
-                summary["total_bytes"] += len(line) + 1
                 if line.startswith("event:"):
                     summary["events"] += 1
-                    if "message_stop" in line:
+                    name = line.split(":", 1)[1].strip()
+                    if name == "message_stop":
                         summary["message_stop_count"] += 1
-                    elif "content_block_delta" in line:
+                    elif name == "content_block_delta":
                         summary["content_block_delta_count"] += 1
                 elif line.startswith("data:"):
                     blob = line[len("data:") :].strip()
@@ -159,29 +190,31 @@ async def _one_request(session, idx: int, payload: dict) -> dict:
                         usage = obj.get("usage") or {}
                         if "output_tokens" in usage:
                             summary["output_tokens"] = usage["output_tokens"]
-    except Exception as exc:  # noqa: BLE001 — test surfaces exception class + msg
-        summary["exception"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 — diagnostic surface
+        summary["exception"] = repr(exc)
     return summary
 
 
 @pytest.mark.asyncio
 async def test_concurrent_heavy_payload_produces_nonzero_output():
     """Regression lockdown: N concurrent unique-prefix heavy payloads must
-    each emit at least one content_block_delta and finish with end_turn.
+    each emit at least one content_block_delta, a positive output_tokens
+    count, a valid stop_reason, and a message_stop event.
 
     Pre-fix: all N complete in <1s with ``content_block_delta_count == 0``
-    and ``output_tokens == 0`` — the ``ArraysCache.extend`` batch-dim bug
-    corrupts conv/SSM state across concurrent prefills and the model
+    and ``output_tokens == 0`` — the ``ArraysCache.extend`` batch-dim
+    bug corrupts conv/SSM state across concurrent prefills and the model
     exits without generating anything usable.
 
-    Post-fix: each request emits proper streaming deltas and the
-    completion counter is positive.
+    Post-fix: each request emits proper streaming deltas, a non-zero
+    output-token count, and lands in one of the valid stop_reasons
+    ({``end_turn``, ``tool_use``, ``max_tokens``, ``stop_sequence``}).
     """
     _skip_if_not_configured()
     httpx = pytest.importorskip("httpx")
 
     base = _load_base_payload()
-    payloads = [_unique_payload(i, base) for i in range(1, CONCURRENCY + 1)]
+    payloads = [_inject_nonce(base, idx=i) for i in range(1, CONCURRENCY + 1)]
 
     async with httpx.AsyncClient() as session:
         results = await asyncio.gather(
@@ -192,18 +225,32 @@ async def test_concurrent_heavy_payload_produces_nonzero_output():
     failures: list[str] = []
     for r in results:
         if r["exception"]:
-            failures.append(f"req-{r['idx']}: raised {r['exception']}")
+            failures.append(
+                f"req-{r['idx']}: raised {r['exception']} "
+                f"(http_status={r['http_status']})"
+            )
             continue
         if r["http_status"] != 200:
             failures.append(f"req-{r['idx']}: HTTP {r['http_status']}")
             continue
+        # Both axes: delta events AND non-zero output_tokens. Pre-fix had
+        # 0 for both; a hypothetical partial regression (deltas but no
+        # usage) should also flag.
         if r["content_block_delta_count"] < 1:
             failures.append(
                 f"req-{r['idx']}: ZERO content_block_delta events "
                 f"(events={r['events']}, output_tokens={r['output_tokens']}, "
-                f"stop_reason={r['stop_reason']}, bytes={r['total_bytes']}). "
+                f"stop_reason={r['stop_reason']}). "
                 "This is the pre-fix mlx_lm#1169 regression — "
                 "ArraysCache.extend corrupted batch-dim under concurrent prefill."
+            )
+            continue
+        if not r["output_tokens"] or r["output_tokens"] < 1:
+            failures.append(
+                f"req-{r['idx']}: output_tokens={r['output_tokens']} (expected >=1); "
+                f"events={r['events']}, stop_reason={r['stop_reason']}. "
+                "Server reported the stream completed but produced no billable "
+                "output — matches the pre-fix concurrent-prefill degenerate path."
             )
             continue
         if r["message_stop_count"] < 1:
@@ -212,9 +259,11 @@ async def test_concurrent_heavy_payload_produces_nonzero_output():
                 f"(events={r['events']}, stop_reason={r['stop_reason']})"
             )
             continue
-        if r["stop_reason"] not in (None, "end_turn", "tool_use", "max_tokens"):
+        if r["stop_reason"] not in _VALID_STOP_REASONS:
             failures.append(
-                f"req-{r['idx']}: unexpected stop_reason {r['stop_reason']!r}"
+                f"req-{r['idx']}: stop_reason {r['stop_reason']!r} not in "
+                f"{sorted(_VALID_STOP_REASONS)}. "
+                "Expected a valid Anthropic stop_reason."
             )
 
     assert not failures, (
@@ -223,5 +272,9 @@ async def test_concurrent_heavy_payload_produces_nonzero_output():
         + "\n  ".join(failures)
         + f"\n\nModel under test: {MODEL}\nTarget URL: {URL}\n"
         "See docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md"
-        " and docs/superpowers/plans/2026-04-22-qwen3-concurrent-deadlock.md."
+        " and docs/superpowers/plans/2026-04-22-qwen3-concurrent-deadlock.md.\n"
+        "Scope note: this test exercises the ArraysCache.extend path "
+        "(concurrent prefill under --continuous-batching). It does NOT "
+        "cover MemoryAwarePrefixCache.fetch shared-reference hazards or "
+        "the scheduler cross-thread race — see plan Phase 1 H2/H3."
     )

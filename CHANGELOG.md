@@ -34,11 +34,17 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
   When mlx-lm 0.31.3 reaches PyPI and mlx-audio releases a compatible
   version, drop the git URL and the override entry.
 - **Regression coverage:** `tests/test_mlx_lm_arrays_cache_concurrent.py`
-  (6 sentinel tests — pass on 0.31.3, 4 of 6 fail on 0.31.2, catches
-  both the #1169 padding fix and #1177 "capture batch sizes before cat
-  loop" fix); `tests/test_qwen3_concurrent_heavy_payload.py` (live-server
-  integration test gated by `QWEN3_CONCURRENT_TEST_URL` + `QWEN3_CONCURRENT_TEST_MODEL`
-  env vars, reuses `docs/testing/claude-shape-heavy-payload.json`).
+  (7 behavioral sentinels covering BOTH regression vectors separately —
+  5 of 7 fail on mlx-lm 0.31.2 (catches vector #1169 and #1177 together),
+  2 of 7 fail on post-#1169-pre-#1177 intermediate SHAs
+  (catches vector #1177 alone — previously undetected by version-string
+  checks since mlx-lm bumped `__version__` to "0.31.3" before either
+  fix landed). Added to `.github/workflows/ci.yml` `test-apple-silicon`
+  job so the sentinel actually runs on PRs.
+  `tests/test_qwen3_concurrent_heavy_payload.py` (live-server
+  integration test gated by `QWEN3_CONCURRENT_TEST_URL` +
+  `QWEN3_CONCURRENT_TEST_MODEL` env vars; injects nonces into BOTH
+  system and user blocks to force concurrent prefill).
 - **UPSTREAM_PIN.md invariant 17** added to pin the dependency floor
   and document the drop-back path for when a PyPI release ships.
 - **Verification (on this fork's main at 1f333f1):** isolated test

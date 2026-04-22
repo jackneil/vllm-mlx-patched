@@ -47,6 +47,15 @@ If this file fails after an mlx_lm rebase or downgrade, stop — do not
 merge. The concurrent-prefill deadlock regresses silently (no test
 failure in the basic prompt-cache suite; symptom only surfaces under
 concurrent load on hybrid models in production).
+
+**Scope limit:** these tests bind the #1177 contract on exactly two
+post-listcomp ``cat`` targets — ``self.left_padding`` and
+``self.lengths``. If a future mlx_lm refactor adds another post-loop
+line of the shape ``self.X = cat(self.X, other.X)`` where the closure
+reads ``self.batch_size``, a #1177-class regression on ``X`` would
+slip past the sentinel. When rebasing, grep
+``mlx_lm/models/cache.py`` for new post-``self.cache`` assignments
+inside ``ArraysCache.extend`` and extend this file accordingly.
 """
 
 from __future__ import annotations
@@ -152,6 +161,17 @@ class TestArraysCacheExtendBatchDim:
         Same contract as the previous test but with `a` as the None side.
         Mirrors the symmetric case in the bug and catches half-fixes that
         only handle one direction.
+
+        Note on #1177 coverage: the ``left_padding`` assertion below does
+        NOT discriminate #1177 in this construction — the post-loop
+        ``cat(a.left_padding=zeros((3,)), b.left_padding=None)`` fires
+        the ``b is None`` branch, which pads using ``other.batch_size``.
+        Since ``other.cache`` is not mutated by the listcomp,
+        ``other.batch_size`` stays stable pre- and post-#1177, so shape
+        equals ``a_batch + b_batch = 5`` in both. The #1177 coverage
+        lives in ``test_arrays_cache_extend_fixes_vector_1177_via_left_padding``
+        (which forces the symmetric ``a is None`` branch). Left here as a
+        basic-contract sanity check.
         """
         a = ArraysCache(4)
         # Give `a` a non-trivial batch_size via left_padding.
@@ -164,11 +184,10 @@ class TestArraysCacheExtendBatchDim:
                 f"slot {slot}: batch dim should be 5 (a_batch=3 + b_batch=2); "
                 f"got {arr.shape[0]}. Regression of mlx_lm#1169."
             )
-        # left_padding: cat(zeros((3,)), None) — b.batch_size captured
-        # BEFORE mutation should be 2 (from b.cache[0]), yielding shape (5,).
+        # left_padding basic-shape sanity — see docstring note on coverage scope.
         assert a.left_padding.shape == (3 + 2,), (
             f"left_padding.shape should be (5,) but got {a.left_padding.shape}. "
-            "Regression of mlx_lm#1177."
+            "Basic shape-contract failure (not a #1177 discriminator — see docstring)."
         )
 
     def test_empty_by_empty_stays_empty(self):

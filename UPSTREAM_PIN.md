@@ -178,6 +178,59 @@ Test guard: `tests/test_chat_template_kwargs_plumbing.py`. If ANY of the server�
 
 Additionally, `server._reasoning_parser_name` is a module attribute set from `args.reasoning_parser` at CLI bind time (`cli.py:~63-85`). Layer 1 reads this — NOT `engine._reasoning_parser_name` (which does not exist) — because Layer 1 needs the raw CLI string like `"qwen3"`, not the class instance on `server._reasoning_parser`.
 
+### Added 2026-04-21: issue #29 KV cache LCP contamination fix
+
+**Ported from `waybarrios/vllm-mlx`:**
+
+- `9630c5d` (#385, 2026-04-21) — `_trim_cache_offset` KVCache slice +
+  `_dequantize_cache` slice. Fixes stale-tokens-past-offset leak visible as
+  `ongo/diễn` garbage on Qwen3-0.6B supersequence-match kickoff and as
+  content bleed on Gemma 4 KV-shared layers upstream.
+
+- `01261c1` (#365, 2026-04-17) — `_CACHE_PERSIST_VERSION = 3` +
+  `_compute_model_fingerprint` + load-time gate. Discards pre-fix disk
+  caches that would otherwise contaminate a fresh session.
+
+Our fork's `_trim_cache_offset` has a different branch structure from
+upstream: upstream uses a `_QuantizedCacheWrapper`; we dispatch on the real
+`QuantizedKVCache` class. The plain-KVCache slice logic was ported
+verbatim; the QuantizedKVCache-specific slice in upstream's
+`_trim_cache_offset` is not applicable to our structure but we have a
+parallel slice in `_dequantize_cache` that covers the same leak.
+
+Additional discovery: RotatingKVCache falls into our KVCache branch of
+`_trim_cache_offset` (it has `.offset` and array `.keys`), so the slice
+fix covers it — but the returned wrapper is a plain `KVCache`, losing
+Rotating-specific attrs (`max_size`, `keep`, `_idx`). Pre-existing
+behaviour, not introduced here, locked down by a regression test at
+`tests/test_memory_cache_mlx.py::TestTrimCacheOffset::test_rotating_kv_cache_slice_applies_but_type_stripped`.
+
+**Deliberately NOT ported** (follow-up PR, not required for #29):
+
+- `09cc64e`, `b61f57c` (#296) — RotatingKVCache proper handling.
+- `d38b978` (#286) — 3D KV tensors in `prefix_cache.py` (paged/block-aware
+  tier; not active on text path that #29 exercised).
+- `5d93852` (#217) — hybrid recurrent state across blocks.
+
+### Invariant 15: `_trim_cache_offset` slices arrays to new offset (added 2026-04-21)
+
+`memory_cache._trim_cache_offset` MUST slice the `keys`/`values` arrays
+down to `new_offset` when returning a trimmed KVCache wrapper, not just
+shrink `.offset`. Sharing the oversized source array across requests
+exposes stale tokens to paths that read `cache.state` directly (Gemma 4
+KV-shared layers, Qwen3 kickoff on supersequence matches — issue #29).
+Pinned by `tests/test_memory_cache_mlx.py`.
+
+### Invariant 16: disk cache gated on version+fingerprint (added 2026-04-21)
+
+`memory_cache.MemoryAwarePrefixCache.save_to_disk` MUST record
+`_CACHE_PERSIST_VERSION` (currently 3) and `_compute_model_fingerprint`
+in the index. `load_from_disk` MUST reject entries whose version differs
+from current OR whose fingerprint differs from the current model's. This
+prevents pre-fix entries from silently contaminating a session. Pinned
+by `tests/test_memory_cache.py::test_load_rejects_older_version` and
+`test_load_rejects_fingerprint_mismatch`.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

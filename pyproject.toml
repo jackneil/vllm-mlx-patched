@@ -29,7 +29,12 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
+    # 0.31.3+ required for ArraysCache native batching on hybrid models (Qwen3.5/3.6-35B-A3B,
+    # Qwen3-Next, etc.). 0.31.3 is the first version containing ml-explore/mlx-lm#1169 +
+    # #1177, which fix the ArraysCache.extend() batch-dim bug that produced degenerate
+    # zero-token responses / deadlocks under concurrent heavy-payload serving. Pinned by
+    # UPSTREAM_PIN.md invariant #17. When 0.31.3 lands on PyPI this pin can drop the git URL.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@3cd9a52df261edbcfd74ba8f72ca345380bb1bbd",
     "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
@@ -136,3 +141,15 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
+
+[tool.uv]
+# Force mlx-lm to resolve to the git SHA that contains the ArraysCache.extend
+# batch-dim fix (ml-explore/mlx-lm#1169 + #1177, merged 2026-04-21; shipped as
+# 0.31.3 on mlx-lm main). Needed because the [audio] extra's mlx-audio>=0.4.1
+# transitively pins mlx-lm==0.31.1, which reintroduces the concurrent-prefill
+# bug described in UPSTREAM_PIN.md invariant #17. When mlx-lm 0.31.3 lands on
+# PyPI and mlx-audio releases a version that permits >=0.31.3, drop this
+# override and return to a plain version pin in [project.dependencies].
+override-dependencies = [
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@3cd9a52df261edbcfd74ba8f72ca345380bb1bbd",
+]

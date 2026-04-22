@@ -10,6 +10,60 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ## Unreleased
 
+### Qwen3.x hybrid-cache concurrent-prefill fix (mlx-lm#1169 + #1177) — PARTIAL
+
+- **#31** `fix(mlx-lm)`: pin to mlx-lm 0.31.3 (git SHA `3cd9a52d`) for the
+  ArraysCache.extend concurrent-prefill fix. **Partial fix** — closes the
+  *homogeneous* concurrent-pair case; Claude Code's real-world
+  *heterogeneous* pair (heavy sonnet + light haiku at the same model)
+  still deadlocks on Qwen3.5/3.6-35B-A3B and is tracked under refined
+  hypothesis H1 (CB scheduler mispack of mixed-shape prefill batches)
+  in `docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`.
+  The heterogeneous case has an xfail integration test
+  (`tests/test_qwen3_concurrent_heavy_payload.py::test_heterogeneous_pair_current_failure_mode`)
+  which flips to a hard regression guard when the fix lands.
+- **Fix concurrent heavy-payload deadlock / degenerate-response on
+  Qwen3.5-35B-A3B, Qwen3.6-35B-A3B, Qwen3-Next and other hybrid-cache
+  models.** Bug doc: [`docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`](docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md).
+  Root cause lives entirely in mlx-lm, not this fork: `ArraysCache.extend`
+  silently dropped the batch dimension when one side had a None slot
+  (fresh, never-used per-sequence cache). Under `--continuous-batching`,
+  two concurrent prefills of large prompts would land in the same
+  `BatchGenerator`, the `extend` call would leave batch dimensions
+  mismatched across cache slots, and the downstream generation path
+  would see one sequence's conv/SSM state fed into the other's attention
+  layers — producing either degenerate zero-token responses (8-concurrent
+  unique-prefix repro) or indefinite stalls after `message_start`
+  (bug doc's original symptom via arena-proxied requests). Gemma 4 on CB
+  was unaffected because the Gemma-4 path routes through the MLLM
+  scheduler with `MLLMCacheManager`, not `ArraysCache`.
+- **Fix path:** port by pinning `mlx-lm` to `3cd9a52df261edbcfd74ba8f72ca345380bb1bbd`
+  on `ml-explore/mlx-lm` main (first SHA containing both #1169 and #1177).
+  `pyproject.toml` uses `[tool.uv] override-dependencies` because the
+  `[audio]` extra's `mlx-audio>=0.4.1` transitively pins `mlx-lm==0.31.1`.
+  When mlx-lm 0.31.3 reaches PyPI and mlx-audio releases a compatible
+  version, drop the git URL and the override entry.
+- **Regression coverage:** `tests/test_mlx_lm_arrays_cache_concurrent.py`
+  (7 behavioral sentinels covering BOTH regression vectors separately —
+  5 of 7 fail on mlx-lm 0.31.2 (catches vector #1169 and #1177 together),
+  2 of 7 fail on post-#1169-pre-#1177 intermediate SHAs
+  (catches vector #1177 alone — previously undetected by version-string
+  checks since mlx-lm bumped `__version__` to "0.31.3" before either
+  fix landed). Added to `.github/workflows/ci.yml` `test-apple-silicon`
+  job so the sentinel actually runs on PRs.
+  `tests/test_qwen3_concurrent_heavy_payload.py` (live-server
+  integration test gated by `QWEN3_CONCURRENT_TEST_URL` +
+  `QWEN3_CONCURRENT_TEST_MODEL` env vars; injects nonces into BOTH
+  system and user blocks to force concurrent prefill).
+- **UPSTREAM_PIN.md invariant 17** added to pin the dependency floor
+  and document the drop-back path for when a PyPI release ships.
+- **Verification (on this fork's main at 1f333f1):** isolated test
+  server on `:19001` with pre-fix 0.31.2 produced
+  `content_block_delta_count=0, completion=0 tokens` on 8 concurrent
+  unique-prefix heavy payloads; post-fix 0.31.3 produced
+  `content_block_delta_count=2, completion=2 tokens` per request.
+  Gemma-4-26b-a4b-it-4bit non-regression passed on 0.31.3.
+
 ### KV cache LCP contamination fix (issue #29)
 
 - **Fix `--continuous-batching` producing garbage on request 2+** ([#29](https://github.com/jackneil/vllm-mlx-patched/issues/29)) — sessions that loaded a persisted prefix cache could return degenerate repetitive output (`ongo`, `diễn`, ...) for the second and later requests. Root cause was twofold:

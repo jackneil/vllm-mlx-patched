@@ -326,31 +326,21 @@ async def test_homogeneous_heavy_pair_regression_guard():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Heterogeneous concurrent-pair deadlock on Qwen3.x hybrid-cache "
-        "models is STILL OPEN as of 2026-04-22. Refined hypothesis H1 "
-        "(CB scheduler mispack of mixed-shape prefill batches) is the "
-        "leading candidate — investigation pending. When the fix lands "
-        "and this starts passing, flip strict=True or remove the xfail "
-        "to turn this into a hard regression guard. See "
-        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md "
-        "Symptom (refined 2026-04-22) section."
-    ),
-)
 async def test_heterogeneous_pair_current_failure_mode():
-    """Current open-bug repro: one heavy + one light payload fired
-    concurrently at the SAME Qwen hybrid-cache model.
+    """Heterogeneous pair: one heavy + one light payload at the SAME Qwen
+    hybrid-cache model. Closed by PR #31 (mlx-lm 0.31.3 pin).
 
     This is Claude Code's real-world pattern: every scenario fires one
     haiku request (``tools=0``, minimal) plus one sonnet request
     (``tools=3``, full system + tool schemas) concurrently at the same
-    model after proxy rewrite. Both hang at ``message_start``.
+    model after proxy rewrite. Pre-PR-#31, both hung at ``message_start``
+    or produced ``!!!`` degenerate output via the mlx-lm#1169 middle-wave
+    neighbour state contamination path. Verified fixed via 10-pair burst
+    on mlx-lm 0.31.3 (20/20 requests pass with distinct proper output).
 
-    Marked xfail because the bug is known open. When the fix lands and
-    this starts passing, upgrade to a hard regression guard by removing
-    the xfail marker.
+    Kept as a hard regression guard — if the mlx-lm pin regresses below
+    0.31.3 (invariant #17) or the deployment env reverts, this will fail
+    loudly.
     """
     _skip_if_not_configured()
     httpx = pytest.importorskip("httpx")

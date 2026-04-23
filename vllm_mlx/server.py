@@ -113,7 +113,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
-from .metrics import streaming_cap_fired_total
+from .metrics import streaming_cap_fired_total, thinking_signature_emitted_total
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -2690,6 +2690,61 @@ def _detect_starts_thinking(
     from_start = suffix[last_start:]
     has_close = any(et in from_start for et in end_tokens)
     return not has_close
+
+
+def _emit_block_close(
+    block_type: str,
+    block_index: int,
+    thinking_buffer: list[str],
+) -> list[str]:
+    """Emit the close-event sequence for a content block of the given type.
+
+    Dispatches on block_type:
+    - "thinking" → two events: signature_delta (Anthropic extended-thinking
+      streaming spec) then content_block_stop on the same index. Clears
+      thinking_buffer in place.
+    - "text" → one bare content_block_stop event. thinking_buffer untouched.
+    - anything else → raises ValueError so new block types can't silently
+      drop the signature contract.
+
+    Invariant 13 (UPSTREAM_PIN.md): every thinking content block — streaming
+    or non-streaming — MUST carry a signature. Any new signable block type
+    added to the Anthropic adapter MUST be routed through this dispatcher.
+    """
+    if block_type == "thinking":
+        signature = compute_thinking_signature("".join(thinking_buffer))
+        if not thinking_buffer:
+            # Empty thinking buffer at close time — legal per spec (signature
+            # is REQUIRED regardless of content), but unusual. Log once so
+            # an operator can correlate unexpected SHA256-of-empty signatures
+            # (`vllm-mlx:e3b0c44298fc1c149afbf4c8996fb924`) back to the
+            # emitting request. INFO level (not WARN) — empty thinking is
+            # legal; WARN would trip ops alerts on a keyword match.
+            logger.info(
+                "[streaming-signature] closing thinking block idx=%d with "
+                "empty buffer; emitting empty-text signature",
+                block_index,
+            )
+        sig_event = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "signature_delta", "signature": signature},
+        }
+        stop_event = {"type": "content_block_stop", "index": block_index}
+        thinking_buffer.clear()
+        thinking_signature_emitted_total.inc()  # module-scope import, see Step 2.5
+        return [
+            f"event: content_block_delta\ndata: {json.dumps(sig_event)}\n\n",
+            f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n",
+        ]
+    if block_type == "text":
+        stop_event = {"type": "content_block_stop", "index": block_index}
+        return [f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"]
+    raise ValueError(
+        f"_emit_block_close: unhandled block_type={block_type!r}. "
+        "Any new signable Anthropic block type MUST be added to this "
+        "dispatcher. See UPSTREAM_PIN.md invariant 13."
+    )
 
 
 def _emit_content_pieces(

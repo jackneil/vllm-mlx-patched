@@ -29,6 +29,14 @@ class _Counter:
 # broken tokenizer, etc.). Alert on rate > 0 if budget is expected to work.
 thinking_budget_noop_total = _Counter("thinking_budget_noop_total")
 
+# Increments once per streaming Anthropic thinking-content-block close
+# (one per _emit_block_close call with block_type='thinking'). Operators
+# use this to confirm the streaming-signature contract is live in prod —
+# compare rate against request rate with Anthropic-streaming thinking
+# requests. No per-model dimension (the _Counter class doesn't support
+# labels today); correlate per-model via msg_id + request logs.
+thinking_signature_emitted_total = _Counter("thinking_signature_emitted_total")
+
 # Increments every time a streaming response terminated because the
 # --streaming-max-seconds wall-clock cap fired. Distinct from organic
 # finish_reason="length" (model hit max_tokens naturally) — cap-firings

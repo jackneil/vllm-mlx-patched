@@ -112,6 +112,16 @@ class AnthropicRequest(BaseModel):
                     f"output_config.effort={effort!r} is not a recognized "
                     f"level. Allowed: {sorted(ALLOWED_EFFORT_LEVELS)}"
                 )
+        # Optional vllm-mlx-patched extension: fold thinking blocks into the
+        # text block as inline `<think>…</think>` wrappers. Documented in
+        # `vllm_mlx/server.py:_emit_content_pieces`; see the fold-thinking
+        # emitter test file for rationale (Claude Code SDK client workaround).
+        fold = v.get("fold_thinking_as_text")
+        if fold is not None and not isinstance(fold, bool):
+            raise ValueError(
+                f"output_config.fold_thinking_as_text must be bool, got "
+                f"{type(fold).__name__}: {fold!r}"
+            )
         return v
 
     @field_validator("thinking")

@@ -2707,6 +2707,7 @@ def _emit_block_close(
     thinking_buffer: list[str],
     *,
     msg_id: str | None = None,
+    fold_thinking: bool = False,
 ) -> list[str]:
     """Emit the close-event sequence for a content block of the given type.
 
@@ -2715,6 +2716,10 @@ def _emit_block_close(
       streaming spec) then content_block_stop on the same index. Clears
       thinking_buffer in place.
     - "text" → one bare content_block_stop event. thinking_buffer untouched.
+      EXCEPT in fold_thinking mode, if `thinking_buffer` is non-empty (fold
+      sentinel signalling an unclosed `<think>` wrapper from a prior
+      `_emit_content_pieces` batch), emit a final `text_delta` carrying
+      `</think>` before the stop so the client sees a balanced wrapper.
     - anything else → raises ValueError so new block types can't silently
       drop the signature contract.
 
@@ -2759,13 +2764,81 @@ def _emit_block_close(
             f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n",
         ]
     if block_type == "text":
+        events: list[str] = []
+        if fold_thinking and thinking_buffer:
+            # Unclosed `<think>` wrapper from a prior batch — emit the
+            # closing tag as a final text_delta so the client sees balanced
+            # tags. Bare text-block close otherwise.
+            closing_delta = {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "text_delta", "text": "</think>"},
+            }
+            events.append(
+                f"event: content_block_delta\ndata: {json.dumps(closing_delta)}\n\n"
+            )
+            thinking_buffer.clear()
         stop_event = {"type": "content_block_stop", "index": block_index}
-        return [f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"]
+        events.append(
+            f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"
+        )
+        return events
     raise ValueError(
         f"_emit_block_close: unhandled block_type={block_type!r}. "
         "Any new signable Anthropic block type MUST be added to this "
         "dispatcher. See UPSTREAM_PIN.md invariant 13."
     )
+
+
+def _fold_thinking_pieces(
+    pieces: list[tuple[str, str]],
+    *,
+    caller_in_think: bool,
+) -> tuple[list[tuple[str, str]], bool]:
+    """Rewrite `('thinking', text)` pieces into `('text', '<think>…</think>')`
+    text pieces so downstream emission stays inside a single text block.
+
+    Used when the `fold_thinking` option is enabled — see
+    `_emit_content_pieces` and the module-level docstring on why this is
+    needed (Claude Code SDK drops text blocks that follow spec-correct
+    thinking blocks; folding preserves the reasoning content visibly while
+    keeping the wire response to a single text block).
+
+    The `<think>` tag opens on the first thinking piece and closes when
+    the stream transitions to non-thinking (or at final close, which the
+    caller drives). Consecutive thinking pieces share one wrapper.
+
+    Args:
+        pieces: list of (block_type, text) pairs from the think router.
+        caller_in_think: True if the caller is already inside an unclosed
+            `<think>` wrapper from a prior call — in which case a leading
+            thinking piece should NOT emit a new `<think>` opener. This
+            exists so multi-call streams (one `_emit_content_pieces` call
+            per router output batch) don't double-open the wrapper.
+
+    Returns:
+        (translated, in_think_after) where `translated` is a list of
+        `('text', text)` pairs ready for the standard emission loop, and
+        `in_think_after` reports whether the wrapper is still open at end
+        of this batch (caller stores it for the next call, or emits
+        `</think>` on final close).
+    """
+    translated: list[tuple[str, str]] = []
+    in_think = caller_in_think
+    for block_type, text in pieces:
+        if block_type == "thinking":
+            if not in_think:
+                translated.append(("text", "<think>" + text))
+                in_think = True
+            else:
+                translated.append(("text", text))
+        else:
+            if in_think:
+                translated.append(("text", "</think>" + text))
+                in_think = False
+            else:
+                translated.append((block_type, text))
+    return translated, in_think
 
 
 def _emit_content_pieces(
@@ -2775,6 +2848,7 @@ def _emit_content_pieces(
     thinking_buffer: list[str],
     *,
     msg_id: str | None = None,
+    fold_thinking: bool = False,
 ) -> tuple[list[str], str | None, int]:
     """Emit Anthropic SSE events for content pieces from the think router.
 
@@ -2793,9 +2867,24 @@ def _emit_content_pieces(
             cleared by _emit_block_close() when the block closes. The
             caller MUST allocate a fresh list at the top of each request's
             streaming coroutine. Sharing a buffer across requests is a bug.
+
+            When `fold_thinking=True`, this buffer is used as a state
+            signal: non-empty at entry means the caller is mid-`<think>`
+            wrapper from a prior call. Upon close of thinking via
+            transition-to-text, the buffer is cleared here (not via
+            `_emit_block_close`, since no thinking block is opened).
         msg_id: Optional Anthropic message id, passed through to
             `_emit_block_close` for log correlation. None is acceptable
             for unit-test callers that don't exercise the log path.
+        fold_thinking: When True, `('thinking', text)` pieces are folded
+            into a single text block with inline `<think>…</think>`
+            wrappers instead of being emitted as separate Anthropic
+            thinking content blocks. No `thinking_delta` or
+            `signature_delta` events are produced in this mode. This is
+            a client-compatibility shim for SDKs (e.g. Claude Code
+            v2.1.x) whose multi-content-block assembly drops text blocks
+            that follow spec-correct thinking blocks. Default False
+            preserves spec-correct emission.
 
     Returns:
         (events, updated_block_type, updated_block_index). The final open
@@ -2803,6 +2892,17 @@ def _emit_content_pieces(
         final-close owns that.
     """
     events = []
+    if fold_thinking:
+        pieces, still_in_think = _fold_thinking_pieces(
+            pieces, caller_in_think=bool(thinking_buffer)
+        )
+        # Keep thinking_buffer as an "inside <think>" flag: len > 0 iff
+        # the wrapper is still open. Any prior entries (from a previous
+        # call) no longer represent thinking content in this mode, so
+        # normalize to a single sentinel when still open.
+        thinking_buffer.clear()
+        if still_in_think:
+            thinking_buffer.append("<fold_sentinel>")
     for block_type, text in pieces:
         if block_type != current_block_type:
             if current_block_type is not None:
@@ -2854,6 +2954,15 @@ async def _stream_anthropic_messages(
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
+
+    # Opt-in client-compatibility shim: fold `<think>` reasoning into the
+    # text block with inline tags instead of emitting a separate Anthropic
+    # `thinking` content block. Needed by clients (Claude Code v2.1.x) whose
+    # multi-content-block assembly drops text blocks that follow spec-correct
+    # thinking blocks. Per-request so the proxy can toggle it per downstream
+    # client; default off preserves Anthropic-spec emission.
+    _oc = anthropic_request.output_config or {}
+    fold_thinking = bool(_oc.get("fold_thinking_as_text")) if isinstance(_oc, dict) else False
 
     # Extract messages for engine
     messages, images, videos = extract_multimodal_content(
@@ -3089,6 +3198,7 @@ async def _stream_anthropic_messages(
                     block_index,
                     thinking_buffer,
                     msg_id=msg_id,
+                    fold_thinking=fold_thinking,
                 )
                 for event in events:
                     yield event
@@ -3102,6 +3212,7 @@ async def _stream_anthropic_messages(
             block_index,
             thinking_buffer,
             msg_id=msg_id,
+            fold_thinking=fold_thinking,
         )
         for event in events:
             yield event
@@ -3114,6 +3225,7 @@ async def _stream_anthropic_messages(
             block_index,
             thinking_buffer,
             msg_id=msg_id,
+            fold_thinking=fold_thinking,
         )
         for event in events:
             yield event
@@ -3129,6 +3241,7 @@ async def _stream_anthropic_messages(
             block_index,
             thinking_buffer,
             msg_id=msg_id,
+            fold_thinking=fold_thinking,
         ):
             yield ev
         block_index += 1

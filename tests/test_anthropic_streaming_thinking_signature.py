@@ -14,6 +14,14 @@ from vllm_mlx.api.anthropic_adapter import (
     compute_thinking_signature,
     openai_to_anthropic,
 )
+from vllm_mlx.api.anthropic_models import AnthropicRequest
+from vllm_mlx.api.models import (
+    AssistantMessage,
+    ChatCompletionChoice,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Usage,
+)
 from vllm_mlx.server import _emit_block_close, _emit_content_pieces
 
 
@@ -248,3 +256,197 @@ def test_thinking_alone_keeps_block_open_then_final_close_signs_it():
         == compute_thinking_signature("reasoning, no follow-up")
     )
     assert thinking_buffer == []
+
+
+# =============================================================================
+# Task 4: Parity + end-to-end coroutine + edge-case tests
+# =============================================================================
+
+
+def _non_streaming_signature_for(thinking_text: str) -> str:
+    response = ChatCompletionResponse(
+        id="test-id",
+        object="chat.completion",
+        created=0,
+        model="any-model",
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=AssistantMessage(
+                    role="assistant",
+                    content="final",
+                    reasoning=thinking_text,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    a = openai_to_anthropic(response, model="any-model")
+    thinking_blocks = [b for b in a.content if b.type == "thinking"]
+    assert len(thinking_blocks) == 1 and thinking_blocks[0].signature
+    return thinking_blocks[0].signature
+
+
+def test_streaming_signature_matches_non_streaming_byte_for_byte():
+    """Parity: same thinking text → same signature on both paths, AND
+    the buffered text the streaming path signs == the reasoning text the
+    non-streaming path signs (byte-for-byte, no whitespace normalization)."""
+    text = "Let me think step by step: 13 * 17 = 221."
+    pieces = [
+        ("thinking", "Let me think "),
+        ("thinking", "step by step: "),
+        ("thinking", "13 * 17 = 221."),
+        ("text", "221"),
+    ]
+
+    thinking_buffer: list[str] = []
+    events, _, _ = _emit_content_pieces(
+        pieces,
+        current_block_type=None,
+        block_index=0,
+        thinking_buffer=thinking_buffer,
+    )
+    parsed = _parse_events(events)
+    sig_events = [
+        p for p in parsed if p["data"].get("delta", {}).get("type") == "signature_delta"
+    ]
+    assert len(sig_events) == 1
+    streaming_sig = sig_events[0]["data"]["delta"]["signature"]
+    non_streaming_sig = _non_streaming_signature_for(text)
+
+    # Signature bytes match on both paths.
+    assert streaming_sig == non_streaming_sig
+
+    # Independently verify the streaming side signed exactly `text` —
+    # not some joined-with-separator variant.
+    assert streaming_sig == compute_thinking_signature(text)
+    # And the piece-concatenation equals `text` byte-for-byte.
+    assert "".join(t for (bt, t) in pieces if bt == "thinking") == text
+
+
+def test_final_close_on_open_thinking_via_dispatcher():
+    """The final-close path calls _emit_block_close on an open thinking
+    block — same contract as the mid-stream close."""
+    thinking_buffer = ["only thinking, no text follows"]
+    events = _emit_block_close(
+        block_type="thinking",
+        block_index=3,
+        thinking_buffer=thinking_buffer,
+    )
+    parsed = _parse_events(events)
+    assert [(p["event"], p["data"].get("delta", {}).get("type")) for p in parsed] == [
+        ("content_block_delta", "signature_delta"),
+        ("content_block_stop", None),
+    ]
+    assert (
+        parsed[0]["data"]["delta"]["signature"]
+        == compute_thinking_signature("only thinking, no text follows")
+    )
+    assert thinking_buffer == []
+
+
+def test_thinking_to_tool_use_transition_closes_with_signature():
+    """Thinking followed by tool_use (no intervening text) — the thinking
+    block still gets its signature_delta before content_block_stop. The
+    tool_use block itself is opened separately by _stream_anthropic_messages'
+    tool emission loop, which is unchanged; this test pins only the
+    thinking-close half."""
+    thinking_buffer: list[str] = []
+    events, new_type, new_idx = _emit_content_pieces(
+        [("thinking", "I should call the tool")],
+        current_block_type=None,
+        block_index=0,
+        thinking_buffer=thinking_buffer,
+    )
+    assert new_type == "thinking"
+    assert "signature_delta" not in "".join(events)
+
+    close_events = _emit_block_close(
+        block_type="thinking",
+        block_index=new_idx,
+        thinking_buffer=thinking_buffer,
+    )
+    parsed = _parse_events(close_events)
+    assert parsed[0]["data"]["delta"]["type"] == "signature_delta"
+    assert (
+        parsed[0]["data"]["delta"]["signature"]
+        == compute_thinking_signature("I should call the tool")
+    )
+
+
+# -----------------------------------------------------------------------------
+# End-to-end _stream_anthropic_messages coroutine tests
+# -----------------------------------------------------------------------------
+
+
+class _FakeOutput:
+    """Minimal GenerationOutput shim — _stream_anthropic_messages reads
+    only .new_text, .prompt_tokens, .completion_tokens (with hasattr
+    guards on the latter two)."""
+    def __init__(self, new_text: str):
+        self.new_text = new_text
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+
+class _FakeEngine:
+    """Minimal engine shim matching the three attributes
+    _stream_anthropic_messages actually reads. Accepts the chunk list
+    at construction; stream_chat yields them in order."""
+    preserve_native_tool_format = False
+    tokenizer = None  # hasattr-guarded downstream
+
+    def __init__(self, chunks: list[str]):
+        self._chunks = chunks
+
+    async def stream_chat(self, *, messages, **kwargs):
+        for c in self._chunks:
+            yield _FakeOutput(c)
+
+
+async def _drive_stream(engine) -> str:
+    """Helper: run _stream_anthropic_messages against `engine` with a
+    trivial prompt and return the concatenated SSE wire bytes."""
+    from vllm_mlx.server import _stream_anthropic_messages
+
+    req_openai = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "x"}],
+        stream=True,
+    )
+    req_anthropic = AnthropicRequest(
+        model="test-model",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": "x"}],
+        stream=True,
+    )
+
+    pieces = []
+    async for ev in _stream_anthropic_messages(engine, req_openai, req_anthropic):
+        pieces.append(ev)
+    return "".join(pieces)
+
+
+@pytest.mark.asyncio
+async def test_e2e_mid_stream_thinking_to_text_emits_signature():
+    """End-to-end (a): thinking→text transition."""
+    engine = _FakeEngine(["<think>", "hello ", "world", "</think>", "answer"])
+    wire = await _drive_stream(engine)
+    assert wire.count('"signature_delta"') == 1, (
+        f"expected 1 signature_delta on mid-stream close, wire:\n{wire}"
+    )
+    expected_sig = compute_thinking_signature("hello world")
+    assert expected_sig in wire, f"expected signature {expected_sig!r} not on wire"
+
+
+@pytest.mark.asyncio
+async def test_e2e_final_close_on_open_thinking_emits_signature():
+    """End-to-end (b): stream terminates with an open thinking block."""
+    engine = _FakeEngine(["<think>", "hello ", "world"])  # no </think>, no text
+    wire = await _drive_stream(engine)
+    assert wire.count('"signature_delta"') == 1, (
+        f"expected 1 signature_delta from final-close, wire:\n{wire}"
+    )
+    expected_sig = compute_thinking_signature("hello world")
+    assert expected_sig in wire, f"expected signature {expected_sig!r} not on wire"

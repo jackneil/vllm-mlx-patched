@@ -1,25 +1,31 @@
 # Qwen3.5 / Qwen3.6 35B-A3B: concurrent heavy-payload requests deadlock
 
-**Status:** **CLOSED PENDING PROD DEPLOYMENT** as of 2026-04-22 post-PR-#31. PR #31's mlx-lm 0.31.3 pin (`ArraysCache.extend` fixes #1169+#1177) resolves both homogeneous AND heterogeneous concurrent-pair cases. Empirical verification on the isolated `vllm-mlx-test` env (post-fix): 20/20 requests across a 10-pair heterogeneous burst pass with proper distinct output. The "heterogeneous still fails" signal observed via `llm.hank.ai` was measured against prod `:8000` / `:8001` which are still running the **vllm-mlx conda env with mlx-lm 0.31.2 (pre-PR-#31 pin)**. Prod needs deployment of the upgraded mlx-lm to pick up PR #31's pin. No additional code fix required. See `docs/superpowers/plans/2026-04-22-qwen3-heterogeneous-prefill-deadlock-h1.md` "Phase 3 execution" section for the full test matrix.
+**Status:** **CLOSED 2026-04-23.** Root cause: `vllm_mlx.scheduler` omitted the `logits_processors=` kwarg on `BatchGenerator.insert()` for requests without a processor, letting mlx-lm slot `None` into the per-row slot. When a heterogeneous pair merged via `GenerationBatch.extend()`, the merged list had `[None, [proc]]` and `_step()` crashed on `for p in None` at `mlx_lm/generate.py:1346`. Fix commit: **312de2f** (caller-side contract + defense-in-depth + unit regression). Verification: 0/90 HANG on Qwen3.6-35B-A3B across three 30-pair bursts, 0/15 on Gemma cross-family. See `UPSTREAM_PIN.md` invariant #18 for the contract. See the **Closure (2026-04-23)** section at the end of this file for the full writeup.
+
+**Historical status (kept for archaeology):** REOPENED 2026-04-22 evening. PR #31's mlx-lm 0.31.3 pin (`ArraysCache.extend` #1169 + #1177) is deployed in prod. Verified fix for the **simultaneous** pair case: 20/20 across a 10-pair same-millisecond burst pass. But Claude Code's real-world timing is **not** simultaneous — `hank-secure-llm` proxy logs show the haiku + sonnet requests arrive at the arena ~50ms apart. Under that stagger, the deadlock reproduces deterministically on Qwen3.5/3.6 via the same `llm.hank.ai` prod path that the burst test used. Gemma-4-26b is unaffected. The `ArraysCache.extend` fix closed one instance of the shared-state class but a second instance remains — likely a scheduler path that batches two requests differently when they arrive in separate CB steps.
 **Reported:** 2026-04-21, refined 2026-04-22 after partial fix shipped. Surfaced via `hank-secure-llm`'s `model_qa` harness run.
 **Impact:** High for Claude Code users on Qwen-35B-A3B. Claude Code always fires haiku + sonnet requests in parallel on every scenario; both deadlock → every request times out. Single-request access works fine, so a naive single-curl test from a developer laptop masks the bug completely.
 **Scope:** `vllm_mlx/` — one of `StreamingThinkRouter` (`api/utils.py:240`), the continuous-batching scheduler `step()` (`scheduler.py:2588` or `mllm_scheduler.py:595`), or a sibling LCP-contamination path that PR #30's slice fix didn't cover.
 
-## Symptom (refined 2026-04-22)
+## Symptom (refined 2026-04-22 evening, post-PR-#31 deployment)
 
-The current trigger is **heterogeneous concurrent payloads** — one request with tools + large system prompt, one without, arriving within ~50ms. Both hang after emitting only `message_start`.
+**The trigger is not "heterogeneous payloads" or "concurrency" generically — it's specifically a ~50ms inter-arrival stagger between two requests to the same model.** Once the second request arrives AFTER the first has begun prefill (rather than in the same CB step), the model's KV/scheduler state decoheres and both streams hang at `message_start`.
 
-After the partial fix (build post-1f333f1):
-- 1 request in isolation: ✅ ~2s
-- 2 concurrent **identical** heavy payloads: ✅ ~3.7s (homogeneous pair — **fixed**)
-- 2 concurrent **heterogeneous** payloads (heavy + light): ❌ **still hangs 30s+**
-- Same heterogeneous pair against Gemma-4-26b-a4b: ✅ 2.6s (unaffected)
+Measured on `llm.hank.ai` prod (mlx-lm 0.31.3 pinned via PR #31):
 
-Claude Code's default behavior hits the remaining trigger: every scenario fires one haiku request (`tools=0`, minimal messages) plus one sonnet request (`tools=3`, full tool schemas + long system prompt) **concurrently** at the same model after proxy rewrite. The harness shows every Qwen scenario timing out even though bare single curls succeed. No chunks after that, no `content_block_start`, no `message_stop`. The backend's HTTP response is 200 with SSE content-type, TTFB ~10ms — so the upstream accepted the request and opened the stream, but no tokens are produced for either.
+| case | Qwen3.6-35B-A3B | Gemma-4-26b-a4b |
+|---|---|---|
+| 1 request in isolation | ✅ ~2s | ✅ |
+| 2 simultaneous requests (same millisecond) | ✅ ~3.7s (**PR #31 fix**) | ✅ |
+| **2 requests with 50ms stagger** (Claude Code's real behavior) | ❌ **both hang 30s+** | ✅ 0.4s + 0.9s |
+| Same stagger but bodies are identical heavy | ✅ 3.7s | ✅ |
 
-- 1 request in isolation: completes in ~2s (`end_turn`, 2 output tokens), works fine.
-- 2 concurrent requests: **both hang** until connection timeout. Deterministic.
-- Same test against Gemma-4-26b-a4b-it-4bit: both complete in ~4.8s. Gemma is unaffected.
+The 50ms-stagger case is deterministic across multiple runs (reproduced 3/3 today). It's also what Claude Code produces in normal use — `hank-secure-llm` proxy logs show haiku arriving at T+0ms and sonnet at T+50ms during every `claude --bare -p` invocation.
+
+Behavior on failure:
+- Both requests receive HTTP 200 with `text/event-stream` and TTFB ~10-20ms — upstream accepts and opens both streams.
+- Haiku emits `message_start` + `content_block_start` (3 events, 0 `message_stop`); sonnet emits only `message_start` (1 event, 0 stops).
+- Neither emits `content_block_delta`, `message_delta`, or `message_stop` within 30s. The `--streaming-max-seconds 260` cap eventually fires but not before client timeouts.
 
 ## Payload that triggers it
 
@@ -27,63 +33,61 @@ Stored at `docs/testing/claude-shape-heavy-payload.json` in this repo (~21 KB, ~
 
 The single-request **minimal** payload in `docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md` (no system prompt, no tools) works fine on the current build — that earlier runaway bug is fixed. This is a distinct, concurrency-only issue.
 
-## Reproduction (heterogeneous pair — current failure mode)
+## Reproduction — 50ms-staggered concurrent pair (current failure mode)
 
-Build a light payload (no tools, no cache_control system block) alongside the heavy one and fire them concurrently:
+The precise trigger is two requests to the same model where the second arrives ~50ms AFTER the first (not simultaneously). Any fire-and-background shell script achieves this naturally:
 
 ```bash
-python3 -c "
-import json
-light = {
-    'model': 'mlx-community/Qwen3.6-35B-A3B-4bit',
-    'max_tokens': 200, 'stream': True,
-    'output_config': {'effort':'high'}, 'thinking':{'type':'adaptive'},
-    'messages': [{'role':'user','content':'Reply with OK'}],
-}
-json.dump(light, open('/tmp/shape-light.json','w'))
-"
+# Real Claude Code captured payloads: cc-cap-01-qwen.json is haiku (tools=0,
+# max_tokens=32000, ~1.5KB), cc-cap-02-qwen.json is sonnet (tools=3,
+# max_tokens=32000, ~5.3KB), both with model=mlx-community/Qwen3.6-35B-A3B-4bit.
+# Capture method: run `claude --bare -p` against a pass-through proxy that
+# dumps request bodies (see capture-proxy.py in hank-secure-llm scratch).
 
-( curl -sS -m 30 -N -o /tmp/h1.sse -w "heavy t=%{time_total}s\n" \
+( curl -sS -m 30 -N -o /tmp/h.sse -w "haiku t=%{time_total}s\n" \
     -X POST https://llm.hank.ai/v1/messages \
     -H "Authorization: Bearer $NEURAL_ARENA_KEY" -H "Content-Type: application/json" \
-    -d @docs/testing/claude-shape-heavy-payload.json ) &
-( curl -sS -m 30 -N -o /tmp/h2.sse -w "light t=%{time_total}s\n" \
+    -d @cc-cap-01-qwen.json ) &
+sleep 0.05                                             # <-- THE TRIGGER
+( curl -sS -m 30 -N -o /tmp/s.sse -w "sonnet t=%{time_total}s\n" \
     -X POST https://llm.hank.ai/v1/messages \
     -H "Authorization: Bearer $NEURAL_ARENA_KEY" -H "Content-Type: application/json" \
-    -d @/tmp/shape-light.json ) &
+    -d @cc-cap-02-qwen.json ) &
 wait
 
-echo "heavy: $(grep -c '^event:' /tmp/h1.sse) events, $(grep -c message_stop /tmp/h1.sse) stops"
-echo "light: $(grep -c '^event:' /tmp/h2.sse) events, $(grep -c message_stop /tmp/h2.sse) stops"
+echo "haiku: $(grep -c '^event:' /tmp/h.sse) events, $(grep -c message_stop /tmp/h.sse) stops"
+echo "sonnet: $(grep -c '^event:' /tmp/s.sse) events, $(grep -c message_stop /tmp/s.sse) stops"
 
-# Failing output (both hang, observed 2026-04-22):
-#   heavy t=30.00s   HTTP 200
-#   light t=30.00s   HTTP 200
-#   heavy: 1 events, 0 stops
-#   light: 1 events, 0 stops
+# Observed 2026-04-22 evening, post-PR-#31 prod deploy (3/3 runs):
+#   haiku t=30.00s   HTTP 200  → 3 events, 0 stops (message_start + content_block_start only)
+#   sonnet t=30.00s  HTTP 200  → 1 event,  0 stops (message_start only)
 ```
 
-Swap both `model` fields to `mlx-community/gemma-4-26b-a4b-it-4bit` — completes in ~2.6s with 6 events + 2 `message_stop`s each. Gemma is the control and remains unaffected.
+Remove the `sleep 0.05` and both requests complete in ~1.8s with clean `message_stop`s — confirming this is not a general concurrency bug but specifically a same-millisecond-vs-staggered-arrival distinction.
 
-### Homogeneous pair — now passes (partial fix landed 2026-04-22)
+Swap both `model` fields to `mlx-community/gemma-4-26b-a4b-it-4bit` — completes in ~0.4s + ~0.9s with 6 events + 2 `message_stop`s each. Gemma is the control and remains unaffected.
 
-Running the same command with **both** requests pointing at `docs/testing/claude-shape-heavy-payload.json` (identical payloads) now completes in ~3.7s on Qwen3.5/3.6. That code path is resolved; the remaining bug is specifically about the two queued requests having **different shapes** (different `tools` count, different system block, different message length) at prefill time.
+### Why the "simultaneous" tests pass but real traffic fails
 
-The bug reproduces through any path that lets two concurrent requests hit vllm-mlx — arena's `/v1/messages` proxy is a dumb `httpx.AsyncClient.stream()` passthrough (verified in `hank_llm_arena/proxy.py:proxy_v1`, no concurrency guards).
+The regression harness added with PR #31 (the 10-pair burst in `vllm-mlx-test`) uses `asyncio.gather` on pre-constructed requests, which typically dispatches within the same event-loop tick — all N requests land on the scheduler within <5ms. That pattern successfully hits the CB fast path where the entire pair is packed into a single prefill step and the `ArraysCache.extend` fix makes that step correct. Real-world callers (Claude Code, browser chat UIs, anyone firing the second request only after the first returns its HTTP headers) stagger by tens of milliseconds, which puts the second request into a LATER scheduler step — exactly the path PR #31 didn't exercise.
 
-## Hypotheses for investigation (refined after partial fix)
+`hank-secure-llm` proxy logs consistently show the two Claude Code requests arriving 30-70ms apart at `llm.hank.ai`. Arena's `/v1/messages` proxy (`hank_llm_arena/proxy.py:proxy_v1`) is a dumb `httpx.AsyncClient.stream()` passthrough with no concurrency guards or queueing — it forwards the 50ms gap through to vllm-mlx untouched. So arena isn't introducing the gap or the bug; the gap exists in real client traffic and vllm-mlx's scheduler doesn't handle it on Qwen3.5/3.6.
 
-Since the partial fix resolved homogeneous pairs but not heterogeneous, the remaining bug is most likely in code that treats a batch of two same-shape requests correctly but mishandles a batch where shapes differ. Candidates:
+## Hypotheses for investigation (refined 2026-04-22 evening)
 
-**H1 (most likely). Continuous-batching prefill scheduler mispacks heterogeneous batches.** In `scheduler.py:2588` or `mllm_scheduler.py:595`'s `step()`, when two requests enter the prefill queue with very different token counts (e.g., heavy=4500 tokens vs light=30 tokens), the padding / slot allocation / attention mask construction for the mixed batch may be computing an incorrect sequence boundary. One request's tokens get masked away, it never gets to generate a logit, and its stream hangs. The other request may be stuck waiting on a shared step barrier.
+Since the repro is now known to be **timing-staggered**, not shape-dependent, the bug is in the scheduler path that handles a second request arriving after the first has started generating. Candidates in descending likelihood:
 
-**H2. `StreamingThinkRouter` state-sharing specifically on mixed-length batches.** `vllm_mlx/api/utils.py:240`. If each request's router is a per-request instance but they share a tokenizer decode pipeline keyed by the batch index (not the request id), a mixed batch could route the wrong token stream into each router.
+**H1 (most likely). Continuous-batching `add_new_request` path corrupts KV state when a second sequence joins mid-step on Qwen3-MoE.** In `scheduler.py:2588` / `mllm_scheduler.py:595`'s `step()`, when a new request enters the batch while another is already prefilling, the slot allocation / KV-offset recompute for the existing sequence may be miscomputed under Qwen3's GQA head layout. The first sequence's generation state gets invalidated (explains haiku stalling after `content_block_start`) and the new sequence never gets a valid KV slot (explains sonnet stalling at `message_start`). PR #31's `ArraysCache.extend` fix handled the case where both sequences start together; a symmetric bug exists for the "one sequence already running" case.
 
-**H3. Prefix cache LCP fetch incorrectly applied across requests with different prompts.** PR #30's fix sliced dequant + rotating KVCache trim. For a mixed batch, one request's prompt has no shared prefix with the other, but the CB LCP pass might still be computing a common prefix and serving stale tokens to one side. PR #384 (`9630c5d`) handled Gemma specifically; Qwen-3_5_moe has different attention group sizes and may hit a separate code path.
+**H2. `StreamingThinkRouter` carries state from the first request when the second joins.** `vllm_mlx/api/utils.py:240`. If the router instance is bound to a scheduler slot that gets reassigned when a new request joins mid-step, the second router could inherit or share state, leaving both streams unable to advance their `<think>` / `</think>` detection.
 
-**H4. Attention group / KV head sizing for Qwen3-MoE in mixed batches.** Qwen3-MoE has GQA with specific group counts. If the KV head packing / unpacking assumes uniform sequence length across a batch and the mixed-shape case computes an off-by-one slice, reads return garbage and generation stalls.
+**H3. Prefix cache allocation race when writing the first request's prefill output AND the second request's prefill input simultaneously.** PR #30 sliced the single-request LCP fetch; PR #31 fixed `ArraysCache.extend` for coincident arrivals. A third race exists when the first request's cache slab is still being written while the second request is trying to allocate. MoE weights (Qwen3-MoE routes tokens to different experts per step) widen the window where the slab is being updated.
 
-The symptom (both requests stall at `message_start`, no tokens emitted) and the shape-sensitivity (same shape OK, different shape breaks) together strongly suggest H1 — a CB scheduler step that only proceeds when both concurrent requests reach some expected alignment that mixed-shape batches never satisfy.
+**H4. Qwen3-MoE expert-routing state leaks across staggered requests.** Qwen3-MoE has top-k expert selection per token. If the expert-routing module retains per-step state (e.g., a routing table or gate output cache) keyed by batch position rather than request id, the position reassignment on step 2 (when the second request joins) could corrupt routing for both.
+
+The "both hang at `message_start` but one reaches `content_block_start`" asymmetry and the exact-50ms trigger strongly suggest H1 — the first request is partway through content generation when the second's join event corrupts its state, while the second never escapes the join.
+
+Diagnostic ask: add logging at the scheduler step where a new request joins an in-progress batch, specifically dumping the KV offset table and slot assignments before and after the join. The log diff between the Gemma case (works) and Qwen3-MoE case (deadlocks) should localize the corruption.
 
 ## Observable signals while reproducing
 
@@ -95,13 +99,15 @@ During the hang, in `vllm-mlx` server logs look for:
 
 ## Success criteria for the fix
 
-This file should be kept in-repo and a regression test added. The new test must cover **three** concurrency shapes, not just one — the partial fix passed the homogeneous case but missed heterogeneous:
+This file should be kept in-repo and a regression test added. The new test must cover **three arrival patterns**, not just the simultaneous one — PR #31 slipped through because only the simultaneous case was exercised:
 
-1. **Heterogeneous concurrent pair** (primary — this is the open bug): one heavy request (~4.5k token system + 3 tools + `effort=high` + `thinking.adaptive`) and one light request (no system, no tools, `Reply OK` prompt) via `asyncio.gather` at the SAME model. Both must complete in <15s with `stop_reason: end_turn` and ≥1 `content_block_delta` each.
-2. **Homogeneous heavy pair** (regression guard for the partial fix): two identical heavy requests. Must still complete in <15s each.
-3. **Same tests against Gemma-4-26b-a4b** (cross-family non-regression): both homogeneous and heterogeneous pairs must complete — ensures the Qwen-specific fix doesn't regress CB for other families.
+1. **Staggered pair at 50ms** (primary — this is the open bug and matches real Claude Code traffic): fire the heavy request, `await asyncio.sleep(0.05)`, fire the light request, then `await asyncio.gather(h, s)`. Both must complete in <15s with `stop_reason: end_turn` and ≥1 `content_block_delta` each.
+2. **Simultaneous pair** (regression guard for PR #31): `asyncio.gather(h, s)` with no sleep between. Must continue to complete in <15s each.
+3. **Same tests against Gemma-4-26b-a4b** (cross-family non-regression): both patterns must complete — ensures any fix doesn't regress CB for other families.
 
-A Python `httpx.AsyncClient` variant is preferred — it lets the test log per-request state machine progression (`router_id`, `kv_cache_slab_id`, `scheduler_queue_position`, and crucially the batch slot assignment + prefill sequence boundaries) for diagnostic value. Because the partial fix slipped through with only the homogeneous case covered, the new test should explicitly name the heterogeneous case and assert both requests made forward progress independently (not just one of them).
+Fail-mode assertion: when a test fails, dump per-request `events_received` and `last_event_type`. The failure signature for this bug is haiku at 3 events / `content_block_start` and sonnet at 1 event / `message_start` (or symmetric — whichever started first gets further). A test that just checks "total duration <15s" is insufficient — it must observe that each request independently reached a terminal event.
+
+Diagnostic instrumentation to add alongside the test: log the CB scheduler's pre-step and post-step KV slot tables with request ids visible, so a regression produces an actionable log diff pointing at where the join-time corruption happens. This data is what the 50ms-stagger case needs that the simultaneous case didn't expose.
 
 ## Why this was hard to catch
 
@@ -114,3 +120,102 @@ Single-request curl succeeds. The previous runaway doc (`2026-04-19-qwen36-first
 - Upstream PR #380 (`608ac4d`) — "gemma4 streaming reasoning leak" — Gemma-specific router state leak.
 - `docs/testing/2026-04-19-qwen36-first-turn-runaway-under-claude-code-payload.md` — the single-request Qwen runaway, **now closed** by PR #26 + #27.
 - `hank-secure-llm` `BLOCKED_MODEL_IDS` currently holds both 35B-A3B Qwens pending this fix.
+
+## Closure (2026-04-23)
+
+### Root cause
+
+`vllm_mlx.scheduler.Scheduler._schedule_waiting` was calling
+`BatchGenerator.insert()` WITHOUT passing `logits_processors=` when a
+request had no per-request logits processor.  mlx-lm's
+`BatchGenerator.insert_segments` normalized the missing kwarg via:
+
+```python
+logits_processors = logits_processors or (
+    [self.logits_processors] * len(segments)
+)
+```
+
+`self.logits_processors` is `None` at the BatchGenerator level for our
+construction, so the per-row slot became `None`.
+
+When two heterogeneous requests (one WITH a `thinking_budget` processor,
+one WITHOUT) completed their prompt phases and merged into a shared
+`GenerationBatch` via `extend()`, the merged `logits_processors` became
+`[None, [proc]]`.
+
+`GenerationBatch._step()` at `mlx_lm/generate.py:1346`:
+```python
+for processor in self.logits_processors[e]:   # e=row_with_None
+```
+crashed with `TypeError: 'NoneType' object is not iterable`.
+
+The error propagated up to our scheduler at `scheduler.py:2759`, which
+caught it as a TypeError — but `_is_cache_corruption_error(e)` returned
+False because `CACHE_CORRUPTION_PATTERNS` only matched
+`"not subscriptable"` (not the error's actual wording `"not iterable"`).
+Re-raise fell through to `engine_core._engine_loop`'s bare
+`except Exception`, which just logged and slept 100ms in an infinite
+loop — turning a one-step bug into a 35s client timeout.
+
+### Fix (three layers)
+
+1. **Caller-side contract** (`vllm_mlx/scheduler.py`): always pass
+   `logits_processors=[[per_row]]` with `per_row = list(request.logits_processors or [])`.
+   The per-row value is a (possibly empty) list — never omitted, never
+   `None`.  See `UPSTREAM_PIN.md` invariant #18.
+2. **Defense in depth — scheduler** (`vllm_mlx/scheduler.py`):
+   `CACHE_CORRUPTION_PATTERNS` widened to include
+   `"'NoneType' object is not iterable"` alongside the existing
+   `"not subscriptable"`.  Future variants of the same class of bug
+   route through `_recover_from_cache_error()` instead of escalating
+   to engine_core.
+3. **Defense in depth — engine** (`vllm_mlx/engine_core.py`): bounded
+   retry on consecutive identical errors.  After 10 identical error
+   reprs in a row, the engine loop calls
+   `scheduler._recover_from_generation_error()`, emits
+   `finish_reason=error` terminal outputs, and resets the streak
+   counter.  Prevents any future similar class from becoming an
+   infinite loop.
+
+### Verification (full matrix)
+
+| Condition | Result |
+|---|---|
+| Pre-fix Qwen3.6-35B-A3B, 10 staggered pairs (with trace on) | **6/10 HANG** |
+| Pre-fix stall_streak_max (deadlocked request) | 1797 steps |
+| Post-fix Qwen3.6-35B-A3B, 30 pairs × 3 bursts | **0/90 HANG** ✅ |
+| Post-fix Gemma-4-26b-a4b-it-4bit, 15 pairs (non-regression) | 0/15 HANG ✅ |
+| Post-fix unit regression (`test_scheduler_heterogeneous_logits_processors.py`) | 2/2 PASS ✅ |
+
+### Instrumentation residue
+
+The scheduler-trace subsystem (`VLLM_MLX_SCHEDULER_TRACE=1`, commits
+f58aae5 + f1b3158) that localized this bug remains in the codebase as
+a disabled-by-default diagnostic.  It's env-gated, does NOT affect
+prod-default behavior, and is available for future investigations of
+similar heterogeneous-admission classes.  Emit-point documentation
+lives in the commit messages + `vllm_mlx/utils/bg_trace.py` docstring.
+
+### Evidence archive
+
+- `/tmp/h1-repro/localization.md` — root-cause walkthrough with
+  full traceback and stall-detector output.
+- `/tmp/h1-repro/trace-diff.txt` — Qwen-vs-Gemma diff showing matrix
+  row 3 signal pre-fix.
+- `/tmp/h1-repro/stalls-qwen.txt` — per-uid stall detection showing
+  pair=10 heavy at `stall_streak_max=1797`.
+- `/tmp/h1-verify-results.txt` — post-fix acceptance evidence.
+- `docs/testing/h1-verify.sh` — committed repro/verify script.
+
+### Follow-up
+
+- **48h prod observation window** before this entry is archived.
+  Watch `server.log` for any `"not iterable"` or `"not subscriptable"`
+  patterns; any hit indicates a regression of a sibling code path.
+- **Upstream mlx-lm issue** to be filed proposing defensive
+  `for p in (self.logits_processors[e] or []):` in
+  `GenerationBatch._step()` at line 1346.  Our caller-side contract
+  remains load-bearing until that lands.
+- **Remove 35B-A3B Qwens from `hank-secure-llm BLOCKED_MODEL_IDS`**
+  after the 48h window passes (separate repo, separate PR).

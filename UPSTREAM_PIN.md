@@ -157,13 +157,24 @@ Downstream consumer assumption: `hank-llm-arena::proxy.py::_FORWARDED_HEADERS` f
 
 Test guard: `tests/test_thinking_budget_headers.py` + matrix rows in `tests/test_thinking_budget_matrix.py` + end-to-end integration in `tests/test_qwen3_first_turn_no_think_integration.py` / `tests/test_thinking_budget_ceiling_integration.py`.
 
-### Invariant 13: Non-streaming Anthropic thinking-block ordering and schema
+### Invariant 13: Anthropic thinking-block signature contract (non-streaming AND streaming)
 
-`vllm_mlx.api.anthropic_adapter.openai_to_anthropic` MUST emit a `type: "thinking"` content block BEFORE the `type: "text"` content block when `choice.message.reasoning` is populated. The ordering matches Anthropic's public API and the streaming path (`server.py:1991-2032`).
+`vllm_mlx.api.anthropic_adapter.openai_to_anthropic` MUST emit a `type: "thinking"` content block BEFORE the `type: "text"` content block when `choice.message.reasoning` is populated. The ordering matches Anthropic's public API and the streaming path (`vllm_mlx.server._emit_content_pieces` + `vllm_mlx.server._stream_anthropic_messages` — cite by symbol, not line number, since line numbers drift on rebase).
 
-Every `type: "thinking"` block MUST also be schema-conformant with the Anthropic SDK's `ThinkingBlock` model: it MUST include a `signature: str` field. We populate it with `"vllm-mlx:" + sha256(thinking_text).hexdigest()[:32]` — an opaque, deterministic hash so identical reasoning text produces identical signatures across requests. The prefix distinguishes our signatures from Anthropic's own server-signed values.
+Every `type: "thinking"` block MUST also be schema-conformant with the Anthropic SDK's `ThinkingBlock` model: it MUST include a `signature: str` field. We populate it with `compute_thinking_signature(thinking_text)` (= `"vllm-mlx:" + sha256(thinking_text).hexdigest()[:32]`) — an opaque, deterministic hash so identical reasoning text produces identical signatures across requests. The prefix distinguishes our signatures from Anthropic's own server-signed values.
 
-Test guards: `tests/test_anthropic_adapter_thinking_block.py` (ordering), `tests/test_anthropic_thinking_block_schema.py` (signature contract).
+**Streaming path (added 2026-04-23):** `vllm_mlx.server._stream_anthropic_messages` MUST emit a `signature_delta` event immediately before `content_block_stop` on every content block of `type: "thinking"`, both at mid-stream transitions (inside `_emit_content_pieces`) and at final-close. The emission MUST route through the shared dispatcher `vllm_mlx.server._emit_block_close` which centralizes the close-event sequence and dispatches on block type (raises `ValueError` for unknown types so a new signable block type cannot silently drop the signature contract). Any new signable block type MUST be added to the dispatcher.
+
+Byte-parity: streaming and non-streaming MUST produce identical signatures for identical thinking text. Both paths call `compute_thinking_signature`; no separate formula is permitted.
+
+Test guards (test-id granularity — rename/delete detection):
+- `tests/test_anthropic_adapter_thinking_block.py` — non-streaming ordering
+- `tests/test_anthropic_thinking_block_schema.py` — non-streaming signature contract
+- `tests/test_anthropic_streaming_thinking_signature.py::test_streaming_signature_matches_non_streaming_byte_for_byte` — byte-parity enforcement (formula + input-text drift)
+- `tests/test_anthropic_streaming_thinking_signature.py::test_emitted_events_conform_to_anthropic_streaming_shape` — Anthropic-spec event/delta-type allowlist
+- `tests/test_anthropic_streaming_thinking_signature.py::test_e2e_mid_stream_thinking_to_text_emits_signature` + `test_e2e_final_close_on_open_thinking_emits_signature` — behavioral guards on both production wire-ups
+- `tests/test_streaming_signature_rebase_sentinel.py::test_emit_content_pieces_invokes_emit_block_close` — AST walk; fires if `_emit_content_pieces` stops calling `_emit_block_close`
+- `tests/test_streaming_signature_rebase_sentinel.py::test_stream_anthropic_messages_final_close_invokes_emit_block_close` — source-substring; fires if the final-close in `_stream_anthropic_messages` stops referencing `_emit_block_close`
 
 ### Invariant 14: `chat_template_kwargs` passthrough plumbing (added 2026-04-20)
 

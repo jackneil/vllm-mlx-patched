@@ -24,7 +24,6 @@ from vllm_mlx.api.models import (
 )
 from vllm_mlx.server import _emit_block_close, _emit_content_pieces
 
-
 SIG_RE = re.compile(r"^vllm-mlx:[0-9a-f]{32}$")
 
 
@@ -35,7 +34,7 @@ def test_helper_signature_format_and_determinism():
     assert SIG_RE.match(sig), f"bad format: {sig!r}"
     expected = (
         "vllm-mlx:"
-        + hashlib.sha256("Hello world".encode("utf-8")).hexdigest()[:32]
+        + hashlib.sha256(b"Hello world").hexdigest()[:32]
     )
     assert sig == expected
     assert compute_thinking_signature("Hello world") == sig
@@ -469,7 +468,7 @@ def test_emitted_events_conform_to_anthropic_streaming_shape():
     Reference: Anthropic Messages streaming docs §'Extended thinking'.
     If Anthropic moves signature onto content_block_start or introduces
     a new event type, this test fails."""
-    ALLOWED_EVENT_TYPES = {
+    ALLOWED_EVENT_TYPES = {  # noqa: N806 — function-local constant, uppercase for semantic clarity
         "message_start",
         "content_block_start",
         "content_block_delta",
@@ -482,7 +481,7 @@ def test_emitted_events_conform_to_anthropic_streaming_shape():
                   # allowlist should accept them so this test doesn't
                   # flag a future error-event addition.
     }
-    ALLOWED_DELTA_TYPES = {
+    ALLOWED_DELTA_TYPES = {  # noqa: N806 — function-local constant, uppercase for semantic clarity
         "text_delta",
         "thinking_delta",
         "signature_delta",

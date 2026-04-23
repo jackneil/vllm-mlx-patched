@@ -10,12 +10,12 @@ and tests/test_mlx_lm_api_contract.py.
 import ast
 import inspect
 
+from vllm_mlx.api.anthropic_adapter import compute_thinking_signature
 from vllm_mlx.server import (
     _emit_block_close,
     _emit_content_pieces,
     _stream_anthropic_messages,
 )
-from vllm_mlx.api.anthropic_adapter import compute_thinking_signature
 
 
 def test_compute_thinking_signature_helper_exists():

@@ -66,7 +66,6 @@ from .api.anthropic_adapter import (
 from .api.anthropic_models import AnthropicRequest
 from .api.budget_ceiling import apply_server_thinking_token_budget_ceiling
 from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
-from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -98,6 +97,7 @@ from .api.models import (
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,

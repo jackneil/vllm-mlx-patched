@@ -450,3 +450,110 @@ async def test_e2e_final_close_on_open_thinking_emits_signature():
     )
     expected_sig = compute_thinking_signature("hello world")
     assert expected_sig in wire, f"expected signature {expected_sig!r} not on wire"
+
+
+# =============================================================================
+# Task 5: Anthropic-spec conformance + interleaved-thinking integration
+# =============================================================================
+
+
+def test_emitted_events_conform_to_anthropic_streaming_shape():
+    """Anthropic streaming spec (extended thinking): each event is one of
+    {message_start, content_block_start, content_block_delta,
+    content_block_stop, message_delta, message_stop, ping}. Signature
+    arrives via content_block_delta with delta.type == signature_delta
+    and a string delta.signature. This test asserts the shape WITHOUT
+    referencing our own string literals, so it catches drift between our
+    emitter and the spec.
+
+    Reference: Anthropic Messages streaming docs §'Extended thinking'.
+    If Anthropic moves signature onto content_block_start or introduces
+    a new event type, this test fails."""
+    ALLOWED_EVENT_TYPES = {
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+        "ping",
+        "error",  # Anthropic emits `error` events on server-side failures.
+                  # Our emitter doesn't produce them today but the
+                  # allowlist should accept them so this test doesn't
+                  # flag a future error-event addition.
+    }
+    ALLOWED_DELTA_TYPES = {
+        "text_delta",
+        "thinking_delta",
+        "signature_delta",
+        "input_json_delta",
+    }
+
+    thinking_buffer: list[str] = []
+    events, _, _ = _emit_content_pieces(
+        [("thinking", "Hello"), ("text", "OK")],
+        current_block_type=None,
+        block_index=0,
+        thinking_buffer=thinking_buffer,
+    )
+    parsed = _parse_events(events)
+
+    for p in parsed:
+        # Event type must be Anthropic-spec-known.
+        assert p["event"] in ALLOWED_EVENT_TYPES, (
+            f"unknown event type {p['event']!r}; not in Anthropic spec"
+        )
+        # content_block_delta carries a typed delta.
+        if p["event"] == "content_block_delta":
+            delta = p["data"].get("delta")
+            assert isinstance(delta, dict), f"no delta: {p}"
+            assert delta.get("type") in ALLOWED_DELTA_TYPES, (
+                f"unknown delta type {delta.get('type')!r}"
+            )
+            # signature_delta carries a string `signature` field.
+            if delta["type"] == "signature_delta":
+                sig = delta.get("signature")
+                assert isinstance(sig, str) and len(sig) > 0
+
+
+def test_interleaved_thinking_via_emit_content_pieces():
+    """Interleaved-thinking across multiple _emit_content_pieces calls
+    (simulating deltas arriving in batches over many coroutine ticks).
+    Each thinking block must get its own signature at transition time."""
+    thinking_buffer: list[str] = []
+    state = {"current_block_type": None, "block_index": 0}
+    all_events: list[str] = []
+
+    def drive(pieces):
+        events, bt, bi = _emit_content_pieces(
+            pieces,
+            current_block_type=state["current_block_type"],
+            block_index=state["block_index"],
+            thinking_buffer=thinking_buffer,
+        )
+        state["current_block_type"] = bt
+        state["block_index"] = bi
+        all_events.extend(events)
+
+    drive([("thinking", "first reasoning")])
+    drive([("text", "first answer")])
+    drive([("thinking", "second reasoning")])
+    drive([("text", "second answer")])
+
+    # Close whatever is still open via dispatcher.
+    if state["current_block_type"] is not None:
+        all_events.extend(
+            _emit_block_close(
+                state["current_block_type"],
+                state["block_index"],
+                thinking_buffer,
+            )
+        )
+
+    parsed = _parse_events(all_events)
+    sig_events = [
+        p for p in parsed if p["data"].get("delta", {}).get("type") == "signature_delta"
+    ]
+    assert len(sig_events) == 2
+    assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature("first reasoning")
+    assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature("second reasoning")

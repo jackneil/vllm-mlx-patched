@@ -290,6 +290,59 @@ or silence it via `importorskip` without updating invariant 17 first
 Reference: `docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`
 and `docs/superpowers/plans/2026-04-22-qwen3-concurrent-deadlock.md`.
 
+### Invariant 18: `BatchGenerator.insert(..., logits_processors=...)` per-row MUST be a list, never None or omitted (added 2026-04-23)
+
+When admitting a request to `mlx_lm.BatchGenerator.insert()`, the
+`logits_processors=` kwarg MUST be passed with a per-row list.  Omitting
+the kwarg makes mlx-lm slot in `self.logits_processors` (which is `None`
+at the BG level for our construction) as the per-row value.  When a
+heterogeneous pair (one request with a processor, one without) later
+gets merged via `GenerationBatch.extend()`, the merged list contains
+`None` at the per-row slot.  `GenerationBatch._step()` at
+`mlx_lm/generate.py:1346` then crashes on
+`for processor in self.logits_processors[e]` when the slot is None —
+observable as `TypeError: 'NoneType' object is not iterable`.
+
+**Contract:** `vllm_mlx.scheduler.Scheduler._schedule_waiting` MUST call
+`self.batch_generator.insert(..., logits_processors=[[per_row]])` with
+`per_row` being either a (non-empty) list of callables or `[]` — never
+omit the kwarg, never pass `None`.
+
+**Pin location:** `vllm_mlx/scheduler.py` — the `insert_extra` dict
+construction around the `try: uids = self.batch_generator.insert(...)`
+call site (currently near L2239).  The fallback `except Exception`
+insert call shares the same `insert_extra` dict and is protected
+transitively.
+
+**Test guard:** `tests/test_scheduler_heterogeneous_logits_processors.py`
+reproduces both the merge crash (when None is explicitly passed per-
+row) and the fix contract (when `[[]]` is passed) directly against
+real mlx-lm at the `BatchGenerator.insert` API level.  Integration-
+gated; run with
+`VLLM_MLX_INTEGRATION=1 VLLM_MLX_H1_REGRESSION_INTEG=1 pytest tests/test_scheduler_heterogeneous_logits_processors.py -m integration`.
+
+**Defense in depth:** `CACHE_CORRUPTION_PATTERNS` in
+`vllm_mlx/scheduler.py` also includes `"'NoneType' object is not iterable"`
+so future variants of the same class of bug route through the
+`_recover_from_cache_error()` path instead of bubbling up to
+`engine_core._engine_loop`'s retry catch.  The engine loop's catch is
+also bounded: 10 consecutive identical errors aborts the running
+requests with `finish_reason=error`.
+
+**History:** H1 heterogeneous 50ms-stagger deadlock on
+Qwen3.5/3.6-35B-A3B.  Diagnosed via the scheduler trace subsystem
+(`VLLM_MLX_SCHEDULER_TRACE=1`, commits f58aae5 + f1b3158, 2026-04-23).
+Pre-fix baseline: 6/10 HANG on 50ms-staggered pairs; `stall_streak_max=1797`
+on the deadlocked request.  Post-fix: 0/90 HANG across 3 × 30-pair
+bursts.  Fix commit: 312de2f.  Root-cause writeup at
+`docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md`
+closure section.
+
+**Upstream follow-up:** An mlx-lm issue should be filed proposing the
+defensive `for p in (self.logits_processors[e] or []):` fix in
+`GenerationBatch._step()`.  Until upstream lands it, our caller-side
+contract is the only defense.
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

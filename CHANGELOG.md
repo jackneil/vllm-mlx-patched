@@ -10,6 +10,41 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
 
 ## Unreleased
 
+### Qwen3.x heterogeneous 50ms-staggered prefill deadlock — CLOSED (H1)
+
+- **H1 root cause closed (2026-04-23, commit 312de2f).**
+  `Scheduler._schedule_waiting` now passes
+  `logits_processors=[[per_row]]` with a (possibly empty) per-row
+  list instead of omitting the kwarg when the request has no
+  processor.  Omitting caused mlx-lm's default to slot `None` into
+  the per-row position, which crashed `GenerationBatch._step()` on
+  `for p in None` when two heterogeneous requests' batches were
+  merged.  See `UPSTREAM_PIN.md` invariant #18 for the full
+  contract.
+- **Defense in depth:** `CACHE_CORRUPTION_PATTERNS` widened to
+  include `"'NoneType' object is not iterable"` alongside the
+  existing `"not subscriptable"` pattern.  `engine_core._engine_loop`'s
+  generic-exception catch is now bounded — 10 consecutive identical
+  errors aborts running requests with `finish_reason=error` instead
+  of retrying forever.
+- **Trace subsystem (commits f58aae5 + f1b3158) used to localize.**
+  `VLLM_MLX_SCHEDULER_TRACE=1` env-gates structured JSON emits at
+  the scheduler ↔ BatchGenerator boundary on both Qwen and Gemma
+  paths, plus a shape-aware pass-through shim over mlx-lm's
+  BatchGenerator that never `repr()`s output items (avoids Metal
+  sync).  Queue-handler-backed so trace I/O never blocks the
+  scheduler thread.
+- **Regression guards:**
+  - `tests/test_scheduler_heterogeneous_logits_processors.py` — unit
+    test against real mlx-lm 0.31.3 at the BatchGenerator API level.
+  - `tests/test_qwen3_concurrent_heavy_payload.py::test_staggered_pair_50ms_current_failure_mode`
+    flipped from xfail to hard regression guard.
+- **Verification:**
+  - Qwen3.6-35B-A3B: 0/90 HANG across 3 × 30-pair bursts.
+  - Gemma-4-26b-a4b-it-4bit: 0/15 HANG (non-regression control).
+  - Pre-fix baseline (from the same instrumented prod): 6/10 HANG,
+    `stall_streak_max=1797` on the deadlocked request.
+
 ### Qwen3.x hybrid-cache concurrent-prefill fix (mlx-lm#1169 + #1177) — PARTIAL
 
 - **#31** `fix(mlx-lm)`: pin to mlx-lm 0.31.3 (git SHA `3cd9a52d`) for the

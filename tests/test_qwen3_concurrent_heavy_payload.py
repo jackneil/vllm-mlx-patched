@@ -427,28 +427,15 @@ async def test_heterogeneous_pair_current_failure_mode():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Test-harness caveat 2026-04-23: bare shell `curl & sleep 0.05 & "
-        "curl &` reproduces the deadlock ~80% of runs on prod "
-        "llm.hank.ai + Qwen3.6-35B-A3B, but asyncio.create_subprocess_exec "
-        "of the same curl commands (this test) passes despite identical "
-        "args and timing. The difference is likely in how asyncio "
-        "schedules the subprocess spawn relative to the 50ms sleep — "
-        "the real wire-arrival gap ends up smaller than bare shell "
-        "produces. Keeping the test in place as a SKELETON / target "
-        "shape; the authoritative repro is the shell-curl pattern "
-        "documented in "
-        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md. "
-        "Remove the xfail marker once the test harness is retuned to "
-        "reliably reproduce (likely requires explicit subprocess.Popen "
-        "with longer spawn-to-send warmup, OR move the stagger to "
-        "actual measured wire-arrival at the server via tcpdump)."
-    ),
-)
 async def test_staggered_pair_50ms_current_failure_mode():
-    """PRIMARY open-bug repro: heavy fires at T+0, light fires at T+50ms at
+    """50ms-staggered heterogeneous-pair — hard regression guard.
+
+    Previously xfail while H1 was open; flipped to hard guard after
+    the caller-side logits_processors fix (commit 312de2f, 2026-04-23).
+    Failure here means the heterogeneous-pair admission contract from
+    UPSTREAM_PIN.md invariant #18 has regressed.
+
+    PRIMARY open-bug repro: heavy fires at T+0, light fires at T+50ms at
     the SAME Qwen hybrid-cache model. Both must complete with proper
     streaming output.
 

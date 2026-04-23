@@ -253,6 +253,25 @@ def anthropic_to_openai(
     return openai_req, resolved
 
 
+def compute_thinking_signature(thinking_text: str) -> str:
+    """Deterministic opaque signature for an Anthropic thinking block.
+
+    Single source of truth for the "vllm-mlx:<32hex>" signature formula
+    shared by the non-streaming `openai_to_anthropic` adapter and the
+    streaming `_emit_block_close` emitter in server.py. The "vllm-mlx:"
+    prefix distinguishes our signatures from Anthropic's own server-signed
+    values. Identical thinking text always yields an identical signature
+    (useful for replay/caching).
+
+    Callers MUST pass the thinking text byte-identical to what non-streaming
+    would see in `choice.message.reasoning` — order and whitespace
+    preserved. Any join/strip/normalize on one side and not the other
+    breaks the parity contract enforced by
+    test_streaming_signature_matches_non_streaming_byte_for_byte.
+    """
+    return "vllm-mlx:" + hashlib.sha256(thinking_text.encode("utf-8")).hexdigest()[:32]
+
+
 def openai_to_anthropic(
     response: ChatCompletionResponse,
     model: str,
@@ -275,12 +294,7 @@ def openai_to_anthropic(
         # Matches Anthropic's public API and the streaming path
         # (server.py:1991-2032).
         if choice.message.reasoning:
-            sig = (
-                "vllm-mlx:"
-                + hashlib.sha256(choice.message.reasoning.encode("utf-8")).hexdigest()[
-                    :32
-                ]
-            )
+            sig = compute_thinking_signature(choice.message.reasoning)
             content.append(
                 AnthropicResponseContentBlock(
                     type="thinking",

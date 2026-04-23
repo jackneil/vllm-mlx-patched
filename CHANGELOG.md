@@ -64,6 +64,16 @@ Format: entries cite the PR number + a one-line summary. See the PR body for the
   `content_block_delta_count=2, completion=2 tokens` per request.
   Gemma-4-26b-a4b-it-4bit non-regression passed on 0.31.3.
 
+### Anthropic streaming thinking-signature fix (PR #34)
+
+- **Fix Claude Code silently dropping text after thinking blocks on Qwen3.5/3.6 streaming.** Bug doc: [`docs/testing/2026-04-23-qwen3-streaming-thinking-missing-signature-silent-text-drop.md`](docs/testing/2026-04-23-qwen3-streaming-thinking-missing-signature-silent-text-drop.md). Non-streaming path was already correct (PR #14); this PR extends the fix to streaming — every thinking content block now carries a `signature_delta` event before `content_block_stop`, both on mid-stream transitions and at final-close.
+- Both paths share `vllm_mlx.api.anthropic_adapter.compute_thinking_signature()` with a byte-parity guard test (`tests/test_anthropic_streaming_thinking_signature.py::test_streaming_signature_matches_non_streaming_byte_for_byte`).
+- Shared close-event emitter `vllm_mlx.server._emit_block_close` dispatches on block type; unknown types raise `ValueError` so a future signable block type cannot silently drop the contract.
+- Adds `thinking_signature_emitted_total` counter (local `_Counter` pattern; `/metrics` endpoint wiring is a follow-up per metrics.py docstring).
+- `[streaming-signature]` INFO log lines include `msg_id` for on-call correlation (both mid-stream and final-close empty-buffer paths).
+- UPSTREAM_PIN.md **invariant 13 extended** to cover streaming + byte-parity. Rebase-sentinel tests in `tests/test_streaming_signature_rebase_sentinel.py` fire loudly if a future rebase drops the dispatcher or its invocation.
+- **Explicitly rejected: `--anthropic-emit-thinking-signatures` feature flag.** Speculative risk to hypothetical non-Claude-Code downstream SDKs pinned to pre-extended-thinking spec versions. `signature_delta` only emits when the model produces thinking content, which only happens when the client opts into extended thinking (via `thinking.type: "adaptive"` or a chat-template `enable_thinking=True`). Non-opt-in clients never see thinking blocks and therefore never see `signature_delta`. Rollback via `git revert` is the accepted safety net.
+
 ### KV cache LCP contamination fix (issue #29)
 
 - **Fix `--continuous-batching` producing garbage on request 2+** ([#29](https://github.com/jackneil/vllm-mlx-patched/issues/29)) — sessions that loaded a persisted prefix cache could return degenerate repetitive output (`ongo`, `diễn`, ...) for the second and later requests. Root cause was twofold:

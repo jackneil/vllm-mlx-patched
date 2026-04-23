@@ -58,11 +58,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
-from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
+from .api.anthropic_adapter import (
+    anthropic_to_openai,
+    compute_thinking_signature,
+    openai_to_anthropic,
+)
 from .api.anthropic_models import AnthropicRequest
 from .api.budget_ceiling import apply_server_thinking_token_budget_ceiling
 from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401
-from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -94,6 +97,7 @@ from .api.models import (
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.thinking_policy import maybe_disable_thinking_for_qwen3_agent_first_turn
 from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
@@ -109,7 +113,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
-from .metrics import streaming_cap_fired_total
+from .metrics import streaming_cap_fired_total, thinking_signature_emitted_total
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -2688,35 +2692,120 @@ def _detect_starts_thinking(
     return not has_close
 
 
+def _emit_block_close(
+    block_type: str,
+    block_index: int,
+    thinking_buffer: list[str],
+    *,
+    msg_id: str | None = None,
+) -> list[str]:
+    """Emit the close-event sequence for a content block of the given type.
+
+    Dispatches on block_type:
+    - "thinking" → two events: signature_delta (Anthropic extended-thinking
+      streaming spec) then content_block_stop on the same index. Clears
+      thinking_buffer in place.
+    - "text" → one bare content_block_stop event. thinking_buffer untouched.
+    - anything else → raises ValueError so new block types can't silently
+      drop the signature contract.
+
+    Invariant 13 (UPSTREAM_PIN.md): every thinking content block — streaming
+    or non-streaming — MUST carry a signature. Any new signable block type
+    added to the Anthropic adapter MUST be routed through this dispatcher.
+
+    Args:
+        block_type: "thinking" | "text" (unknown types raise ValueError).
+        block_index: Current block index for the close event.
+        thinking_buffer: Caller-owned accumulator for thinking-block text.
+        msg_id: Optional Anthropic message id for log correlation. Passed
+            by `_stream_anthropic_messages` so that on-call can grep
+            `[streaming-signature]` log lines by user-facing msg_id. None
+            is acceptable for unit-test callers.
+    """
+    if block_type == "thinking":
+        signature = compute_thinking_signature("".join(thinking_buffer))
+        if not thinking_buffer:
+            # Empty thinking buffer at close time — legal per spec (signature
+            # is REQUIRED regardless of content), but unusual. Log once so
+            # an operator can correlate unexpected SHA256-of-empty signatures
+            # (`vllm-mlx:e3b0c44298fc1c149afbf4c8996fb924`) back to the
+            # emitting request. INFO level (not WARN) — empty thinking is
+            # legal; WARN would trip ops alerts on a keyword match.
+            logger.info(
+                "[streaming-signature] msg_id=%s closing thinking block "
+                "idx=%d with empty buffer; emitting empty-text signature",
+                msg_id if msg_id is not None else "<unknown>",
+                block_index,
+            )
+        sig_event = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "signature_delta", "signature": signature},
+        }
+        stop_event = {"type": "content_block_stop", "index": block_index}
+        thinking_buffer.clear()
+        thinking_signature_emitted_total.inc()  # module-scope import, see Step 2.5
+        return [
+            f"event: content_block_delta\ndata: {json.dumps(sig_event)}\n\n",
+            f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n",
+        ]
+    if block_type == "text":
+        stop_event = {"type": "content_block_stop", "index": block_index}
+        return [f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"]
+    raise ValueError(
+        f"_emit_block_close: unhandled block_type={block_type!r}. "
+        "Any new signable Anthropic block type MUST be added to this "
+        "dispatcher. See UPSTREAM_PIN.md invariant 13."
+    )
+
+
 def _emit_content_pieces(
     pieces: list[tuple[str, str]],
     current_block_type: str | None,
     block_index: int,
+    thinking_buffer: list[str],
+    *,
+    msg_id: str | None = None,
 ) -> tuple[list[str], str | None, int]:
     """Emit Anthropic SSE events for content pieces from the think router.
 
     Handles block type transitions (thinking <-> text), emitting
-    content_block_start/stop/delta events as needed.
+    content_block_start/stop/delta events as needed. When closing a
+    `thinking` block, uses _emit_block_close() to emit signature_delta +
+    content_block_stop so streaming matches the non-streaming signature
+    contract (UPSTREAM_PIN.md invariant 13).
 
     Args:
         pieces: List of (block_type, text) from StreamingThinkRouter
-        current_block_type: Current open block type, or None
+        current_block_type: Currently-open block type, or None
         block_index: Current block index
+        thinking_buffer: Caller-owned accumulator for thinking-block text.
+            Mutated in place — appended while a thinking block is open,
+            cleared by _emit_block_close() when the block closes. The
+            caller MUST allocate a fresh list at the top of each request's
+            streaming coroutine. Sharing a buffer across requests is a bug.
+        msg_id: Optional Anthropic message id, passed through to
+            `_emit_block_close` for log correlation. None is acceptable
+            for unit-test callers that don't exercise the log path.
 
     Returns:
-        Tuple of (events, updated_block_type, updated_block_index)
+        (events, updated_block_type, updated_block_index). The final open
+        block (if any) is NOT closed here; _stream_anthropic_messages'
+        final-close owns that.
     """
     events = []
     for block_type, text in pieces:
         if block_type != current_block_type:
-            # Close previous block if open
             if current_block_type is not None:
-                events.append(
-                    f"event: content_block_stop\ndata: "
-                    f"{json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                events.extend(
+                    _emit_block_close(
+                        current_block_type,
+                        block_index,
+                        thinking_buffer,
+                        msg_id=msg_id,
+                    )
                 )
                 block_index += 1
-            # Start new block
             current_block_type = block_type
             content_block = (
                 {"type": block_type, "text": ""}
@@ -2727,7 +2816,8 @@ def _emit_content_pieces(
                 f"event: content_block_start\ndata: "
                 f"{json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
             )
-        # Emit delta
+        if block_type == "thinking":
+            thinking_buffer.append(text)
         delta_key = "thinking" if block_type == "thinking" else "text"
         delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
         delta_event = {
@@ -2867,6 +2957,10 @@ async def _stream_anthropic_messages(
     # Track which content blocks we've started
     current_block_type = None  # "thinking" or "text"
     block_index = 0
+    # Caller-owned accumulator for thinking-block text. Threaded through
+    # _emit_content_pieces; cleared by _emit_block_close() when a thinking
+    # block closes. Fresh per request — sharing across requests is a bug.
+    thinking_buffer: list[str] = []
 
     # Server-side streaming cap — guards against Qwen3.x "interleaved
     # thinking" trap and any other model-side non-termination. When the
@@ -2981,7 +3075,11 @@ async def _stream_anthropic_messages(
                 # Stage 2: route thinking vs text
                 pieces = think_router.process(filtered)
                 events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index
+                    pieces,
+                    current_block_type,
+                    block_index,
+                    thinking_buffer,
+                    msg_id=msg_id,
                 )
                 for event in events:
                     yield event
@@ -2990,7 +3088,11 @@ async def _stream_anthropic_messages(
     remaining = tool_filter.flush()
     if remaining:
         events, current_block_type, block_index = _emit_content_pieces(
-            think_router.process(remaining), current_block_type, block_index
+            think_router.process(remaining),
+            current_block_type,
+            block_index,
+            thinking_buffer,
+            msg_id=msg_id,
         )
         for event in events:
             yield event
@@ -2998,14 +3100,28 @@ async def _stream_anthropic_messages(
     flush_pieces = think_router.flush()
     if flush_pieces:
         events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index
+            flush_pieces,
+            current_block_type,
+            block_index,
+            thinking_buffer,
+            msg_id=msg_id,
         )
         for event in events:
             yield event
 
-    # Close final content block
+    # Close final content block via the shared dispatcher so thinking blocks
+    # get signature_delta + content_block_stop and text/tool_use blocks
+    # get a bare stop — single source of truth with the mid-stream transition
+    # path. Handles the stream-ends-on-open-thinking case (max_tokens cap,
+    # clean stop with thinking but no text).
     if current_block_type is not None:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        for ev in _emit_block_close(
+            current_block_type,
+            block_index,
+            thinking_buffer,
+            msg_id=msg_id,
+        ):
+            yield ev
         block_index += 1
 
     # Check for tool calls in accumulated text

@@ -54,6 +54,11 @@ _QUEUE_CAPACITY = 100_000
 
 
 def is_trace_enabled() -> bool:
+    """Return True iff VLLM_MLX_SCHEDULER_TRACE=1.
+
+    PINNED AT IMPORT.  If the env var is set AFTER ``import vllm_mlx``, this
+    still returns False.  Tests can monkey-patch ``_TRACE_ENABLED`` directly.
+    """
     return _TRACE_ENABLED
 
 

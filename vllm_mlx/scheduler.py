@@ -2183,14 +2183,19 @@ class Scheduler:
                     candidate_tokens=request.num_prompt_tokens,
                     running_before=len(self.running),
                 )
-            # [schedule_attempt] INFO log — fires for ALL admission attempts,
-            # including ones that hang inside insert().  Wall_ns is embedded
-            # in the message body so downstream tooling (build_manifest.py)
-            # can cross-reference by timestamp regardless of log format.
-            logger.info(
-                f"[schedule_attempt] request={request.request_id[:12]} "
-                f"wall_ns={time.time_ns()} tokens={request.num_prompt_tokens}"
-            )
+            # [schedule_attempt] INFO log — gated behind trace_enabled() so it
+            # doesn't hit the scheduler thread's hot path in prod.  When trace
+            # is on, this log still goes to the vllm_mlx.scheduler logger (not
+            # the async trace channel) but is bounded by the trace-diagnostic
+            # window — the operator is already accepting stderr overhead for
+            # that window.  Wall_ns is embedded in the message body so
+            # downstream tooling (build_manifest.py) can cross-reference by
+            # timestamp regardless of log format.
+            if trace_enabled():
+                logger.info(
+                    f"[schedule_attempt] request={request.request_id[:12]} "
+                    f"wall_ns={time.time_ns()} tokens={request.num_prompt_tokens}"
+                )
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)

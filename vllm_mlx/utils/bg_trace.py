@@ -29,6 +29,21 @@ _logger = logging.getLogger(__name__)
 
 _MISSING = object()
 
+# Whitelist of scalar fields extracted per response item.  Single source of
+# truth — scheduler.py and mllm_scheduler.py's step.exit dict-comprehensions
+# reference this same tuple so adding a new field is a one-place edit.  Never
+# add fields that might hold mx.array (logprobs, current_state, etc.) — repr
+# would force Metal sync and mask the race class under investigation.
+SAFE_OUTPUT_FIELDS: tuple[str, ...] = (
+    "uid",
+    "request_id",
+    "token",
+    "finish_reason",
+    "end_of_segment",
+    "end_of_prompt",
+    "progress",
+)
+
 
 def _extract_request_summary(request: Any) -> Any:
     try:
@@ -51,15 +66,7 @@ def _extract_request_summary(request: Any) -> Any:
 
 def _extract_output_summary(output: Any) -> dict:
     out: dict[str, Any] = {}
-    for f in (
-        "uid",
-        "request_id",
-        "token",
-        "finish_reason",
-        "end_of_segment",
-        "end_of_prompt",
-        "progress",
-    ):
+    for f in SAFE_OUTPUT_FIELDS:
         try:
             v = getattr(output, f, _MISSING)
             if v is _MISSING:

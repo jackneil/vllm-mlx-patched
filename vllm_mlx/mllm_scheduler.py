@@ -459,10 +459,15 @@ class MLLMScheduler:
                     candidate_tokens=request.num_prompt_tokens,
                     running_before=len(self.running),
                 )
-            logger.info(
-                f"[schedule_attempt] request={request.request_id[:12]} "
-                f"wall_ns={time.time_ns()} tokens={request.num_prompt_tokens}"
-            )
+            # Gated like the Qwen sibling at scheduler.py: this INFO line is a
+            # synchronous stderr write on the single-worker scheduler thread.
+            # Only emit when trace is on (the operator is already accepting
+            # stderr overhead during the trace-diagnostic window).
+            if trace_enabled():
+                logger.info(
+                    f"[schedule_attempt] request={request.request_id[:12]} "
+                    f"wall_ns={time.time_ns()} tokens={request.num_prompt_tokens}"
+                )
 
             # Create batch request
             batch_req = MLLMBatchRequest(
@@ -506,13 +511,17 @@ class MLLMScheduler:
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
 
-                # Upgraded from debug → info with [schedule] format matching
-                # Qwen scheduler.py:2238 so build_manifest.py can correlate
-                # hung requests via wall_ns.
-                logger.info(
-                    f"[schedule] request={request.request_id[:12]} "
-                    f"uid={uid} wall_ns={time.time_ns()}"
-                )
+                # Gated: synchronous stderr write on the single-worker
+                # scheduler thread.  When trace is off, the prior debug-level
+                # log is also off (matches the pre-commit behavior).  When
+                # trace is on, emit at INFO with [schedule] format matching
+                # Qwen scheduler.py so build_manifest.py can correlate hung
+                # requests via wall_ns.
+                if trace_enabled():
+                    logger.info(
+                        f"[schedule] request={request.request_id[:12]} "
+                        f"uid={uid} wall_ns={time.time_ns()}"
+                    )
 
         return scheduled
 

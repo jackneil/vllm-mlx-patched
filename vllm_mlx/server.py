@@ -2751,31 +2751,39 @@ def _emit_content_pieces(
     pieces: list[tuple[str, str]],
     current_block_type: str | None,
     block_index: int,
+    thinking_buffer: list[str],
 ) -> tuple[list[str], str | None, int]:
     """Emit Anthropic SSE events for content pieces from the think router.
 
     Handles block type transitions (thinking <-> text), emitting
-    content_block_start/stop/delta events as needed.
+    content_block_start/stop/delta events as needed. When closing a
+    `thinking` block, uses _emit_block_close() to emit signature_delta +
+    content_block_stop so streaming matches the non-streaming signature
+    contract (UPSTREAM_PIN.md invariant 13).
 
     Args:
         pieces: List of (block_type, text) from StreamingThinkRouter
-        current_block_type: Current open block type, or None
+        current_block_type: Currently-open block type, or None
         block_index: Current block index
+        thinking_buffer: Caller-owned accumulator for thinking-block text.
+            Mutated in place — appended while a thinking block is open,
+            cleared by _emit_block_close() when the block closes. The
+            caller MUST allocate a fresh list at the top of each request's
+            streaming coroutine. Sharing a buffer across requests is a bug.
 
     Returns:
-        Tuple of (events, updated_block_type, updated_block_index)
+        (events, updated_block_type, updated_block_index). The final open
+        block (if any) is NOT closed here; _stream_anthropic_messages'
+        final-close owns that.
     """
     events = []
     for block_type, text in pieces:
         if block_type != current_block_type:
-            # Close previous block if open
             if current_block_type is not None:
-                events.append(
-                    f"event: content_block_stop\ndata: "
-                    f"{json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                events.extend(
+                    _emit_block_close(current_block_type, block_index, thinking_buffer)
                 )
                 block_index += 1
-            # Start new block
             current_block_type = block_type
             content_block = (
                 {"type": block_type, "text": ""}
@@ -2786,7 +2794,8 @@ def _emit_content_pieces(
                 f"event: content_block_start\ndata: "
                 f"{json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
             )
-        # Emit delta
+        if block_type == "thinking":
+            thinking_buffer.append(text)
         delta_key = "thinking" if block_type == "thinking" else "text"
         delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
         delta_event = {
@@ -2926,6 +2935,10 @@ async def _stream_anthropic_messages(
     # Track which content blocks we've started
     current_block_type = None  # "thinking" or "text"
     block_index = 0
+    # Caller-owned accumulator for thinking-block text. Threaded through
+    # _emit_content_pieces; cleared by _emit_block_close() when a thinking
+    # block closes. Fresh per request — sharing across requests is a bug.
+    thinking_buffer: list[str] = []
 
     # Server-side streaming cap — guards against Qwen3.x "interleaved
     # thinking" trap and any other model-side non-termination. When the
@@ -3040,7 +3053,7 @@ async def _stream_anthropic_messages(
                 # Stage 2: route thinking vs text
                 pieces = think_router.process(filtered)
                 events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index
+                    pieces, current_block_type, block_index, thinking_buffer
                 )
                 for event in events:
                     yield event
@@ -3049,7 +3062,10 @@ async def _stream_anthropic_messages(
     remaining = tool_filter.flush()
     if remaining:
         events, current_block_type, block_index = _emit_content_pieces(
-            think_router.process(remaining), current_block_type, block_index
+            think_router.process(remaining),
+            current_block_type,
+            block_index,
+            thinking_buffer,
         )
         for event in events:
             yield event
@@ -3057,14 +3073,19 @@ async def _stream_anthropic_messages(
     flush_pieces = think_router.flush()
     if flush_pieces:
         events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index
+            flush_pieces, current_block_type, block_index, thinking_buffer
         )
         for event in events:
             yield event
 
-    # Close final content block
+    # Close final content block via the shared dispatcher so thinking blocks
+    # get signature_delta + content_block_stop and text/tool_use blocks
+    # get a bare stop — single source of truth with the mid-stream transition
+    # path. Handles the stream-ends-on-open-thinking case (max_tokens cap,
+    # clean stop with thinking but no text).
     if current_block_type is not None:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        for ev in _emit_block_close(current_block_type, block_index, thinking_buffer):
+            yield ev
         block_index += 1
 
     # Check for tool calls in accumulated text

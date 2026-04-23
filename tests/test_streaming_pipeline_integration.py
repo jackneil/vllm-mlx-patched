@@ -16,7 +16,9 @@ class TestEmitContentPieces(unittest.TestCase):
     """Test the refactored _emit_content_pieces helper."""
 
     def test_single_text_block(self):
-        events, block_type, index = _emit_content_pieces([("text", "hello")], None, 0)
+        events, block_type, index = _emit_content_pieces(
+            [("text", "hello")], None, 0, []
+        )
         assert len(events) == 2  # block_start + delta
         assert block_type == "text"
         assert index == 0
@@ -30,7 +32,7 @@ class TestEmitContentPieces(unittest.TestCase):
 
     def test_single_thinking_block(self):
         events, block_type, index = _emit_content_pieces(
-            [("thinking", "reasoning")], None, 0
+            [("thinking", "reasoning")], None, 0, []
         )
         assert block_type == "thinking"
         delta_data = json.loads(events[1].split("data: ")[1])
@@ -38,23 +40,28 @@ class TestEmitContentPieces(unittest.TestCase):
 
     def test_transition_thinking_to_text(self):
         events, block_type, index = _emit_content_pieces(
-            [("thinking", "reason"), ("text", "answer")], None, 0
+            [("thinking", "reason"), ("text", "answer")], None, 0, []
         )
         assert block_type == "text"
         assert index == 1  # incremented on block transition
-        # Should have: start_thinking, delta_thinking, stop_thinking, start_text, delta_text
-        assert len(events) == 5
-        stop_data = json.loads(events[2].split("data: ")[1])
+        # Should have: start_thinking, delta_thinking, signature_delta,
+        # stop_thinking, start_text, delta_text
+        assert len(events) == 6
+        sig_data = json.loads(events[2].split("data: ")[1])
+        assert sig_data["delta"]["type"] == "signature_delta"
+        stop_data = json.loads(events[3].split("data: ")[1])
         assert stop_data["type"] == "content_block_stop"
 
     def test_continues_existing_block(self):
         """If current_block_type matches, no start/stop emitted."""
-        events, block_type, index = _emit_content_pieces([("text", "more")], "text", 0)
+        events, block_type, index = _emit_content_pieces(
+            [("text", "more")], "text", 0, []
+        )
         assert len(events) == 1  # just delta, no start
         assert block_type == "text"
 
     def test_empty_pieces(self):
-        events, block_type, index = _emit_content_pieces([], None, 0)
+        events, block_type, index = _emit_content_pieces([], None, 0, [])
         assert events == []
         assert block_type is None
         assert index == 0
@@ -69,6 +76,9 @@ class TestStreamingPipelineIntegration(unittest.TestCase):
         think_router = StreamingThinkRouter(start_in_thinking=start_in_thinking)
         current_block_type = None
         block_index = 0
+        # Caller-owned buffer threaded through every _emit_content_pieces
+        # call in this request, mirroring production semantics.
+        buf: list[str] = []
         all_events = []
         accumulated_text = ""
 
@@ -79,7 +89,7 @@ class TestStreamingPipelineIntegration(unittest.TestCase):
                 continue
             pieces = think_router.process(filtered)
             events, current_block_type, block_index = _emit_content_pieces(
-                pieces, current_block_type, block_index
+                pieces, current_block_type, block_index, buf
             )
             all_events.extend(events)
 
@@ -88,14 +98,14 @@ class TestStreamingPipelineIntegration(unittest.TestCase):
         if remaining:
             pieces = think_router.process(remaining)
             events, current_block_type, block_index = _emit_content_pieces(
-                pieces, current_block_type, block_index
+                pieces, current_block_type, block_index, buf
             )
             all_events.extend(events)
 
         flush_pieces = think_router.flush()
         if flush_pieces:
             events, current_block_type, block_index = _emit_content_pieces(
-                flush_pieces, current_block_type, block_index
+                flush_pieces, current_block_type, block_index, buf
             )
             all_events.extend(events)
 

@@ -269,10 +269,7 @@ def compute_thinking_signature(thinking_text: str) -> str:
     breaks the parity contract enforced by
     test_streaming_signature_matches_non_streaming_byte_for_byte.
     """
-    return (
-        "vllm-mlx:"
-        + hashlib.sha256(thinking_text.encode("utf-8")).hexdigest()[:32]
-    )
+    return "vllm-mlx:" + hashlib.sha256(thinking_text.encode("utf-8")).hexdigest()[:32]
 
 
 def openai_to_anthropic(

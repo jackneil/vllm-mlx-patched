@@ -32,10 +32,7 @@ def test_helper_signature_format_and_determinism():
     match PR #14's formula (sha256 then first 32 hex chars)."""
     sig = compute_thinking_signature("Hello world")
     assert SIG_RE.match(sig), f"bad format: {sig!r}"
-    expected = (
-        "vllm-mlx:"
-        + hashlib.sha256(b"Hello world").hexdigest()[:32]
-    )
+    expected = "vllm-mlx:" + hashlib.sha256(b"Hello world").hexdigest()[:32]
     assert sig == expected
     assert compute_thinking_signature("Hello world") == sig
     assert compute_thinking_signature("Hello World") != sig
@@ -57,8 +54,8 @@ def _parse_events(events: list[str]) -> list[dict]:
         assert lines[1].startswith("data: "), raw
         out.append(
             {
-                "event": lines[0][len("event: "):],
-                "data": json.loads(lines[1][len("data: "):]),
+                "event": lines[0][len("event: ") :],
+                "data": json.loads(lines[1][len("data: ") :]),
             }
         )
     return out
@@ -201,13 +198,19 @@ def test_interleaved_thinking_each_block_gets_distinct_signature():
     )
     parsed = _parse_events(events)
     sig_events = [
-        p for p in parsed
-        if p["data"].get("delta", {}).get("type") == "signature_delta"
+        p for p in parsed if p["data"].get("delta", {}).get("type") == "signature_delta"
     ]
     assert len(sig_events) == 2, f"expected 2 sig events, got {len(sig_events)}"
-    assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature("reasoning A")
-    assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature("reasoning B")
-    assert sig_events[0]["data"]["delta"]["signature"] != sig_events[1]["data"]["delta"]["signature"]
+    assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "reasoning A"
+    )
+    assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "reasoning B"
+    )
+    assert (
+        sig_events[0]["data"]["delta"]["signature"]
+        != sig_events[1]["data"]["delta"]["signature"]
+    )
     assert thinking_buffer == []
     assert final_idx == 3
 
@@ -246,13 +249,14 @@ def test_thinking_alone_keeps_block_open_then_final_close_signs_it():
     # (b) The Step 3.5b final-close call pattern.
     close_events = _emit_block_close(new_type, new_idx, thinking_buffer)
     close_parsed = _parse_events(close_events)
-    assert [(p["event"], p["data"].get("delta", {}).get("type")) for p in close_parsed] == [
+    assert [
+        (p["event"], p["data"].get("delta", {}).get("type")) for p in close_parsed
+    ] == [
         ("content_block_delta", "signature_delta"),
         ("content_block_stop", None),
     ]
-    assert (
-        close_parsed[0]["data"]["delta"]["signature"]
-        == compute_thinking_signature("reasoning, no follow-up")
+    assert close_parsed[0]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "reasoning, no follow-up"
     )
     assert thinking_buffer == []
 
@@ -338,9 +342,8 @@ def test_final_close_on_open_thinking_via_dispatcher():
         ("content_block_delta", "signature_delta"),
         ("content_block_stop", None),
     ]
-    assert (
-        parsed[0]["data"]["delta"]["signature"]
-        == compute_thinking_signature("only thinking, no text follows")
+    assert parsed[0]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "only thinking, no text follows"
     )
     assert thinking_buffer == []
 
@@ -368,9 +371,8 @@ def test_thinking_to_tool_use_transition_closes_with_signature():
     )
     parsed = _parse_events(close_events)
     assert parsed[0]["data"]["delta"]["type"] == "signature_delta"
-    assert (
-        parsed[0]["data"]["delta"]["signature"]
-        == compute_thinking_signature("I should call the tool")
+    assert parsed[0]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "I should call the tool"
     )
 
 
@@ -383,6 +385,7 @@ class _FakeOutput:
     """Minimal GenerationOutput shim — _stream_anthropic_messages reads
     only .new_text, .prompt_tokens, .completion_tokens (with hasattr
     guards on the latter two)."""
+
     def __init__(self, new_text: str):
         self.new_text = new_text
         self.prompt_tokens = 0
@@ -393,6 +396,7 @@ class _FakeEngine:
     """Minimal engine shim matching the three attributes
     _stream_anthropic_messages actually reads. Accepts the chunk list
     at construction; stream_chat yields them in order."""
+
     preserve_native_tool_format = False
     tokenizer = None  # hasattr-guarded downstream
 
@@ -432,9 +436,9 @@ async def test_e2e_mid_stream_thinking_to_text_emits_signature():
     """End-to-end (a): thinking→text transition."""
     engine = _FakeEngine(["<think>", "hello ", "world", "</think>", "answer"])
     wire = await _drive_stream(engine)
-    assert wire.count('"signature_delta"') == 1, (
-        f"expected 1 signature_delta on mid-stream close, wire:\n{wire}"
-    )
+    assert (
+        wire.count('"signature_delta"') == 1
+    ), f"expected 1 signature_delta on mid-stream close, wire:\n{wire}"
     expected_sig = compute_thinking_signature("hello world")
     assert expected_sig in wire, f"expected signature {expected_sig!r} not on wire"
 
@@ -444,9 +448,9 @@ async def test_e2e_final_close_on_open_thinking_emits_signature():
     """End-to-end (b): stream terminates with an open thinking block."""
     engine = _FakeEngine(["<think>", "hello ", "world"])  # no </think>, no text
     wire = await _drive_stream(engine)
-    assert wire.count('"signature_delta"') == 1, (
-        f"expected 1 signature_delta from final-close, wire:\n{wire}"
-    )
+    assert (
+        wire.count('"signature_delta"') == 1
+    ), f"expected 1 signature_delta from final-close, wire:\n{wire}"
     expected_sig = compute_thinking_signature("hello world")
     assert expected_sig in wire, f"expected signature {expected_sig!r} not on wire"
 
@@ -477,16 +481,18 @@ def test_emitted_events_conform_to_anthropic_streaming_shape():
         "message_stop",
         "ping",
         "error",  # Anthropic emits `error` events on server-side failures.
-                  # Our emitter doesn't produce them today but the
-                  # allowlist should accept them so this test doesn't
-                  # flag a future error-event addition.
+        # Our emitter doesn't produce them today but the
+        # allowlist should accept them so this test doesn't
+        # flag a future error-event addition.
     }
-    ALLOWED_DELTA_TYPES = {  # noqa: N806 — function-local constant, uppercase for semantic clarity
-        "text_delta",
-        "thinking_delta",
-        "signature_delta",
-        "input_json_delta",
-    }
+    ALLOWED_DELTA_TYPES = (
+        {  # noqa: N806 — function-local constant, uppercase for semantic clarity
+            "text_delta",
+            "thinking_delta",
+            "signature_delta",
+            "input_json_delta",
+        }
+    )
 
     thinking_buffer: list[str] = []
     events, _, _ = _emit_content_pieces(
@@ -499,16 +505,16 @@ def test_emitted_events_conform_to_anthropic_streaming_shape():
 
     for p in parsed:
         # Event type must be Anthropic-spec-known.
-        assert p["event"] in ALLOWED_EVENT_TYPES, (
-            f"unknown event type {p['event']!r}; not in Anthropic spec"
-        )
+        assert (
+            p["event"] in ALLOWED_EVENT_TYPES
+        ), f"unknown event type {p['event']!r}; not in Anthropic spec"
         # content_block_delta carries a typed delta.
         if p["event"] == "content_block_delta":
             delta = p["data"].get("delta")
             assert isinstance(delta, dict), f"no delta: {p}"
-            assert delta.get("type") in ALLOWED_DELTA_TYPES, (
-                f"unknown delta type {delta.get('type')!r}"
-            )
+            assert (
+                delta.get("type") in ALLOWED_DELTA_TYPES
+            ), f"unknown delta type {delta.get('type')!r}"
             # signature_delta carries a string `signature` field.
             if delta["type"] == "signature_delta":
                 sig = delta.get("signature")
@@ -554,8 +560,12 @@ def test_interleaved_thinking_via_emit_content_pieces():
         p for p in parsed if p["data"].get("delta", {}).get("type") == "signature_delta"
     ]
     assert len(sig_events) == 2
-    assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature("first reasoning")
-    assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature("second reasoning")
+    assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "first reasoning"
+    )
+    assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature(
+        "second reasoning"
+    )
 
 
 def test_emit_block_close_increments_signature_counter():

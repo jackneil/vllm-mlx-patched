@@ -2799,7 +2799,9 @@ def _emit_content_pieces(
             if current_block_type is not None:
                 events.extend(
                     _emit_block_close(
-                        current_block_type, block_index, thinking_buffer,
+                        current_block_type,
+                        block_index,
+                        thinking_buffer,
                         msg_id=msg_id,
                     )
                 )
@@ -3073,7 +3075,10 @@ async def _stream_anthropic_messages(
                 # Stage 2: route thinking vs text
                 pieces = think_router.process(filtered)
                 events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index, thinking_buffer,
+                    pieces,
+                    current_block_type,
+                    block_index,
+                    thinking_buffer,
                     msg_id=msg_id,
                 )
                 for event in events:
@@ -3095,7 +3100,10 @@ async def _stream_anthropic_messages(
     flush_pieces = think_router.flush()
     if flush_pieces:
         events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index, thinking_buffer,
+            flush_pieces,
+            current_block_type,
+            block_index,
+            thinking_buffer,
             msg_id=msg_id,
         )
         for event in events:
@@ -3108,7 +3116,10 @@ async def _stream_anthropic_messages(
     # clean stop with thinking but no text).
     if current_block_type is not None:
         for ev in _emit_block_close(
-            current_block_type, block_index, thinking_buffer, msg_id=msg_id,
+            current_block_type,
+            block_index,
+            thinking_buffer,
+            msg_id=msg_id,
         ):
             yield ev
         block_index += 1

@@ -13,10 +13,11 @@ The scheduler follows vLLM's design with:
 
 import inspect
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -27,7 +28,10 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .utils.bg_trace import BatchGeneratorTraceShim
 from .utils.mamba_cache import ensure_mamba_support
+from .utils.trace import emit as trace_emit
+from .utils.trace import is_trace_enabled as trace_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +43,7 @@ ensure_mamba_support()
 # once a constructor kwarg and is now set as an attribute post-construction).
 # Filtering via inspect.signature() lets vllm-mlx keep building against
 # newer and older mlx_lm releases without crashing.
-_BG_INIT_PARAMS: Set[str] = set(
+_BG_INIT_PARAMS: set[str] = set(
     inspect.signature(BatchGenerator.__init__).parameters.keys()
 )
 
@@ -51,7 +55,7 @@ _BG_INIT_PARAMS: Set[str] = set(
 _INVARIANT_10_LOGGED: bool = False
 
 
-def _bg_kwargs(**kwargs: Any) -> Dict[str, Any]:
+def _bg_kwargs(**kwargs: Any) -> dict[str, Any]:
     """Filter kwargs to those accepted by BatchGenerator.__init__.
 
     Drops (with a warning) any kwarg the installed mlx_lm doesn't accept.
@@ -208,9 +212,16 @@ def _attach_thinking_budget_processor(
     return processor, None
 
 
-# Error patterns that indicate cache corruption
+# Error patterns that indicate recoverable batch-state corruption.
+# When a TypeError matching any of these fires inside scheduler.step(),
+# the scheduler resets the BG + caches and reschedules running requests
+# instead of bubbling up to engine_core's retry catch (which would
+# infinite-loop).  Defense in depth alongside the specific call-site
+# fixes (e.g., UPSTREAM_PIN invariant #18 for the logits_processors
+# case added 2026-04-23).
 CACHE_CORRUPTION_PATTERNS = [
     "'NoneType' object is not subscriptable",
+    "'NoneType' object is not iterable",
     "cache",
     "BatchKVCache",
 ]
@@ -244,7 +255,7 @@ class SchedulerConfig:
 
     # Memory-aware cache settings (recommended for large models)
     use_memory_aware_cache: bool = True  # Use memory-based eviction
-    cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
+    cache_memory_mb: int | None = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
     # KV cache quantization (reduces prefix cache memory)
@@ -287,13 +298,13 @@ class SchedulerOutput:
     """
 
     # Requests scheduled in this step
-    scheduled_request_ids: List[str] = field(default_factory=list)
+    scheduled_request_ids: list[str] = field(default_factory=list)
     # Total tokens scheduled
     num_scheduled_tokens: int = 0
     # Requests that finished in this step
-    finished_request_ids: Set[str] = field(default_factory=set)
+    finished_request_ids: set[str] = field(default_factory=set)
     # Request outputs (tokens generated)
-    outputs: List[RequestOutput] = field(default_factory=list)
+    outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
 
@@ -303,9 +314,9 @@ def _install_chunked_prefill(
     budget: int,
     mid_prefill_save=None,
     prompt_cache_save=None,
-    pending_abort_ids: Optional[Set[str]] = None,
-    uid_to_request_id: Optional[Dict[int, str]] = None,
-    requests: Optional[Dict[str, Any]] = None,
+    pending_abort_ids: set[str] | None = None,
+    uid_to_request_id: dict[int, str] | None = None,
+    requests: dict[str, Any] | None = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -1199,7 +1210,7 @@ class Scheduler:
         self,
         model: Any,
         tokenizer: Any,
-        config: Optional[SchedulerConfig] = None,
+        config: SchedulerConfig | None = None,
         reasoning_parser: Any = None,
     ):
         """
@@ -1223,27 +1234,27 @@ class Scheduler:
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
-        self._detokenizer_pool: Dict[str, Any] = {}
+        self._detokenizer_pool: dict[str, Any] = {}
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
-        self.running: Dict[str, Request] = {}  # Running requests by ID
-        self.requests: Dict[str, Request] = {}  # All requests by ID
-        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self.running: dict[str, Request] = {}  # Running requests by ID
+        self.requests: dict[str, Request] = {}  # All requests by ID
+        self.finished_req_ids: set[str] = set()  # Recently finished
 
         # Mapping between our request IDs and BatchGenerator UIDs
-        self.request_id_to_uid: Dict[str, int] = {}
-        self.uid_to_request_id: Dict[int, str] = {}
+        self.request_id_to_uid: dict[str, int] = {}
+        self.uid_to_request_id: dict[int, str] = {}
 
         # BatchGenerator - the actual batching engine
-        self.batch_generator: Optional[BatchGenerator] = None
-        self._current_sampler_params: Optional[Tuple] = None
+        self.batch_generator: BatchGenerator | None = None
+        self._current_sampler_params: tuple | None = None
 
         # Prefix cache for KV state reuse
-        self.prefix_cache: Optional[PrefixCacheManager] = None
-        self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
-        self.paged_cache_manager: Optional[PagedCacheManager] = None
-        self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self.prefix_cache: PrefixCacheManager | None = None
+        self.memory_aware_cache: MemoryAwarePrefixCache | None = None
+        self.paged_cache_manager: PagedCacheManager | None = None
+        self.block_aware_cache: BlockAwarePrefixCache | None = None
 
         if self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
@@ -1290,7 +1301,7 @@ class Scheduler:
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
-        self._pending_abort_ids: Set[str] = set()
+        self._pending_abort_ids: set[str] = set()
 
         # Statistics
         self.num_requests_processed = 0
@@ -1319,7 +1330,7 @@ class Scheduler:
         # Fallback to the original
         return tokenizer
 
-    def _decode_tokens(self, token_ids: List[int]) -> str:
+    def _decode_tokens(self, token_ids: list[int]) -> str:
         """
         Decode token IDs to text, handling both tokenizers and processors.
         """
@@ -1340,7 +1351,7 @@ class Scheduler:
         """Remove the streaming detokenizer for a finished request."""
         self._detokenizer_pool.pop(request_id, None)
 
-    def _get_stop_tokens(self) -> Set[int]:
+    def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer or processor."""
         stop_tokens = set()
         # Check both the processor/tokenizer and the actual tokenizer
@@ -1499,6 +1510,8 @@ class Scheduler:
                     "(model.mtp is None). MTP will be disabled."
                 )
 
+        if trace_enabled():
+            bg = BatchGeneratorTraceShim(bg)
         return bg
 
     def _make_prompt_cache_save_callback(self):
@@ -1635,6 +1648,12 @@ class Scheduler:
         ):
             # If we have an existing generator with requests, we need to drain it first
             if self.batch_generator is not None and self.running:
+                if trace_enabled():
+                    trace_emit(
+                        "bg.recreate.skipped_running_nonempty",
+                        running_before=len(self.running),
+                        running_ids=[r.request_id for r in list(self.running.values())],
+                    )
                 logger.warning(
                     "Sampling parameters changed with active requests. "
                     "New requests will use new parameters after current batch completes."
@@ -1660,6 +1679,17 @@ class Scheduler:
                     f"keeping {n_entries} cache entries"
                 )
 
+            if trace_enabled():
+                trace_emit(
+                    "bg.recreate",
+                    running_before=len(self.running),
+                    running_ids=[r.request_id for r in list(self.running.values())],
+                    reason=(
+                        "first_call"
+                        if self.batch_generator is None
+                        else "sampling_params_changed"
+                    ),
+                )
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
@@ -1724,7 +1754,7 @@ class Scheduler:
 
         return True
 
-    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+    def _extract_cache_states(self, raw_cache: list[Any]) -> list[dict[str, Any]]:
         """
         Extract actual tensor state from each layer cache.
 
@@ -1762,8 +1792,8 @@ class Scheduler:
         return extracted if len(extracted) == len(raw_cache) else []
 
     def _reconstruct_cache_from_states(
-        self, extracted_states: List[Dict[str, Any]]
-    ) -> Optional[List[Any]]:
+        self, extracted_states: list[dict[str, Any]]
+    ) -> list[Any] | None:
         """
         Reconstruct cache objects from extracted cache states.
 
@@ -1795,6 +1825,8 @@ class Scheduler:
                     # (safe because mid-prefill save is always batch_size=1).
                     from mlx_lm.models.cache import (
                         BatchKVCache as _BatchKVCache,
+                    )
+                    from mlx_lm.models.cache import (
                         KVCache as _KVCache,
                     )
 
@@ -2133,17 +2165,44 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
 
         Returns:
             List of requests that were scheduled
         """
+        if trace_enabled():
+            trace_emit(
+                "schedule_waiting.cycle",
+                running=len(self.running),
+                waiting=len(self.waiting),
+                running_ids=[r.request_id for r in list(self.running.values())],
+            )
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
+            if trace_enabled():
+                trace_emit(
+                    "schedule_waiting.iter",
+                    request_id=request.request_id,
+                    candidate_tokens=request.num_prompt_tokens,
+                    running_before=len(self.running),
+                )
+            # [schedule_attempt] INFO log — gated behind trace_enabled() so it
+            # doesn't hit the scheduler thread's hot path in prod.  When trace
+            # is on, this log still goes to the vllm_mlx.scheduler logger (not
+            # the async trace channel) but is bounded by the trace-diagnostic
+            # window — the operator is already accepting stderr overhead for
+            # that window.  Wall_ns is embedded in the message body so
+            # downstream tooling (build_manifest.py) can cross-reference by
+            # timestamp regardless of log format.
+            if trace_enabled():
+                logger.info(
+                    f"[schedule_attempt] request={request.request_id[:12]} "
+                    f"wall_ns={time.time_ns()} tokens={request.num_prompt_tokens}"
+                )
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -2181,24 +2240,47 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Per-request logits_processors (e.g. thinking-budget). Only
-            # pass if non-empty — older mlx_lm versions may not accept the
-            # kwarg, so we use _insert_kwargs() to drop it gracefully.
-            insert_extra: Dict[str, Any] = {}
-            if request.logits_processors:
-                insert_extra["logits_processors"] = [list(request.logits_processors)]
+            # Per-request logits_processors (e.g. thinking-budget).  ALWAYS
+            # pass the kwarg with a per-row list (possibly empty) — never
+            # omit it.  Omitting would let mlx-lm's default slot in the
+            # BG-level `self.logits_processors` (None for our construction),
+            # which then crashes GenerationBatch._step()'s
+            # `for p in self.logits_processors[e]` loop when this row is
+            # later merged with a row that DID have a processor.
+            # See UPSTREAM_PIN.md invariant #18 (H1 heterogeneous-pair
+            # deadlock root cause, closed 2026-04-23).
+            insert_extra: dict[str, Any] = {
+                "logits_processors": [list(request.logits_processors or [])]
+            }
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
             try:
+                if trace_enabled():
+                    trace_emit(
+                        "schedule_waiting.pre_insert",
+                        call_site="primary_insert",
+                        request_id=request.request_id,
+                        tokens_to_process=len(tokens_to_process),
+                        max_tokens=request.sampling_params.max_tokens,
+                        has_cache=cache_to_use is not None,
+                    )
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
                     **insert_extra,
                 )
+                if trace_enabled():
+                    trace_emit(
+                        "schedule_waiting.post_insert",
+                        call_site="primary_insert",
+                        request_id=request.request_id,
+                        uids_returned=list(uids) if uids else [],
+                        running_after=len(self.running),
+                    )
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -2210,12 +2292,29 @@ class Scheduler:
                     request.cached_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
+                    if trace_enabled():
+                        trace_emit(
+                            "schedule_waiting.pre_insert",
+                            call_site="fallback_insert_no_cache",
+                            request_id=request.request_id,
+                            tokens_to_process=len(tokens_to_process),
+                            max_tokens=request.sampling_params.max_tokens,
+                            has_cache=False,
+                        )
                     uids = self.batch_generator.insert(
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
                         **insert_extra,
                     )
+                    if trace_enabled():
+                        trace_emit(
+                            "schedule_waiting.post_insert",
+                            call_site="fallback_insert_no_cache",
+                            request_id=request.request_id,
+                            uids_returned=list(uids) if uids else [],
+                            running_after=len(self.running),
+                        )
                 else:
                     raise
 
@@ -2246,8 +2345,8 @@ class Scheduler:
         return scheduled
 
     def _process_batch_responses(
-        self, responses: List[Any]
-    ) -> Tuple[List[RequestOutput], Set[str]]:
+        self, responses: list[Any]
+    ) -> tuple[list[RequestOutput], set[str]]:
         """
         Process responses from BatchGenerator.
 
@@ -2357,7 +2456,7 @@ class Scheduler:
 
         return outputs, finished_ids
 
-    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+    def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         for request_id in finished_ids:
             request = self.running.get(request_id)
@@ -2529,7 +2628,7 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
-    def _recover_from_generation_error(self) -> Set[str]:
+    def _recover_from_generation_error(self) -> set[str]:
         """Recover from fatal generation error (OOM, Metal crash).
 
         Aborts all running requests and resets batch state.
@@ -2544,7 +2643,7 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Abort all running requests
-        aborted_ids: Set[str] = set()
+        aborted_ids: set[str] = set()
         for request_id in list(self.running):
             request = self.running.get(request_id)
             if request is not None:
@@ -2617,6 +2716,15 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
+                    if trace_enabled():
+                        trace_emit(
+                            "step.enter",
+                            running=len(self.running),
+                            running_ids=[
+                                r.request_id for r in list(self.running.values())
+                            ],
+                            waiting=len(self.waiting),
+                        )
                     result = self.batch_generator.next()
                     # mlx_lm 0.31+ returns (prompt_processing_responses,
                     # generation_responses). Older versions returned a flat
@@ -2628,6 +2736,28 @@ class Scheduler:
                         _, responses = result
                     else:
                         responses = result
+                    if trace_enabled():
+                        per_uid_tokens = {
+                            str(getattr(r, "uid", None)): getattr(r, "token", None)
+                            for r in (responses or [])
+                        }
+                        per_uid_finished = {
+                            str(getattr(r, "uid", None)): getattr(
+                                r, "finish_reason", None
+                            )
+                            for r in (responses or [])
+                        }
+                        trace_emit(
+                            "step.exit",
+                            output_count=len(responses or []),
+                            finished_count=sum(
+                                1
+                                for r in (responses or [])
+                                if getattr(r, "finish_reason", None)
+                            ),
+                            per_uid_tokens=per_uid_tokens,
+                            per_uid_finished=per_uid_finished,
+                        )
                     output.has_work = True
 
                     if responses:
@@ -2734,16 +2864,16 @@ class Scheduler:
 
         return output
 
-    def get_request(self, request_id: str) -> Optional[Request]:
+    def get_request(self, request_id: str) -> Request | None:
         """Get a request by ID."""
         return self.requests.get(request_id)
 
-    def remove_finished_request(self, request_id: str) -> Optional[Request]:
+    def remove_finished_request(self, request_id: str) -> Request | None:
         """Remove a finished request from tracking."""
         self._release_cache_hold(request_id)
         return self.requests.pop(request_id, None)
 
-    def get_running_requests_info(self) -> List[Dict[str, Any]]:
+    def get_running_requests_info(self) -> list[dict[str, Any]]:
         """Per-request details for status endpoint."""
         import time as _time
 
@@ -2811,7 +2941,7 @@ class Scheduler:
 
         return result
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
         stats = {
             "num_waiting": len(self.waiting),
@@ -2838,7 +2968,7 @@ class Scheduler:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()

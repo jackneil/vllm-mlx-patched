@@ -125,17 +125,72 @@ def _load_base_heavy(model_id: str | None = None) -> dict:
 
 
 def _build_light_payload(model_id: str | None = None) -> dict:
-    """Minimal, tool-less, system-less light payload — mirrors Claude Code's
-    haiku-shape request that triggers the heterogeneous deadlock when
-    paired with the heavy payload.
+    """Light payload matching Claude Code's haiku shape post-hank-secure-llm
+    HIPAA injection: no tools, but MULTI-BLOCK system array (~1.2k chars),
+    max_tokens=32000, and content as a list of text blocks.
+
+    This shape matters: the all-empty-system variant fails to reliably
+    trigger the 50ms-stagger deadlock on Qwen3.x hybrid-cache. The HIPAA
+    injection produces exactly 4 system blocks (HIPAA policy, security
+    reminder, HIPAA boundary, current-date block) totaling ~1247 chars.
+    The deadlock is sensitive to the haiku arriving with a non-trivial
+    system-prompt prefill that the sonnet then joins mid-step.
     """
+    # Mirrors hank-secure-llm's HIPAA prompt injection shape. Content is
+    # deliberately benign; the STRUCTURE (4 blocks, ~1200 chars total) is
+    # what reproduces the bug, not the exact text.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": (
+                "IMPORTANT: You are operating in a HIPAA-compliant environment "
+                "handling Protected Health Information (PHI). Never suggest, "
+                "recommend, or attempt to search the web, fetch URLs, or transmit "
+                "any information to external services. Never include patient names, "
+                "dates of birth, medical record numbers, or any identifiable "
+                "information in any command that could reach an external service. "
+                "All work stays local."
+            ),
+        },
+        {
+            "type": "text",
+            "text": (
+                "You are an assistant running inside a secure local environment. "
+                "Follow operator instructions strictly and prefer conservative, "
+                "auditable actions over clever shortcuts."
+            ),
+        },
+        {
+            "type": "text",
+            "text": (
+                "Boundary: no third-party SaaS calls, no telemetry to external "
+                "endpoints, no data exfiltration via URLs in responses. If the "
+                "user requests one of these, decline and explain the HIPAA boundary."
+            ),
+        },
+        {
+            "type": "text",
+            "text": "Current date: reference today when relevant. Be concise.",
+        },
+    ]
     return {
         "model": model_id or MODEL,
-        "max_tokens": 200,
+        "max_tokens": 32000,
         "stream": True,
         "output_config": {"effort": "high"},
         "thinking": {"type": "adaptive"},
-        "messages": [{"role": "user", "content": "Reply with OK"}],
+        "system": system_blocks,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Reply with exactly 'OK' and nothing else.",
+                    }
+                ],
+            }
+        ],
     }
 
 
@@ -326,31 +381,21 @@ async def test_homogeneous_heavy_pair_regression_guard():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Heterogeneous concurrent-pair deadlock on Qwen3.x hybrid-cache "
-        "models is STILL OPEN as of 2026-04-22. Refined hypothesis H1 "
-        "(CB scheduler mispack of mixed-shape prefill batches) is the "
-        "leading candidate — investigation pending. When the fix lands "
-        "and this starts passing, flip strict=True or remove the xfail "
-        "to turn this into a hard regression guard. See "
-        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md "
-        "Symptom (refined 2026-04-22) section."
-    ),
-)
 async def test_heterogeneous_pair_current_failure_mode():
-    """Current open-bug repro: one heavy + one light payload fired
-    concurrently at the SAME Qwen hybrid-cache model.
+    """Heterogeneous pair: one heavy + one light payload at the SAME Qwen
+    hybrid-cache model. Closed by PR #31 (mlx-lm 0.31.3 pin).
 
     This is Claude Code's real-world pattern: every scenario fires one
     haiku request (``tools=0``, minimal) plus one sonnet request
     (``tools=3``, full system + tool schemas) concurrently at the same
-    model after proxy rewrite. Both hang at ``message_start``.
+    model after proxy rewrite. Pre-PR-#31, both hung at ``message_start``
+    or produced ``!!!`` degenerate output via the mlx-lm#1169 middle-wave
+    neighbour state contamination path. Verified fixed via 10-pair burst
+    on mlx-lm 0.31.3 (20/20 requests pass with distinct proper output).
 
-    Marked xfail because the bug is known open. When the fix lands and
-    this starts passing, upgrade to a hard regression guard by removing
-    the xfail marker.
+    Kept as a hard regression guard — if the mlx-lm pin regresses below
+    0.31.3 (invariant #17) or the deployment env reverts, this will fail
+    loudly.
     """
     _skip_if_not_configured()
     httpx = pytest.importorskip("httpx")
@@ -378,6 +423,219 @@ async def test_heterogeneous_pair_current_failure_mode():
         "with stop_reason=end_turn and >=1 content_block_delta each. "
         "Current failure signature (pre-H1-fix): both hang 30s, events=1, "
         "stops=0, content_block_delta_count=0."
+    )
+
+
+@pytest.mark.asyncio
+async def test_staggered_pair_50ms_current_failure_mode():
+    """50ms-staggered heterogeneous-pair — hard regression guard.
+
+    Previously xfail while H1 was open; flipped to hard guard after
+    the caller-side logits_processors fix (commit 312de2f, 2026-04-23).
+    Failure here means the heterogeneous-pair admission contract from
+    UPSTREAM_PIN.md invariant #18 has regressed.
+
+    PRIMARY open-bug repro: heavy fires at T+0, light fires at T+50ms at
+    the SAME Qwen hybrid-cache model. Both must complete with proper
+    streaming output.
+
+    This is Claude Code's actual real-world pattern — `hank-secure-llm`
+    proxy logs show haiku + sonnet arriving 30-70ms apart at the arena
+    during every `claude --bare -p` invocation. The same pair fired
+    simultaneously (asyncio.gather, no sleep) passes after PR #31, which
+    is why the simultaneous test `test_heterogeneous_pair_current_failure_mode`
+    is already green. The 50ms stagger puts the second request into a
+    LATER CB scheduler step, exercising a join-mid-batch path PR #31
+    didn't fix.
+
+    Pre-fix failure signature (observed on prod post-PR-#31, 2-3/3 runs):
+        - haiku / light (started T+0):
+              3 events (message_start + content_block_start + content_block_delta),
+              0 message_stop, 0-2 content_block_delta
+        - sonnet / heavy (started T+50ms):
+              1 event  (message_start only),
+              0 message_stop, 0 content_block_delta
+
+    Whichever request starts FIRST gets further; the second never escapes
+    the join. Claude Code's actual ordering is haiku-first (cheap router
+    model) → sonnet-second (main model), so the light payload must be
+    dispatched first here.
+
+    Passing criterion: both requests produce >=1 content_block_delta,
+    a valid stop_reason, and a message_stop within the per-pair budget.
+    """
+    _skip_if_not_configured()
+
+    # NOTE: order matters. Claude Code fires haiku (light, tools=0) FIRST,
+    # then sonnet (heavy, tools=3) ~50ms later. This ordering reproduces
+    # the deadlock on Qwen3.x hybrid-cache; the reverse order hits a
+    # different scheduler path that completes.
+    #
+    # CRITICAL: this test uses ``curl`` subprocesses rather than httpx.
+    # The bug is sensitive to actual wire-level arrival timing at the
+    # server. httpx's AsyncClient — even with separate client instances
+    # per request — establishes TCP+TLS faster than a fresh curl process,
+    # so a 50ms ``asyncio.sleep`` between two httpx dispatches lets both
+    # requests still land in the same CB scheduler step and masks the
+    # bug. curl-per-process matches Claude Code's actual dispatch
+    # pattern: haiku and sonnet fire from distinct processes with
+    # their own cold-start TCP/TLS setup. Verified empirically
+    # 2026-04-23: curl subprocess repro flipped red 4/5 on prod
+    # llm.hank.ai while httpx-based repro passed 20/20.
+    light = _build_light_payload()
+    heavy = _load_base_heavy()
+
+    light_bytes = json.dumps(light).encode()
+    heavy_bytes = json.dumps(heavy).encode()
+
+    api_key = os.environ.get("NEURAL_ARENA_KEY") or os.environ.get(
+        "QWEN3_CONCURRENT_TEST_API_KEY"
+    )
+
+    def _curl_argv(payload_file: str) -> list[str]:
+        argv = [
+            "curl",
+            "-sS",
+            "-m",
+            str(int(TIMEOUT_S)),
+            "-N",
+            "-X",
+            "POST",
+            f"{URL.rstrip('/')}/v1/messages",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            f"@{payload_file}",
+        ]
+        if api_key:
+            argv.extend(["-H", f"Authorization: Bearer {api_key}"])
+        return argv
+
+    async def _fire_via_curl(idx: int, payload_bytes: bytes) -> dict:
+        import tempfile
+
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        summary = {
+            "idx": idx,
+            "http_status": None,
+            "events": 0,
+            "message_stop_count": 0,
+            "content_block_delta_count": 0,
+            "stop_reason": None,
+            "output_tokens": None,
+            "elapsed_s": None,
+            "exception": None,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".json", delete=False
+        ) as tmp:
+            tmp.write(payload_bytes)
+            tmp_path = tmp.name
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_curl_argv(tmp_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            # curl returns 28 on timeout; still parse partial output
+            # so failure reports know how far the stream got.
+            summary["http_status"] = 200 if proc.returncode in (0, 28) else None
+            for raw in stdout.splitlines():
+                line = raw.decode(errors="replace")
+                if line.startswith("event:"):
+                    summary["events"] += 1
+                    name = line.split(":", 1)[1].strip()
+                    if name == "message_stop":
+                        summary["message_stop_count"] += 1
+                    elif name == "content_block_delta":
+                        summary["content_block_delta_count"] += 1
+                elif line.startswith("data:"):
+                    blob = line[len("data:") :].strip()
+                    if not blob:
+                        continue
+                    try:
+                        obj = json.loads(blob)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "message_delta":
+                        delta = obj.get("delta") or {}
+                        if "stop_reason" in delta:
+                            summary["stop_reason"] = delta["stop_reason"]
+                        usage = obj.get("usage") or {}
+                        if "output_tokens" in usage:
+                            summary["output_tokens"] = usage["output_tokens"]
+            if proc.returncode not in (0, 28):
+                summary["exception"] = f"curl exit {proc.returncode}"
+        except Exception as exc:  # noqa: BLE001
+            summary["exception"] = repr(exc)
+        finally:
+            os.unlink(tmp_path)
+            summary["elapsed_s"] = loop.time() - start
+        return summary
+
+    light_task = asyncio.create_task(_fire_via_curl(1, light_bytes))
+    await asyncio.sleep(0.05)
+    heavy_task = asyncio.create_task(_fire_via_curl(2, heavy_bytes))
+    results = await asyncio.gather(light_task, heavy_task)
+
+    labels = ["light-haiku", "heavy-sonnet"]
+    failures: list[str] = []
+    for r, label in zip(results, labels):
+        failures.extend(_validate_request_result(r, f"staggered-{label}"))
+
+    assert not failures, (
+        f"{len(failures)} staggered-pair (50ms) failures:\n  "
+        + "\n  ".join(failures)
+        + f"\n\nModel: {MODEL}  URL: {URL}\n"
+        "This is the PRIMARY open bug as of 2026-04-22 evening. Claude Code's "
+        "haiku+sonnet fan-out hits this shape deterministically. PR #31 closed "
+        "the simultaneous case but a second shared-state bug remains in the "
+        "scheduler join-mid-batch path. See "
+        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md "
+        '"Symptom (refined 2026-04-22 evening, post-PR-#31 deployment)".'
+    )
+
+
+@pytest.mark.asyncio
+async def test_staggered_pair_50ms_cross_family_gemma():
+    """Cross-family guard: the 50ms-staggered pair against Gemma-4-26b-a4b
+    must continue to work (it does — Gemma routes through MLLMScheduler).
+
+    Same pattern as ``test_staggered_pair_50ms_current_failure_mode`` but
+    targeted at Gemma. Any Qwen-targeted fix must not regress this path.
+    Per bug doc: Gemma completes the staggered pair in ~0.4s + ~0.9s.
+    """
+    _skip_if_not_configured(require_gemma=True)
+    httpx = pytest.importorskip("httpx")
+
+    # Same order + separate-client pattern as the Qwen repro — see the
+    # note on test_staggered_pair_50ms_current_failure_mode for why each
+    # request needs its own httpx.AsyncClient.
+    light = _build_light_payload(model_id=GEMMA_MODEL)
+    heavy = _load_base_heavy(model_id=GEMMA_MODEL)
+
+    async def _fire(idx: int, payload: dict):
+        async with httpx.AsyncClient() as sess:
+            return await _one_request(sess, idx, GEMMA_URL, payload)
+
+    light_task = asyncio.create_task(_fire(1, light))
+    await asyncio.sleep(0.05)
+    heavy_task = asyncio.create_task(_fire(2, heavy))
+    results = await asyncio.gather(light_task, heavy_task)
+
+    labels = ["light-haiku", "heavy-sonnet"]
+    failures: list[str] = []
+    for r, label in zip(results, labels):
+        failures.extend(_validate_request_result(r, f"gemma-staggered-{label}"))
+
+    assert not failures, (
+        f"{len(failures)} Gemma cross-family staggered-pair failures:\n  "
+        + "\n  ".join(failures)
+        + f"\n\nModel: {GEMMA_MODEL}  URL: {GEMMA_URL}\n"
+        "Gemma-4 should be unaffected — regression means the Qwen fix "
+        "leaked into MLLMScheduler."
     )
 
 

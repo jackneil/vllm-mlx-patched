@@ -107,6 +107,14 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # Bounded-retry state for _engine_loop: if the SAME error repr
+        # fires on N consecutive steps, abort the running batch instead
+        # of infinite-looping.  See: H1 heterogeneous logits_processors
+        # crash (2026-04-23), where an un-recovered TypeError turned a
+        # one-step bug into a 35s deadlock.
+        self._engine_loop_last_error: Optional[str] = None
+        self._engine_loop_error_streak: int = 0
+
         logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
@@ -258,7 +266,56 @@ class EngineCore:
             except Exception as e:
                 import traceback
 
-                logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
+                err_key = repr(e)
+                if err_key == self._engine_loop_last_error:
+                    self._engine_loop_error_streak += 1
+                else:
+                    self._engine_loop_last_error = err_key
+                    self._engine_loop_error_streak = 1
+
+                logger.error(
+                    f"Engine loop error (streak={self._engine_loop_error_streak}): "
+                    f"{e}\n{traceback.format_exc()}"
+                )
+
+                # After 10 consecutive identical errors, abort all running
+                # requests — continuing is an infinite loop.  Threshold is
+                # generous to avoid aborting on occasional transient errors
+                # (Metal warm-up, brief cache pressure).  History: H1
+                # (2026-04-23) saw 1828 identical retries in 35s before
+                # client timeout; bounded abort converts that to a
+                # first-class "error" finish_reason.
+                if self._engine_loop_error_streak >= 10:
+                    logger.error(
+                        "Engine loop: aborting all running requests after "
+                        "10 consecutive identical errors."
+                    )
+                    try:
+                        aborted = self.scheduler._recover_from_generation_error()
+                        from .request import RequestOutput
+
+                        for rid in aborted:
+                            collector = self._output_collectors.get(rid)
+                            if collector is not None:
+                                collector.put(
+                                    RequestOutput(
+                                        request_id=rid,
+                                        finished=True,
+                                        finish_reason="error",
+                                    )
+                                )
+                            ev = self._finished_events.get(rid)
+                            if ev is not None:
+                                ev.set()
+                    except Exception as abort_e:  # noqa: BLE001
+                        logger.error(
+                            f"Engine loop: abort-all-requests itself failed: "
+                            f"{abort_e}"
+                        )
+                    finally:
+                        self._engine_loop_last_error = None
+                        self._engine_loop_error_streak = 0
+
                 await asyncio.sleep(0.1)
 
     async def add_request(

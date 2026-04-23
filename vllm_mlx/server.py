@@ -2696,6 +2696,8 @@ def _emit_block_close(
     block_type: str,
     block_index: int,
     thinking_buffer: list[str],
+    *,
+    msg_id: str | None = None,
 ) -> list[str]:
     """Emit the close-event sequence for a content block of the given type.
 
@@ -2710,6 +2712,15 @@ def _emit_block_close(
     Invariant 13 (UPSTREAM_PIN.md): every thinking content block — streaming
     or non-streaming — MUST carry a signature. Any new signable block type
     added to the Anthropic adapter MUST be routed through this dispatcher.
+
+    Args:
+        block_type: "thinking" | "text" (unknown types raise ValueError).
+        block_index: Current block index for the close event.
+        thinking_buffer: Caller-owned accumulator for thinking-block text.
+        msg_id: Optional Anthropic message id for log correlation. Passed
+            by `_stream_anthropic_messages` so that on-call can grep
+            `[streaming-signature]` log lines by user-facing msg_id. None
+            is acceptable for unit-test callers.
     """
     if block_type == "thinking":
         signature = compute_thinking_signature("".join(thinking_buffer))
@@ -2721,8 +2732,9 @@ def _emit_block_close(
             # emitting request. INFO level (not WARN) — empty thinking is
             # legal; WARN would trip ops alerts on a keyword match.
             logger.info(
-                "[streaming-signature] closing thinking block idx=%d with "
-                "empty buffer; emitting empty-text signature",
+                "[streaming-signature] msg_id=%s closing thinking block "
+                "idx=%d with empty buffer; emitting empty-text signature",
+                msg_id if msg_id is not None else "<unknown>",
                 block_index,
             )
         sig_event = {
@@ -2752,6 +2764,8 @@ def _emit_content_pieces(
     current_block_type: str | None,
     block_index: int,
     thinking_buffer: list[str],
+    *,
+    msg_id: str | None = None,
 ) -> tuple[list[str], str | None, int]:
     """Emit Anthropic SSE events for content pieces from the think router.
 
@@ -2770,6 +2784,9 @@ def _emit_content_pieces(
             cleared by _emit_block_close() when the block closes. The
             caller MUST allocate a fresh list at the top of each request's
             streaming coroutine. Sharing a buffer across requests is a bug.
+        msg_id: Optional Anthropic message id, passed through to
+            `_emit_block_close` for log correlation. None is acceptable
+            for unit-test callers that don't exercise the log path.
 
     Returns:
         (events, updated_block_type, updated_block_index). The final open
@@ -2781,7 +2798,10 @@ def _emit_content_pieces(
         if block_type != current_block_type:
             if current_block_type is not None:
                 events.extend(
-                    _emit_block_close(current_block_type, block_index, thinking_buffer)
+                    _emit_block_close(
+                        current_block_type, block_index, thinking_buffer,
+                        msg_id=msg_id,
+                    )
                 )
                 block_index += 1
             current_block_type = block_type
@@ -3053,7 +3073,8 @@ async def _stream_anthropic_messages(
                 # Stage 2: route thinking vs text
                 pieces = think_router.process(filtered)
                 events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index, thinking_buffer
+                    pieces, current_block_type, block_index, thinking_buffer,
+                    msg_id=msg_id,
                 )
                 for event in events:
                     yield event
@@ -3066,6 +3087,7 @@ async def _stream_anthropic_messages(
             current_block_type,
             block_index,
             thinking_buffer,
+            msg_id=msg_id,
         )
         for event in events:
             yield event
@@ -3073,7 +3095,8 @@ async def _stream_anthropic_messages(
     flush_pieces = think_router.flush()
     if flush_pieces:
         events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index, thinking_buffer
+            flush_pieces, current_block_type, block_index, thinking_buffer,
+            msg_id=msg_id,
         )
         for event in events:
             yield event
@@ -3084,7 +3107,9 @@ async def _stream_anthropic_messages(
     # path. Handles the stream-ends-on-open-thinking case (max_tokens cap,
     # clean stop with thinking but no text).
     if current_block_type is not None:
-        for ev in _emit_block_close(current_block_type, block_index, thinking_buffer):
+        for ev in _emit_block_close(
+            current_block_type, block_index, thinking_buffer, msg_id=msg_id,
+        ):
             yield ev
         block_index += 1
 

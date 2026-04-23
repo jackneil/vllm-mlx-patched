@@ -556,3 +556,114 @@ def test_interleaved_thinking_via_emit_content_pieces():
     assert len(sig_events) == 2
     assert sig_events[0]["data"]["delta"]["signature"] == compute_thinking_signature("first reasoning")
     assert sig_events[1]["data"]["delta"]["signature"] == compute_thinking_signature("second reasoning")
+
+
+def test_emit_block_close_increments_signature_counter():
+    """/dc M4: the dispatcher must increment thinking_signature_emitted_total
+    exactly once per thinking-block close. Guards against a refactor that
+    drops or double-counts the inc() call — the counter is the only
+    operational signal that the streaming contract is live in prod."""
+    from vllm_mlx.metrics import thinking_signature_emitted_total
+
+    initial = thinking_signature_emitted_total.value
+
+    # Close a thinking block.
+    _emit_block_close("thinking", 0, ["x"])
+    assert thinking_signature_emitted_total.value == initial + 1
+
+    # Close a text block — counter must NOT increment.
+    _emit_block_close("text", 1, [])
+    assert thinking_signature_emitted_total.value == initial + 1
+
+    # Close another thinking block — counter increments again.
+    _emit_block_close("thinking", 2, ["y"])
+    assert thinking_signature_emitted_total.value == initial + 2
+
+
+def test_empty_buffer_close_logs_info_with_msg_id(caplog):
+    """/dc M3 + PM-2: empty thinking buffer at close fires an INFO log
+    that includes msg_id so on-call can correlate unexpected SHA256-of-empty
+    signatures (`vllm-mlx:e3b0c44298fc1c149afbf4c8996fb924`) back to the
+    user-facing request."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="vllm_mlx.server")
+
+    thinking_buffer: list[str] = []
+    events = _emit_block_close(
+        "thinking",
+        7,
+        thinking_buffer,
+        msg_id="msg_deadbeef00000000000000",
+    )
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    info_log = next(
+        (m for m in messages if "[streaming-signature]" in m and "empty buffer" in m),
+        None,
+    )
+    assert info_log is not None, f"empty-buffer INFO log not fired; got: {messages}"
+    assert "msg_id=msg_deadbeef00000000000000" in info_log, info_log
+    assert "idx=7" in info_log, info_log
+
+    parsed = _parse_events(events)
+    assert parsed[0]["data"]["delta"]["signature"] == compute_thinking_signature("")
+
+
+def test_empty_buffer_close_with_none_msg_id_uses_unknown_placeholder(caplog):
+    """/dc PM-2: when msg_id is not provided (unit tests, or a legacy
+    caller), the log line uses `<unknown>` rather than crashing or
+    emitting None."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="vllm_mlx.server")
+
+    thinking_buffer: list[str] = []
+    _emit_block_close("thinking", 0, thinking_buffer)  # no msg_id kwarg
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    info_log = next(
+        (m for m in messages if "[streaming-signature]" in m and "empty buffer" in m),
+        None,
+    )
+    assert info_log is not None
+    assert "msg_id=<unknown>" in info_log, info_log
+
+
+def test_compute_thinking_signature_bounded_latency_realistic_input():
+    """/dc PM-1: guards against pathological latency in compute_thinking_signature
+    on realistic-max inputs. In prod, `--max-thinking-token-budget` (Invariant 12)
+    caps thinking-token budgets; a typical max (32k tokens × ~5 chars/tok) is
+    ≈160 KB of text — sha256 on that should complete in single-digit ms on
+    an M1/M2-class box.
+
+    If this test fails, either:
+    (a) max-thinking-token-budget ceiling is being bypassed in prod, OR
+    (b) compute_thinking_signature has taken on unexpected work beyond the
+        sha256 hash (e.g., a normalize/canonicalize step was added).
+    Either way: investigate before shipping.
+
+    Flakiness guard: 5 samples, assert MEDIAN — robust to single-shot GC
+    pauses or scheduler hiccups on contended CI runners. Threshold is 500ms
+    (100x expected) so a real order-of-magnitude regression still trips it
+    while transient spikes don't.
+    """
+    import statistics
+    import time
+
+    text = "x" * 200_000  # ~200 KB — above the realistic 160 KB cap.
+
+    samples_ms = []
+    for _ in range(5):
+        start = time.perf_counter()
+        sig = compute_thinking_signature(text)
+        samples_ms.append((time.perf_counter() - start) * 1000)
+        assert SIG_RE.match(sig), f"bad signature format: {sig!r}"
+
+    median_ms = statistics.median(samples_ms)
+    assert median_ms < 500, (
+        f"compute_thinking_signature on 200 KB median latency {median_ms:.1f}ms "
+        f"(samples {[f'{s:.1f}' for s in samples_ms]}ms) — expected <500ms. "
+        f"Either the ceiling was removed (PM-1 vulnerability) or the helper "
+        f"picked up extra work beyond sha256. Investigate."
+    )

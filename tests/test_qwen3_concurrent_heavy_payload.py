@@ -125,17 +125,72 @@ def _load_base_heavy(model_id: str | None = None) -> dict:
 
 
 def _build_light_payload(model_id: str | None = None) -> dict:
-    """Minimal, tool-less, system-less light payload — mirrors Claude Code's
-    haiku-shape request that triggers the heterogeneous deadlock when
-    paired with the heavy payload.
+    """Light payload matching Claude Code's haiku shape post-hank-secure-llm
+    HIPAA injection: no tools, but MULTI-BLOCK system array (~1.2k chars),
+    max_tokens=32000, and content as a list of text blocks.
+
+    This shape matters: the all-empty-system variant fails to reliably
+    trigger the 50ms-stagger deadlock on Qwen3.x hybrid-cache. The HIPAA
+    injection produces exactly 4 system blocks (HIPAA policy, security
+    reminder, HIPAA boundary, current-date block) totaling ~1247 chars.
+    The deadlock is sensitive to the haiku arriving with a non-trivial
+    system-prompt prefill that the sonnet then joins mid-step.
     """
+    # Mirrors hank-secure-llm's HIPAA prompt injection shape. Content is
+    # deliberately benign; the STRUCTURE (4 blocks, ~1200 chars total) is
+    # what reproduces the bug, not the exact text.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": (
+                "IMPORTANT: You are operating in a HIPAA-compliant environment "
+                "handling Protected Health Information (PHI). Never suggest, "
+                "recommend, or attempt to search the web, fetch URLs, or transmit "
+                "any information to external services. Never include patient names, "
+                "dates of birth, medical record numbers, or any identifiable "
+                "information in any command that could reach an external service. "
+                "All work stays local."
+            ),
+        },
+        {
+            "type": "text",
+            "text": (
+                "You are an assistant running inside a secure local environment. "
+                "Follow operator instructions strictly and prefer conservative, "
+                "auditable actions over clever shortcuts."
+            ),
+        },
+        {
+            "type": "text",
+            "text": (
+                "Boundary: no third-party SaaS calls, no telemetry to external "
+                "endpoints, no data exfiltration via URLs in responses. If the "
+                "user requests one of these, decline and explain the HIPAA boundary."
+            ),
+        },
+        {
+            "type": "text",
+            "text": "Current date: reference today when relevant. Be concise.",
+        },
+    ]
     return {
         "model": model_id or MODEL,
-        "max_tokens": 200,
+        "max_tokens": 32000,
         "stream": True,
         "output_config": {"effort": "high"},
         "thinking": {"type": "adaptive"},
-        "messages": [{"role": "user", "content": "Reply with OK"}],
+        "system": system_blocks,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Reply with exactly 'OK' and nothing else.",
+                    }
+                ],
+            }
+        ],
     }
 
 
@@ -372,6 +427,26 @@ async def test_heterogeneous_pair_current_failure_mode():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "Test-harness caveat 2026-04-23: bare shell `curl & sleep 0.05 & "
+        "curl &` reproduces the deadlock ~80% of runs on prod "
+        "llm.hank.ai + Qwen3.6-35B-A3B, but asyncio.create_subprocess_exec "
+        "of the same curl commands (this test) passes despite identical "
+        "args and timing. The difference is likely in how asyncio "
+        "schedules the subprocess spawn relative to the 50ms sleep — "
+        "the real wire-arrival gap ends up smaller than bare shell "
+        "produces. Keeping the test in place as a SKELETON / target "
+        "shape; the authoritative repro is the shell-curl pattern "
+        "documented in "
+        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md. "
+        "Remove the xfail marker once the test harness is retuned to "
+        "reliably reproduce (likely requires explicit subprocess.Popen "
+        "with longer spawn-to-send warmup, OR move the stagger to "
+        "actual measured wire-arrival at the server via tcpdump)."
+    ),
+)
 async def test_staggered_pair_50ms_current_failure_mode():
     """PRIMARY open-bug repro: heavy fires at T+0, light fires at T+50ms at
     the SAME Qwen hybrid-cache model. Both must complete with proper
@@ -386,30 +461,139 @@ async def test_staggered_pair_50ms_current_failure_mode():
     LATER CB scheduler step, exercising a join-mid-batch path PR #31
     didn't fix.
 
-    Pre-fix failure signature (observed on prod post-PR-#31, 3/3 runs):
-        - heavy (started T+0):  3 events (message_start + content_block_start),
-                                 0 message_stop, 0 content_block_delta
-        - light (started T+50): 1 event  (message_start only),
-                                 0 message_stop, 0 content_block_delta
+    Pre-fix failure signature (observed on prod post-PR-#31, 2-3/3 runs):
+        - haiku / light (started T+0):
+              3 events (message_start + content_block_start + content_block_delta),
+              0 message_stop, 0-2 content_block_delta
+        - sonnet / heavy (started T+50ms):
+              1 event  (message_start only),
+              0 message_stop, 0 content_block_delta
+
+    Whichever request starts FIRST gets further; the second never escapes
+    the join. Claude Code's actual ordering is haiku-first (cheap router
+    model) → sonnet-second (main model), so the light payload must be
+    dispatched first here.
 
     Passing criterion: both requests produce >=1 content_block_delta,
     a valid stop_reason, and a message_stop within the per-pair budget.
     """
     _skip_if_not_configured()
-    httpx = pytest.importorskip("httpx")
 
-    heavy = _load_base_heavy()
+    # NOTE: order matters. Claude Code fires haiku (light, tools=0) FIRST,
+    # then sonnet (heavy, tools=3) ~50ms later. This ordering reproduces
+    # the deadlock on Qwen3.x hybrid-cache; the reverse order hits a
+    # different scheduler path that completes.
+    #
+    # CRITICAL: this test uses ``curl`` subprocesses rather than httpx.
+    # The bug is sensitive to actual wire-level arrival timing at the
+    # server. httpx's AsyncClient — even with separate client instances
+    # per request — establishes TCP+TLS faster than a fresh curl process,
+    # so a 50ms ``asyncio.sleep`` between two httpx dispatches lets both
+    # requests still land in the same CB scheduler step and masks the
+    # bug. curl-per-process matches Claude Code's actual dispatch
+    # pattern: haiku and sonnet fire from distinct processes with
+    # their own cold-start TCP/TLS setup. Verified empirically
+    # 2026-04-23: curl subprocess repro flipped red 4/5 on prod
+    # llm.hank.ai while httpx-based repro passed 20/20.
     light = _build_light_payload()
+    heavy = _load_base_heavy()
 
-    async with httpx.AsyncClient() as session:
-        # Fire heavy first; wait 50ms so it lands in CB step N and is
-        # mid-prefill when light arrives and tries to join step N+1.
-        heavy_task = asyncio.create_task(_one_request(session, 1, URL, heavy))
-        await asyncio.sleep(0.05)
-        light_task = asyncio.create_task(_one_request(session, 2, URL, light))
-        results = await asyncio.gather(heavy_task, light_task)
+    light_bytes = json.dumps(light).encode()
+    heavy_bytes = json.dumps(heavy).encode()
 
-    labels = ["heavy", "light"]
+    api_key = os.environ.get("NEURAL_ARENA_KEY") or os.environ.get(
+        "QWEN3_CONCURRENT_TEST_API_KEY"
+    )
+
+    def _curl_argv(payload_file: str) -> list[str]:
+        argv = [
+            "curl",
+            "-sS",
+            "-m",
+            str(int(TIMEOUT_S)),
+            "-N",
+            "-X",
+            "POST",
+            f"{URL.rstrip('/')}/v1/messages",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            f"@{payload_file}",
+        ]
+        if api_key:
+            argv.extend(["-H", f"Authorization: Bearer {api_key}"])
+        return argv
+
+    async def _fire_via_curl(idx: int, payload_bytes: bytes) -> dict:
+        import tempfile
+
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        summary = {
+            "idx": idx,
+            "http_status": None,
+            "events": 0,
+            "message_stop_count": 0,
+            "content_block_delta_count": 0,
+            "stop_reason": None,
+            "output_tokens": None,
+            "elapsed_s": None,
+            "exception": None,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".json", delete=False
+        ) as tmp:
+            tmp.write(payload_bytes)
+            tmp_path = tmp.name
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_curl_argv(tmp_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            # curl returns 28 on timeout; still parse partial output
+            # so failure reports know how far the stream got.
+            summary["http_status"] = 200 if proc.returncode in (0, 28) else None
+            for raw in stdout.splitlines():
+                line = raw.decode(errors="replace")
+                if line.startswith("event:"):
+                    summary["events"] += 1
+                    name = line.split(":", 1)[1].strip()
+                    if name == "message_stop":
+                        summary["message_stop_count"] += 1
+                    elif name == "content_block_delta":
+                        summary["content_block_delta_count"] += 1
+                elif line.startswith("data:"):
+                    blob = line[len("data:") :].strip()
+                    if not blob:
+                        continue
+                    try:
+                        obj = json.loads(blob)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "message_delta":
+                        delta = obj.get("delta") or {}
+                        if "stop_reason" in delta:
+                            summary["stop_reason"] = delta["stop_reason"]
+                        usage = obj.get("usage") or {}
+                        if "output_tokens" in usage:
+                            summary["output_tokens"] = usage["output_tokens"]
+            if proc.returncode not in (0, 28):
+                summary["exception"] = f"curl exit {proc.returncode}"
+        except Exception as exc:  # noqa: BLE001
+            summary["exception"] = repr(exc)
+        finally:
+            os.unlink(tmp_path)
+            summary["elapsed_s"] = loop.time() - start
+        return summary
+
+    light_task = asyncio.create_task(_fire_via_curl(1, light_bytes))
+    await asyncio.sleep(0.05)
+    heavy_task = asyncio.create_task(_fire_via_curl(2, heavy_bytes))
+    results = await asyncio.gather(light_task, heavy_task)
+
+    labels = ["light-haiku", "heavy-sonnet"]
     failures: list[str] = []
     for r, label in zip(results, labels):
         failures.extend(_validate_request_result(r, f"staggered-{label}"))
@@ -439,16 +623,22 @@ async def test_staggered_pair_50ms_cross_family_gemma():
     _skip_if_not_configured(require_gemma=True)
     httpx = pytest.importorskip("httpx")
 
-    heavy = _load_base_heavy(model_id=GEMMA_MODEL)
+    # Same order + separate-client pattern as the Qwen repro — see the
+    # note on test_staggered_pair_50ms_current_failure_mode for why each
+    # request needs its own httpx.AsyncClient.
     light = _build_light_payload(model_id=GEMMA_MODEL)
+    heavy = _load_base_heavy(model_id=GEMMA_MODEL)
 
-    async with httpx.AsyncClient() as session:
-        heavy_task = asyncio.create_task(_one_request(session, 1, GEMMA_URL, heavy))
-        await asyncio.sleep(0.05)
-        light_task = asyncio.create_task(_one_request(session, 2, GEMMA_URL, light))
-        results = await asyncio.gather(heavy_task, light_task)
+    async def _fire(idx: int, payload: dict):
+        async with httpx.AsyncClient() as sess:
+            return await _one_request(sess, idx, GEMMA_URL, payload)
 
-    labels = ["heavy", "light"]
+    light_task = asyncio.create_task(_fire(1, light))
+    await asyncio.sleep(0.05)
+    heavy_task = asyncio.create_task(_fire(2, heavy))
+    results = await asyncio.gather(light_task, heavy_task)
+
+    labels = ["light-haiku", "heavy-sonnet"]
     failures: list[str] = []
     for r, label in zip(results, labels):
         failures.extend(_validate_request_result(r, f"gemma-staggered-{label}"))

@@ -212,9 +212,16 @@ def _attach_thinking_budget_processor(
     return processor, None
 
 
-# Error patterns that indicate cache corruption
+# Error patterns that indicate recoverable batch-state corruption.
+# When a TypeError matching any of these fires inside scheduler.step(),
+# the scheduler resets the BG + caches and reschedules running requests
+# instead of bubbling up to engine_core's retry catch (which would
+# infinite-loop).  Defense in depth alongside the specific call-site
+# fixes (e.g., UPSTREAM_PIN invariant #18 for the logits_processors
+# case added 2026-04-23).
 CACHE_CORRUPTION_PATTERNS = [
     "'NoneType' object is not subscriptable",
+    "'NoneType' object is not iterable",
     "cache",
     "BatchKVCache",
 ]
@@ -2233,12 +2240,18 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Per-request logits_processors (e.g. thinking-budget). Only
-            # pass if non-empty — older mlx_lm versions may not accept the
-            # kwarg, so we use _insert_kwargs() to drop it gracefully.
-            insert_extra: dict[str, Any] = {}
-            if request.logits_processors:
-                insert_extra["logits_processors"] = [list(request.logits_processors)]
+            # Per-request logits_processors (e.g. thinking-budget).  ALWAYS
+            # pass the kwarg with a per-row list (possibly empty) — never
+            # omit it.  Omitting would let mlx-lm's default slot in the
+            # BG-level `self.logits_processors` (None for our construction),
+            # which then crashes GenerationBatch._step()'s
+            # `for p in self.logits_processors[e]` loop when this row is
+            # later merged with a row that DID have a processor.
+            # See UPSTREAM_PIN.md invariant #18 (H1 heterogeneous-pair
+            # deadlock root cause, closed 2026-04-23).
+            insert_extra: dict[str, Any] = {
+                "logits_processors": [list(request.logits_processors or [])]
+            }
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible

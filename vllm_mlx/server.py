@@ -58,7 +58,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
-from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
+from .api.anthropic_adapter import (
+    anthropic_to_openai,
+    compute_thinking_signature,
+    openai_to_anthropic,
+)
 from .api.anthropic_models import AnthropicRequest
 from .api.budget_ceiling import apply_server_thinking_token_budget_ceiling
 from .api.effort import EffortSource, ResolvedBudget, resolve_effort  # noqa: F401

@@ -372,6 +372,97 @@ async def test_heterogeneous_pair_current_failure_mode():
 
 
 @pytest.mark.asyncio
+async def test_staggered_pair_50ms_current_failure_mode():
+    """PRIMARY open-bug repro: heavy fires at T+0, light fires at T+50ms at
+    the SAME Qwen hybrid-cache model. Both must complete with proper
+    streaming output.
+
+    This is Claude Code's actual real-world pattern — `hank-secure-llm`
+    proxy logs show haiku + sonnet arriving 30-70ms apart at the arena
+    during every `claude --bare -p` invocation. The same pair fired
+    simultaneously (asyncio.gather, no sleep) passes after PR #31, which
+    is why the simultaneous test `test_heterogeneous_pair_current_failure_mode`
+    is already green. The 50ms stagger puts the second request into a
+    LATER CB scheduler step, exercising a join-mid-batch path PR #31
+    didn't fix.
+
+    Pre-fix failure signature (observed on prod post-PR-#31, 3/3 runs):
+        - heavy (started T+0):  3 events (message_start + content_block_start),
+                                 0 message_stop, 0 content_block_delta
+        - light (started T+50): 1 event  (message_start only),
+                                 0 message_stop, 0 content_block_delta
+
+    Passing criterion: both requests produce >=1 content_block_delta,
+    a valid stop_reason, and a message_stop within the per-pair budget.
+    """
+    _skip_if_not_configured()
+    httpx = pytest.importorskip("httpx")
+
+    heavy = _load_base_heavy()
+    light = _build_light_payload()
+
+    async with httpx.AsyncClient() as session:
+        # Fire heavy first; wait 50ms so it lands in CB step N and is
+        # mid-prefill when light arrives and tries to join step N+1.
+        heavy_task = asyncio.create_task(_one_request(session, 1, URL, heavy))
+        await asyncio.sleep(0.05)
+        light_task = asyncio.create_task(_one_request(session, 2, URL, light))
+        results = await asyncio.gather(heavy_task, light_task)
+
+    labels = ["heavy", "light"]
+    failures: list[str] = []
+    for r, label in zip(results, labels):
+        failures.extend(_validate_request_result(r, f"staggered-{label}"))
+
+    assert not failures, (
+        f"{len(failures)} staggered-pair (50ms) failures:\n  "
+        + "\n  ".join(failures)
+        + f"\n\nModel: {MODEL}  URL: {URL}\n"
+        "This is the PRIMARY open bug as of 2026-04-22 evening. Claude Code's "
+        "haiku+sonnet fan-out hits this shape deterministically. PR #31 closed "
+        "the simultaneous case but a second shared-state bug remains in the "
+        "scheduler join-mid-batch path. See "
+        "docs/testing/2026-04-21-qwen3-35b-a3b-concurrent-heavy-payload-deadlock.md "
+        '"Symptom (refined 2026-04-22 evening, post-PR-#31 deployment)".'
+    )
+
+
+@pytest.mark.asyncio
+async def test_staggered_pair_50ms_cross_family_gemma():
+    """Cross-family guard: the 50ms-staggered pair against Gemma-4-26b-a4b
+    must continue to work (it does — Gemma routes through MLLMScheduler).
+
+    Same pattern as ``test_staggered_pair_50ms_current_failure_mode`` but
+    targeted at Gemma. Any Qwen-targeted fix must not regress this path.
+    Per bug doc: Gemma completes the staggered pair in ~0.4s + ~0.9s.
+    """
+    _skip_if_not_configured(require_gemma=True)
+    httpx = pytest.importorskip("httpx")
+
+    heavy = _load_base_heavy(model_id=GEMMA_MODEL)
+    light = _build_light_payload(model_id=GEMMA_MODEL)
+
+    async with httpx.AsyncClient() as session:
+        heavy_task = asyncio.create_task(_one_request(session, 1, GEMMA_URL, heavy))
+        await asyncio.sleep(0.05)
+        light_task = asyncio.create_task(_one_request(session, 2, GEMMA_URL, light))
+        results = await asyncio.gather(heavy_task, light_task)
+
+    labels = ["heavy", "light"]
+    failures: list[str] = []
+    for r, label in zip(results, labels):
+        failures.extend(_validate_request_result(r, f"gemma-staggered-{label}"))
+
+    assert not failures, (
+        f"{len(failures)} Gemma cross-family staggered-pair failures:\n  "
+        + "\n  ".join(failures)
+        + f"\n\nModel: {GEMMA_MODEL}  URL: {GEMMA_URL}\n"
+        "Gemma-4 should be unaffected — regression means the Qwen fix "
+        "leaked into MLLMScheduler."
+    )
+
+
+@pytest.mark.asyncio
 async def test_heterogeneous_pair_cross_family_gemma():
     """Cross-family non-regression guard: the same heterogeneous pair
     pattern against Gemma-4-26b-a4b-it-4bit must continue to work.

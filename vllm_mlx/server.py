@@ -111,9 +111,18 @@ from .api.utils import (
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .metrics import streaming_cap_fired_total
 from .tool_parsers import ToolParserManager
+from .utils.trace import install_trace_queue_handler as _install_trace_queue_handler
+from .utils.trace import is_trace_enabled as _trace_enabled
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Install the trace QueueHandler at module import time so
+# `vllm_mlx.trace` emits during scheduler startup are captured
+# without blocking the scheduler thread.  No-op when the env var
+# is unset (checked inside is_trace_enabled()).
+if _trace_enabled():
+    _install_trace_queue_handler(propagate=False)
 
 # Global engine instance
 _engine: BaseEngine | None = None

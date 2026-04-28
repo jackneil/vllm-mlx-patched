@@ -35,7 +35,7 @@ class TestCompileWithRealModel:
         model, tokenizer = model_and_tokenizer
 
         baseline_tokens = []
-        for resp in stream_generate(model, tokenizer, "Hello", max_tokens=5, temp=0.0):
+        for resp in stream_generate(model, tokenizer, "Hello", max_tokens=5):
             baseline_tokens.append(resp.token)
             if resp.finish_reason:
                 break
@@ -44,7 +44,7 @@ class TestCompileWithRealModel:
         assert is_compiled(model)
 
         compiled_tokens = []
-        for resp in stream_generate(model, tokenizer, "Hello", max_tokens=5, temp=0.0):
+        for resp in stream_generate(model, tokenizer, "Hello", max_tokens=5):
             compiled_tokens.append(resp.token)
             if resp.finish_reason:
                 break

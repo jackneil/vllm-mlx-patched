@@ -2779,9 +2779,7 @@ def _emit_block_close(
             )
             thinking_buffer.clear()
         stop_event = {"type": "content_block_stop", "index": block_index}
-        events.append(
-            f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"
-        )
+        events.append(f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n")
         return events
     raise ValueError(
         f"_emit_block_close: unhandled block_type={block_type!r}. "
@@ -2962,7 +2960,9 @@ async def _stream_anthropic_messages(
     # thinking blocks. Per-request so the proxy can toggle it per downstream
     # client; default off preserves Anthropic-spec emission.
     _oc = anthropic_request.output_config or {}
-    fold_thinking = bool(_oc.get("fold_thinking_as_text")) if isinstance(_oc, dict) else False
+    fold_thinking = (
+        bool(_oc.get("fold_thinking_as_text")) if isinstance(_oc, dict) else False
+    )
 
     # Extract messages for engine
     messages, images, videos = extract_multimodal_content(

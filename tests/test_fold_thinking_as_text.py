@@ -135,9 +135,7 @@ def test_fold_thinking_only_thinking_leaves_block_open_for_final_close():
     # Block is still text (fold_thinking maps thinking → text)
     assert final_block_type == "text"
     # No content_block_stop — caller handles that
-    assert not any(
-        e["data"]["type"] == "content_block_stop" for e in parsed
-    ), parsed
+    assert not any(e["data"]["type"] == "content_block_stop" for e in parsed), parsed
     # The emitted text_delta opens <think> but doesn't close it
     text = _collect_text_content(parsed)
     assert text == "<think>Half-finished reasoning..."
@@ -195,7 +193,8 @@ def test_fold_thinking_final_close_emits_closing_tag_if_still_open():
 
     # Last two events should be: text_delta with "</think>", then stop.
     closing_deltas = [
-        e for e in all_parsed
+        e
+        for e in all_parsed
         if e["data"].get("type") == "content_block_delta"
         and e["data"].get("delta", {}).get("type") == "text_delta"
     ]

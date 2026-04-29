@@ -24,6 +24,7 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
+from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
 
@@ -153,9 +154,16 @@ class EngineCore:
         """
         import concurrent.futures
 
-        # Single-thread executor ensures MLX calls are never concurrent
+        # Single-thread executor ensures MLX calls are never concurrent.
+        # initializer runs once on the worker thread when it spawns —
+        # mlx-lm 0.31+ (PR #1090) made generation_stream thread-local,
+        # so the worker MUST register the stream before any scheduler.step
+        # / mx.async_eval runs there. See UPSTREAM_PIN.md invariant #20 +
+        # tests/test_engine_core_stream_safety.py.
         _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-step"
+            max_workers=1,
+            thread_name_prefix="mlx-step",
+            initializer=bind_generation_streams,
         )
         loop = asyncio.get_running_loop()
 
@@ -195,14 +203,22 @@ class EngineCore:
                     )
                     needs_executor = has_waiting or has_partial
 
-                    if needs_executor:
-                        output = await loop.run_in_executor(
-                            _executor, self.scheduler.step
-                        )
-                    else:
-                        output = self.scheduler.step()
-                        # Yield to event loop after inline step
-                        await asyncio.sleep(0)
+                    # mlx-lm 0.31+ (PR #1090) made generation_stream
+                    # thread-local. Pre-PR, we used a hybrid executor:
+                    # worker thread for prefill, inline for generation —
+                    # giving ~5-10% throughput gain on sustained generation
+                    # by avoiding a context switch. Post-PR, the worker
+                    # thread can't share streams with the main thread
+                    # where the model was loaded; binding helpers don't
+                    # migrate stream references already in the prompt
+                    # cache. Upstream waybarrios PR #421 commit 986dda9
+                    # took the same path: run scheduler.step on the
+                    # event-loop thread always. We accept the throughput
+                    # regression as the cost of correctness.
+                    # See UPSTREAM_PIN.md invariant #20.
+                    output = self.scheduler.step()
+                    # Yield to event loop after each step.
+                    await asyncio.sleep(0)
                     self._steps_executed += 1
 
                     # Emergency memory pressure check

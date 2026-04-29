@@ -354,6 +354,81 @@ defensive `for p in (self.logits_processors[e] or []):` fix in
 `GenerationBatch._step()`.  Until upstream lands it, our caller-side
 contract is the only defense.
 
+### Invariant 19: `mlx-lm` install MUST include `deepseek_v4` model class (added 2026-04-28)
+
+The `vllm-mlx` conda env's `mlx-lm` install MUST resolve
+`mlx_lm.models.deepseek_v4` at import time. The upstream PyPI package
+(`mlx-lm 0.31.3`) does NOT ship this module — only `deepseek`,
+`deepseek_v2`, `deepseek_v3`, `deepseek_v32`. Without `deepseek_v4`,
+`vllm-mlx serve mlx-community/DeepSeek-V4-Flash-4bit` (or any other
+`config.json` with `model_type: deepseek_v4`) hard-fails at startup
+with:
+
+    ModuleNotFoundError: No module named 'mlx_lm.models.deepseek_v4'
+    ValueError: Model type deepseek_v4 not supported.
+    ERROR:    Application startup failed. Exiting.
+
+**Current pin (editable install):**
+
+- **Source:** `https://github.com/jackneil/mlx-lm-1.git`
+- **Branch:** `fix/deepseek-v4-decode-cache`
+- **HEAD SHA:** `2673e367f143b8632bd026744e1bf183a674f670` (`fix(deepseek_v4): with-cache decode parity — 4 root causes`)
+- **Local clone:** `/Users/jackneil/Github/mlx-lm-v4`
+- **Conda env wiring:** `/opt/homebrew/Caskroom/miniconda/base/envs/vllm-mlx/lib/python3.12/site-packages/__editable__.mlx_lm-0.31.3.pth`
+  (`pip install -e /Users/jackneil/Github/mlx-lm-v4`)
+
+**Why an editable install instead of a `pyproject.toml` git+ pin
+(invariant 17 pattern):** the deepseek_v4 model class is under active
+development in this fork — bug fixes (e.g. the 4-root-cause cache-vs-
+no-cache logit parity fix at `2673e36`) need to be tested locally
+without re-publishing a pip-installable artifact. The editable install
+keeps `import mlx_lm.models.deepseek_v4` resolving against the working
+tree.
+
+**Forge dependency:** `hank_llm_arena/forge/validators/deepseek_v4.py`
+(arena's HF→MLX convert pipeline) imports `from mlx_lm.models import
+deepseek_v4` at module load and uses `from mlx_lm import load` for
+artifact-parity checks. Forge does NOT ship the model class — it
+assumes it is present in the env. Same constraint applies.
+
+**Failure modes if this pin regresses:**
+
+1. `pip install -U mlx-lm` (or any `pip install` that resolves a
+   transitive `mlx-lm` dep) silently overwrites the editable install
+   with PyPI's `mlx-lm 0.31.3`, removing `deepseek_v4`. DeepSeek model
+   starts hard-fail at the first request after restart. The arena's
+   /admin/models will show the model as `stopped` with no PID.
+
+2. The `mlx-lm-v4` working tree is checked out to a branch without
+   `mlx_lm/models/deepseek_v4.py` (e.g. accidental `git checkout main`).
+   Same symptom — same diagnosis.
+
+**Sentinel test (recommended):** add a contract test parallel to
+`tests/test_mlx_lm_arrays_cache_concurrent.py` that asserts:
+
+    import mlx_lm.models.deepseek_v4  # noqa: F401
+    from mlx_lm.utils import _get_classes
+    cls, args = _get_classes(config={'model_type': 'deepseek_v4'})
+    assert cls.__module__ == 'mlx_lm.models.deepseek_v4'
+
+Failure mode is the exact `ModuleNotFoundError` chain users hit at
+serve-time, so the sentinel catches PyPI overwrites before the next
+DeepSeek serve attempt.
+
+**Drop-back path:** when upstream `ml-explore/mlx-lm` accepts the
+deepseek_v4 model class on `main`, drop the editable install in favor
+of a plain `mlx-lm>=N.N.N` pin in invariant 17's `pyproject.toml`.
+Keep the sentinel; it remains the long-term guard against a future
+mlx-lm regression of this architecture.
+
+**History:** Pre-2026-04-28 the env had stock PyPI `mlx-lm 0.31.3`,
+which crashed every DeepSeek-V4-Flash-4bit start. The editable install
+of `jackneil/mlx-lm-1@fix/deepseek-v4-decode-cache` was wired in some
+time before 2026-04-28; this invariant documents that wiring so it
+survives future env rebuilds. Diagnosis trace at
+`hank-llm-arena/data/logs/mlx-community--DeepSeek-V4-Flash-4bit.log`
+(stale Apr 25, pre-fix).
+
 ## Rebase checklist
 
 When merging upstream changes into this fork:

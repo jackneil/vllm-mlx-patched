@@ -16,6 +16,7 @@ Architecture:
 3. Language model generation is batched using BatchKVCache (like LLM batching)
 """
 
+import copy
 import logging
 import time
 from dataclasses import dataclass, field
@@ -289,6 +290,7 @@ class MLLMBatchGenerator:
         prefill_step_size: int = 2048,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
+        prefix_cache: Optional[Any] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -305,6 +307,14 @@ class MLLMBatchGenerator:
             prefill_step_size: Tokens to process per prefill step
             enable_vision_cache: Enable vision embedding caching
             vision_cache_size: Max entries in vision cache
+            prefix_cache: Optional prefix-cache manager (any object exposing
+                fetch_cache(tokens) -> (cache_or_None, remaining_tokens) and
+                store_cache(tokens, cache) -> None). When provided, text-only
+                requests reuse a previously-prefilled prefix instead of
+                running the full prefill on every turn. Multimodal requests
+                (with images or videos) bypass this cache and continue to
+                prefill from scratch — image-aware prefix caching is a
+                future iteration.
         """
         self.model = model
         self.processor = processor
@@ -357,6 +367,17 @@ class MLLMBatchGenerator:
         if enable_vision_cache:
             logger.info(
                 f"MLLMBatchGenerator: Vision cache enabled (size={vision_cache_size})"
+            )
+
+        # Prefix cache for text-only KV-state reuse across requests.
+        # Held as a duck-typed reference so this module does not depend on
+        # a specific cache implementation (PrefixCacheManager,
+        # MemoryAwarePrefixCache, etc.). Multimodal requests bypass this.
+        self.prefix_cache = prefix_cache
+        if prefix_cache is not None:
+            logger.info(
+                "MLLMBatchGenerator: prefix cache wired (text-only requests "
+                "will reuse cached prefix KV state across turns)"
             )
 
         # Generation stream
@@ -655,8 +676,105 @@ class MLLMBatchGenerator:
         per_request_caches = []
 
         for req in requests:
-            # Create a fresh KVCache for this request's language model prefill
-            request_cache = make_prompt_cache(self.language_model)
+            # Capture the original (pre-trim) input_ids and full token_ids list
+            # so we can store the post-prefill KV state under the right key
+            # even when fetch_cache shortened the prefill work.
+            original_input_ids = req.input_ids
+            full_token_ids: Optional[List[int]] = None
+            cached_prefix_len = 0
+            text_only = not req.images and not req.videos
+            cache_was_hit = False
+
+            # Try to reuse a previously-stored prefix KV state. Scoped to
+            # text-only requests for now: image-bearing prompts route image
+            # tokens at specific positions and partial reuse needs vision-
+            # aware bookkeeping (deferred). The vision_cache above already
+            # handles image-only reuse of pixel processing.
+            if (
+                self.prefix_cache is not None
+                and text_only
+                and original_input_ids is not None
+                and original_input_ids.size > 0
+            ):
+                ids_2d = (
+                    original_input_ids
+                    if original_input_ids.ndim == 2
+                    else original_input_ids[None, :]
+                )
+                full_token_ids = ids_2d[0].tolist()
+                try:
+                    cached_state, remaining = self.prefix_cache.fetch_cache(
+                        full_token_ids
+                    )
+                except Exception:
+                    logger.exception(
+                        "MLLM prefix_cache.fetch_cache raised — "
+                        "falling through to full prefill"
+                    )
+                    cached_state, remaining = None, full_token_ids
+
+                if cached_state is not None and len(remaining) < len(full_token_ids):
+                    cached_prefix_len = len(full_token_ids) - len(remaining)
+                    if remaining:
+                        # Partial match: feed the suffix in for prefill,
+                        # cache pre-populated up to cached_prefix_len.
+                        request_cache = cached_state
+                        req.input_ids = mx.array(remaining)[None, :]
+                    else:
+                        # Full token match. We still need at least one input
+                        # token to compute next-token logits. Trim cache by 1
+                        # so the model reprocesses just the final token; this
+                        # gives logits for the LAST token without re-running
+                        # the whole prompt. Skip if the cache implementation
+                        # does not support trimming.
+                        if hasattr(self.prefix_cache, "_can_trim_cache") and (
+                            self.prefix_cache._can_trim_cache(cached_state)
+                        ):
+                            try:
+                                trimmed = self.prefix_cache._trim_cache(
+                                    copy.deepcopy(cached_state), 1
+                                )
+                                request_cache = trimmed
+                                req.input_ids = mx.array(
+                                    [full_token_ids[-1]]
+                                )[None, :]
+                                cached_prefix_len -= 1
+                            except Exception:
+                                logger.exception(
+                                    "MLLM prefix_cache trim failed — "
+                                    "falling through to full prefill"
+                                )
+                                request_cache = make_prompt_cache(
+                                    self.language_model
+                                )
+                                req.input_ids = original_input_ids
+                                cached_prefix_len = 0
+                        else:
+                            request_cache = make_prompt_cache(self.language_model)
+                            req.input_ids = original_input_ids
+                            cached_prefix_len = 0
+                    if cached_prefix_len > 0:
+                        cache_was_hit = True
+                        logger.debug(
+                            "MLLM prefix cache HIT request=%s cached=%d "
+                            "remaining=%d",
+                            req.request_id,
+                            cached_prefix_len,
+                            req.input_ids.shape[1],
+                        )
+                    else:
+                        request_cache = make_prompt_cache(self.language_model)
+                else:
+                    request_cache = make_prompt_cache(self.language_model)
+                    logger.debug(
+                        "MLLM prefix cache MISS request=%s tokens=%d",
+                        req.request_id,
+                        len(full_token_ids),
+                    )
+            else:
+                # No cache configured, or request carries images/videos:
+                # always do a fresh prefill.
+                request_cache = make_prompt_cache(self.language_model)
 
             with mx.stream(MLLMBatchGenerator._stream):
                 # Run VLM forward pass — cache= flows through to language_model
@@ -673,6 +791,34 @@ class MLLMBatchGenerator:
 
                 first_tokens.append(sampled.item())
                 all_logprobs.append(logprobs.squeeze(0))
+
+            # Restore the original input_ids on the request so downstream
+            # token bookkeeping (output_tokens, generated counters) is
+            # measured against the user's actual prompt, not our
+            # cache-trimmed view.
+            req.input_ids = original_input_ids
+
+            # Store the post-prefill KV state for future requests with this
+            # prefix. Deepcopy because the same KVCache list will be mutated
+            # by subsequent generation steps (continuous batching), but the
+            # stored entry must represent the prompt-only state. Skip when
+            # we already had a cache hit for this prefix — we'd be storing
+            # the same key.
+            if (
+                self.prefix_cache is not None
+                and text_only
+                and full_token_ids is not None
+                and not cache_was_hit
+            ):
+                try:
+                    self.prefix_cache.store_cache(
+                        full_token_ids, copy.deepcopy(request_cache)
+                    )
+                except Exception:
+                    logger.exception(
+                        "MLLM prefix_cache.store_cache raised — request "
+                        "still completed normally"
+                    )
 
             per_request_caches.append(request_cache)
 

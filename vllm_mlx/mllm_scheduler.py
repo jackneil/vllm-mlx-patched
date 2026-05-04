@@ -69,6 +69,17 @@ class MLLMSchedulerConfig:
     default_video_fps: float = 2.0
     # Maximum video frames
     max_video_frames: int = 128
+    # Enable prefix cache reuse for text-only requests. Mirrors the
+    # SchedulerConfig flag on the LLM path. When enabled, identical or
+    # overlapping prompt prefixes (common in multi-turn agentic tools like
+    # Claude Code) skip the full prefill on subsequent turns. Multimodal
+    # requests bypass this cache regardless of the flag.
+    enable_prefix_cache: bool = True
+    # Maximum entries in the MLLM prefix cache. Each entry holds the KV
+    # state for one prompt prefix and can be hundreds of MB to several GB
+    # for long contexts; keep this low. The trie shares storage between
+    # entries that share a prefix, so the effective overhead is sub-linear.
+    prefix_cache_size: int = 16
 
 
 @dataclass
@@ -273,6 +284,22 @@ class MLLMScheduler:
             # Default sampler (can be overridden per-request in future)
             sampler = make_sampler(temp=0.7, top_p=0.9)
 
+            # Prefix cache for text-only KV-state reuse across requests.
+            # The MLLMBatchGenerator only consults this for requests with
+            # no images/videos — multimodal prompts always full-prefill
+            # (image-aware prefix caching is a future iteration).
+            prefix_cache = None
+            if self.config.enable_prefix_cache:
+                from .prefix_cache import PrefixCacheManager
+
+                # Key on the language_model — that is what actually owns
+                # the KV state we are caching. Falls back to the full VLM
+                # if the model does not expose `.language_model`.
+                lm = getattr(self.model, "language_model", self.model)
+                prefix_cache = PrefixCacheManager(
+                    model=lm, max_entries=self.config.prefix_cache_size
+                )
+
             _bg = MLLMBatchGenerator(
                 model=self.model,
                 processor=self.processor,
@@ -283,6 +310,7 @@ class MLLMScheduler:
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
+                prefix_cache=prefix_cache,
             )
             if trace_enabled():
                 trace_emit(

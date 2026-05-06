@@ -328,8 +328,17 @@ class BatchedEngine(BaseEngine):
                 )
 
         # Set Metal memory limits to make allocation failures graceful
-        # instead of fatal Metal command buffer errors (SIGABRT)
+        # instead of fatal Metal command buffer errors (SIGABRT).
+        #
+        # Env knobs (mlx-lm#883/#1015 — wired-page accumulation):
+        # - VLLM_MLX_CACHE_LIMIT_BYTES: cap on Metal cache (default 32 GB).
+        #   Lower values reduce maximum wired-page ceiling per process.
+        # - VLLM_MLX_NUM_SERVERS: divisor for the memory limit when N servers
+        #   share a host (default 1). Each process limits to
+        #   max_recommended/N so 9 sibling servers don't each request 90% of
+        #   physical RAM.
         try:
+            import os
             import mlx.core as mx
 
             if mx.metal.is_available():
@@ -338,15 +347,19 @@ class BatchedEngine(BaseEngine):
                     "max_recommended_working_set_size",
                     device_info.get("memory_size", 0),
                 )
+                num_servers = max(1, int(os.getenv("VLLM_MLX_NUM_SERVERS", "1")))
+                cache_limit_bytes = int(
+                    os.getenv("VLLM_MLX_CACHE_LIMIT_BYTES", str(32 * 1024 * 1024 * 1024))
+                )
                 if max_recommended > 0:
-                    soft_limit = int(max_recommended * 0.90)
+                    soft_limit = int((max_recommended * 0.90) / num_servers)
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit_bytes)
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
-                        f"(90% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"(90% of {max_recommended / 1e9:.1f}GB / {num_servers} servers), "
+                        f"cache_limit={cache_limit_bytes / 1e9:.1f}GB"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")

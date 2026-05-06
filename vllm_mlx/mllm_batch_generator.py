@@ -31,6 +31,56 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+def _handle_full_match(
+    prefix_cache: Any,
+    prompt_cache: List[Any],
+    full_token_ids: List[int],
+    language_model: Any,
+) -> Tuple[List[Any], Optional[mx.array], int, bool]:
+    """Decide how to reuse a fully-cached prefix on a same-tokens fetch.
+
+    Three branches:
+    1. Cache supports trim: deep-copy + trim by 1, feed last token (the
+       original behavior, kept for KVCache and similar trimmable types).
+    2. Cache does NOT support trim (e.g. RotatingKVCache for sliding-
+       window models like gemma-4): use the cache as-is and feed only
+       the last token. This bypasses the silent fallthrough that
+       previously dropped the cache hit. The position counter inside
+       the cache moves on by 1 when the model processes the last
+       token; for sliding-window models this is acceptable — the next-
+       token continuation is still coherent.
+    3. Trim raises: fall back to full prefill.
+
+    Returns:
+        (request_cache, input_ids, cached_prefix_len, cache_was_hit).
+        On fallback, returns (make_prompt_cache(...), None, 0, False);
+        the caller is expected to set input_ids = original_input_ids
+        and skip the cache-was-hit logging.
+    """
+    # Imported lazily so unit tests can stub it.
+    from mlx_lm.models.cache import make_prompt_cache
+
+    can_trim_method = getattr(prefix_cache, "_can_trim_cache", None)
+    can_trim = bool(can_trim_method and can_trim_method(prompt_cache))
+    last_token_input = mx.array([full_token_ids[-1]])[None, :]
+    cached_prefix_len = len(full_token_ids) - 1
+
+    if can_trim:
+        try:
+            trimmed = prefix_cache._trim_cache(copy.deepcopy(prompt_cache), 1)
+            return trimmed, last_token_input, cached_prefix_len, True
+        except Exception:
+            logger.exception(
+                "MLLM prefix_cache trim failed — falling through to full prefill"
+            )
+            return make_prompt_cache(language_model), None, 0, False
+
+    # Non-trimmable cache: reuse as-is, feed only the last token. The
+    # cache will internally bump its position counter — sliding-window
+    # models tolerate this, the next-token output is still correct.
+    return prompt_cache, last_token_input, cached_prefix_len, True
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -729,38 +779,27 @@ class MLLMBatchGenerator:
                         request_cache = cached_state
                         req.input_ids = mx.array(remaining)[None, :]
                     else:
-                        # Full token match. We still need at least one input
-                        # token to compute next-token logits. Trim cache by 1
-                        # so the model reprocesses just the final token; this
-                        # gives logits for the LAST token without re-running
-                        # the whole prompt. Skip if the cache implementation
-                        # does not support trimming.
-                        if hasattr(self.prefix_cache, "_can_trim_cache") and (
-                            self.prefix_cache._can_trim_cache(cached_state)
-                        ):
-                            try:
-                                trimmed = self.prefix_cache._trim_cache(
-                                    copy.deepcopy(cached_state), 1
-                                )
-                                request_cache = trimmed
-                                req.input_ids = mx.array(
-                                    [full_token_ids[-1]]
-                                )[None, :]
-                                cached_prefix_len -= 1
-                            except Exception:
-                                logger.exception(
-                                    "MLLM prefix_cache trim failed — "
-                                    "falling through to full prefill"
-                                )
-                                request_cache = make_prompt_cache(
-                                    self.language_model
-                                )
-                                req.input_ids = original_input_ids
-                                cached_prefix_len = 0
+                        # Full token match. Delegate to _handle_full_match
+                        # which understands both trimmable (regular KVCache)
+                        # and non-trimmable (RotatingKVCache for sliding-
+                        # window models like gemma-4) cache classes. Without
+                        # the latter, gemma-4-26b silently re-prefilled 50K
+                        # tokens on every identical /v1/messages request.
+                        (
+                            request_cache,
+                            new_input_ids,
+                            cached_prefix_len,
+                            cache_was_hit_now,
+                        ) = _handle_full_match(
+                            prefix_cache=self.prefix_cache,
+                            prompt_cache=cached_state,
+                            full_token_ids=full_token_ids,
+                            language_model=self.language_model,
+                        )
+                        if cache_was_hit_now:
+                            req.input_ids = new_input_ids
                         else:
-                            request_cache = make_prompt_cache(self.language_model)
                             req.input_ids = original_input_ids
-                            cached_prefix_len = 0
                     if cached_prefix_len > 0:
                         cache_was_hit = True
                         logger.debug(

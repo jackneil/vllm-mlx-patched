@@ -215,6 +215,30 @@ def serve_command(args):
         compile=args.compile,
     )
 
+    # Spawn the always-responsive health thread on a separate port so
+    # external probers (arena, monitoring) get an answer even when the
+    # main async /health is starved by an inference step that's holding
+    # the uvicorn event loop. See vllm_mlx/fast_health.py.
+    _health_port_arg = getattr(args, "health_port", None)
+    if _health_port_arg is None:
+        _health_port = args.port + 100
+    elif _health_port_arg == 0:
+        _health_port = None  # explicitly disabled
+    else:
+        _health_port = _health_port_arg
+    if _health_port is not None:
+        from .fast_health import start_health_server
+        served_name = (
+            args.served_model_name
+            if getattr(args, "served_model_name", None)
+            else args.model
+        )
+        start_health_server(
+            model_name=served_name,
+            port=_health_port,
+            host=args.host,
+        )
+
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -776,6 +800,18 @@ Examples:
         "--host", type=str, default="0.0.0.0", help="Host to bind"
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
+    serve_parser.add_argument(
+        "--health-port",
+        type=int,
+        default=None,
+        help=(
+            "Port for the always-responsive /health endpoint, served from a "
+            "separate thread that doesn't share the inference event loop. "
+            "Default: --port + 100. Set to 0 to disable. External liveness "
+            "probers (arena, monitoring) should prefer this port — the "
+            "default async /health blocks during long prefills."
+        ),
+    )
     serve_parser.add_argument(
         "--max-num-seqs", type=int, default=256, help="Max concurrent sequences"
     )

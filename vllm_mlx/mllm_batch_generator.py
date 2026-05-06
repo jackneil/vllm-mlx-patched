@@ -384,12 +384,20 @@ class MLLMBatchGenerator:
         if MLLMBatchGenerator._stream is None:
             MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
 
-        # Memory management
+        # Memory management. Coordinated wired-limit: when multiple servers
+        # share a host (e.g. arena fronting 9 vllm-mlx processes), each
+        # raising the limit to 75% of physical RAM independently sums to a
+        # request the kernel can't satisfy, leading to wired-page contention
+        # and the cascading hang in mlx-lm#883/#1015. Divide by an env-
+        # supplied sibling count so the per-process budget stays sane.
+        import os
         self._old_wired_limit = None
         if mx.metal.is_available():
-            self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+            num_servers = max(1, int(os.getenv("VLLM_MLX_NUM_SERVERS", "1")))
+            target = int(
+                mx.device_info()["max_recommended_working_set_size"] / num_servers
             )
+            self._old_wired_limit = mx.set_wired_limit(target)
 
     def close(self) -> None:
         """Release resources and reset wired limit."""

@@ -13,6 +13,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,16 @@ from .model_registry import get_registry
 from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
+
+
+# Idle-branch cache reap interval (seconds). When the engine loop has no
+# requests, the active-branch `mx.clear_cache()` calls (engine_core.py:229,
+# :269) never fire, so the Metal allocator never returns wired pages.
+# Production users hit this as a slow drift toward unrecoverable wired-page
+# pressure (mlx-lm/issues/883, /1015). Reaping every 30s while idle is
+# effectively free (there's no active scheduling to disturb) and keeps the
+# wired-page count bounded.
+IDLE_REAP_INTERVAL_S: float = float(os.getenv("VLLM_MLX_IDLE_REAP_INTERVAL_S", "30"))
 
 
 @dataclass
@@ -116,7 +127,35 @@ class EngineCore:
         self._engine_loop_last_error: Optional[str] = None
         self._engine_loop_error_streak: int = 0
 
+        # Idle-branch cache-reap timestamp; see _maybe_reap_idle_cache.
+        self._last_idle_reap_ts: float = 0.0
+
         logger.debug(f"Engine {self._engine_id} initialized")
+
+    def _maybe_reap_idle_cache(self, now: float) -> bool:
+        """Periodic Metal cache reap for the idle branch of the engine loop.
+
+        The active branch already calls `mx.clear_cache()` at engine_core.py:229
+        and :269. When the scheduler has no requests, neither fires, and the
+        Metal allocator slowly accumulates wired pages it would otherwise
+        return. Reap every IDLE_REAP_INTERVAL_S seconds while idle to bound
+        the wired-page footprint.
+
+        Returns True if the time gate fired this call (regardless of whether
+        clear_cache itself ran or raised — the timestamp advances either way
+        so we don't spin the gate every loop tick).
+        """
+        if now - self._last_idle_reap_ts < IDLE_REAP_INTERVAL_S:
+            return False
+        self._last_idle_reap_ts = now
+        try:
+            if mx.metal.is_available():
+                mx.clear_cache()
+        except Exception as e:
+            # Best-effort: if Metal is contended or briefly unavailable, log
+            # and move on. The next idle tick retries.
+            logger.warning(f"[idle-reap] mx.clear_cache failed: {e}")
+        return True
 
     async def start(self) -> None:
         """Start the engine loop."""
@@ -274,7 +313,10 @@ class EngineCore:
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
                 else:
-                    # No work, yield control
+                    # No work, yield control. While here, periodically reap
+                    # the Metal cache so wired pages don't drift up forever
+                    # on long-idle servers (mlx-lm#883/#1015).
+                    self._maybe_reap_idle_cache(time.monotonic())
                     await asyncio.sleep(step_interval)
 
             except asyncio.CancelledError:

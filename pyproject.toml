@@ -29,12 +29,15 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    # 0.31.3+ required for ArraysCache native batching on hybrid models (Qwen3.5/3.6-35B-A3B,
-    # Qwen3-Next, etc.). 0.31.3 is the first version containing ml-explore/mlx-lm#1169 +
-    # #1177, which fix the ArraysCache.extend() batch-dim bug that produced degenerate
-    # zero-token responses / deadlocks under concurrent heavy-payload serving. Pinned by
-    # UPSTREAM_PIN.md invariant #17. When 0.31.3 lands on PyPI this pin can drop the git URL.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@3cd9a52df261edbcfd74ba8f72ca345380bb1bbd",
+    # Local fork: jackneil/mlx-lm-1 @ feat/pr-999-prefix-cache-hybrid (b95e9f0).
+    # Built atop 3cd9a52d (which carries ml-explore/mlx-lm#1169 + #1177 — ArraysCache
+    # batch-dim fix). On top of that, cherry-picks ml-explore/mlx-lm#999 (Giustino98,
+    # open since 2026-03-11) which fixes RotatingKVCache.is_trimmable / trim for
+    # sliding-window models AFTER the ring buffer wraps. Without this, gemma-4-26b
+    # falls back to full prompt recompute on every multi-turn request that has a
+    # divergent suffix — the practical effect was 35s prefill per Claude Code turn.
+    # When PR #999 merges upstream, return to a plain ml-explore SHA pin.
+    "mlx-lm @ git+https://github.com/jackneil/mlx-lm-1.git@b95e9f0b34b575d91699dc45d663cd6335105301",
     "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
@@ -143,13 +146,14 @@ python_files = ["test_*.py"]
 asyncio_mode = "auto"
 
 [tool.uv]
-# Force mlx-lm to resolve to the git SHA that contains the ArraysCache.extend
-# batch-dim fix (ml-explore/mlx-lm#1169 + #1177, merged 2026-04-21; shipped as
-# 0.31.3 on mlx-lm main). Needed because the [audio] extra's mlx-audio>=0.4.1
-# transitively pins mlx-lm==0.31.1, which reintroduces the concurrent-prefill
-# bug described in UPSTREAM_PIN.md invariant #17. When mlx-lm 0.31.3 lands on
-# PyPI and mlx-audio releases a version that permits >=0.31.3, drop this
-# override and return to a plain version pin in [project.dependencies].
+# Force mlx-lm to resolve to our patched fork carrying both:
+#   1. ml-explore/mlx-lm#1169 + #1177 (ArraysCache.extend batch-dim fix), needed
+#      because the [audio] extra's mlx-audio>=0.4.1 transitively pins
+#      mlx-lm==0.31.1, which reintroduces the concurrent-prefill bug described
+#      in UPSTREAM_PIN.md invariant #17.
+#   2. ml-explore/mlx-lm#999 (RotatingKVCache trim-after-wrap fix for hybrid
+#      sliding-window models like gemma-4 / GPT-OSS), still open upstream.
+# When both land on PyPI, drop this override and return to a plain version pin.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@3cd9a52df261edbcfd74ba8f72ca345380bb1bbd",
+    "mlx-lm @ git+https://github.com/jackneil/mlx-lm-1.git@b95e9f0b34b575d91699dc45d663cd6335105301",
 ]

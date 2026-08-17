@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import tempfile
@@ -55,6 +56,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
@@ -146,6 +148,13 @@ STREAMING_MAX_SECONDS_DEFAULT: float = 260.0
 _streaming_max_seconds: float = STREAMING_MAX_SECONDS_DEFAULT
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+
+# --refusal-dirs PATH: path / HF repo id of the DeepSeek-V4 refusal-direction
+# sidecar. Recorded by load_model() and consumed in lifespan(), because that
+# is the first point where BOTH engines are guaranteed to have real weights
+# (BatchedEngine loads inside lifespan; SimpleEngine loads in load_model).
+# None (the default) means the hook is never imported, let alone installed.
+_refusal_dirs: str | None = None
 
 # CLI-bound reasoning-parser name ("qwen3", "gemma4", "qwen3_coder", or None).
 # Used by Layer 1 (thinking_policy) to decide whether to fire on the Qwen3
@@ -598,6 +607,42 @@ def _get_cache_dir() -> str:
     return cache_dir
 
 
+def _install_refusal_directions() -> int:
+    """Install the DeepSeek-V4 refusal dial if --refusal-dirs was given.
+
+    No-op (and no import) when the flag is absent. Fail-open by design: a bad
+    path, a sidecar that matches nothing, or a non-V4 model logs a warning and
+    leaves the stock model serving, because a refusal dial is a convenience
+    and an unbootable server is not.
+    """
+    if not _refusal_dirs:
+        return 0
+
+    target = getattr(_engine, "_model", None) if _engine is not None else None
+    if target is None:
+        logger.warning(
+            "[refusal] --refusal-dirs given but no model is loaded — "
+            "dial NOT installed, serving stock model"
+        )
+        return 0
+
+    from .patches.deepseek_v4_refusal import load_refusal_directions
+
+    hooked = load_refusal_directions(target, _refusal_dirs)
+    if hooked:
+        logger.info(
+            "[refusal] dial ready on %d attention modules "
+            "(lambda=0 = stock/bit-exact; POST /admin/refusal_lambda to change)",
+            hooked,
+        )
+    else:
+        logger.warning(
+            "[refusal] no directions installed from %r — serving stock model",
+            _refusal_dirs,
+        )
+    return hooked
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -605,6 +650,11 @@ async def lifespan(app: FastAPI):
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
+
+    # Install the DeepSeek-V4 refusal dial (AFTER engine start — this is the
+    # first point where BatchedEngine has real weights). Fail-open: any
+    # problem logs and serves the stock model.
+    _install_refusal_directions()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
@@ -886,6 +936,7 @@ def load_model(
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
     compile: bool = False,
+    refusal_dirs: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -903,9 +954,14 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        refusal_dirs: Path / HF repo id of a DeepSeek-V4 refusal-direction
+            sidecar. Recorded here and installed in lifespan(), once the
+            engine is guaranteed to hold real weights.
     """
     global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
+    global _refusal_dirs
 
+    _refusal_dirs = refusal_dirs
     _default_max_tokens = max_tokens
     _model_path = model_name
     _model_name = served_model_name or model_name
@@ -1040,6 +1096,51 @@ async def status():
         or stats.get("prefix_cache"),
         "requests": stats.get("requests", []),
     }
+
+
+class RefusalLambdaRequest(BaseModel):
+    """Body for POST /admin/refusal_lambda."""
+
+    lambda_: float = Field(..., alias="lambda")
+
+    model_config = {"populate_by_name": True}
+
+
+@app.get("/admin/refusal_lambda")
+async def get_refusal_lambda():
+    """Current refusal-direction dial and whether the hook is installed."""
+    from .patches.deepseek_v4_refusal import status
+
+    return status()
+
+
+@app.post("/admin/refusal_lambda")
+async def post_refusal_lambda(body: RefusalLambdaRequest):
+    """Set the refusal-direction dial; effective on the next request.
+
+    0 is stock (bit-exact), ~1.5 removes refusal, negative values make the
+    model more reticent than stock. Rejected when no directions are loaded,
+    so a silent no-op can never be mistaken for a working dial.
+    """
+    from .patches.deepseek_v4_refusal import set_lambda, status
+
+    st = status()
+    if not st["installed"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "refusal directions are not loaded; start the server with "
+                "--refusal-dirs <path-or-repo> to enable the dial"
+            ),
+        )
+    value = body.lambda_
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail="lambda must be a finite number")
+    if not -10.0 <= value <= 10.0:
+        raise HTTPException(status_code=400, detail="lambda must be between -10 and 10")
+    applied = set_lambda(value)
+    logger.info("[refusal] lambda set to %.3f", applied)
+    return {**status(), "lambda": applied}
 
 
 @app.get("/v1/cache/stats")

@@ -221,7 +221,9 @@ def test_anthropic_stream_layer1_closed_think_routes_tagless_answer_as_text(
     assert resp.status_code == 200
     # Layer 1 fired and reached the engine.
     assert resp.headers.get("x-thinking-qwen3-auto-disabled") == "true"
-    assert (captured[0].get("chat_template_kwargs") or {}).get("enable_thinking") is False
+    assert (captured[0].get("chat_template_kwargs") or {}).get(
+        "enable_thinking"
+    ) is False
     # The router's probe rendered with the SAME kwargs the engine used.
     probe_calls = [c for c in fake.tokenizer.calls if c.get("add_generation_prompt")]
     assert probe_calls, "router never probed the template"
@@ -274,7 +276,9 @@ def test_anthropic_stream_open_think_still_routes_tagless_prefix_as_thinking(
         },
     )
     assert resp.status_code == 200
-    assert (captured[0].get("chat_template_kwargs") or {}).get("enable_thinking") is None
+    assert (captured[0].get("chat_template_kwargs") or {}).get(
+        "enable_thinking"
+    ) is None
     blocks = _anthropic_blocks(resp.text)
     assert blocks.get("thinking") == "thinking hard", blocks
     assert blocks.get("text") == "PONG", blocks
@@ -327,7 +331,9 @@ def test_openai_stream_layer1_closed_think_emits_tagless_answer_as_content(
         },
     )
     assert resp.status_code == 200
-    assert (captured[0].get("chat_template_kwargs") or {}).get("enable_thinking") is False
+    assert (captured[0].get("chat_template_kwargs") or {}).get(
+        "enable_thinking"
+    ) is False
     deltas = _openai_deltas(resp.text)
     content = "".join(d.get("content") or "" for d in deltas)
     reasoning = "".join(d.get("reasoning") or "" for d in deltas)

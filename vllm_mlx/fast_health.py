@@ -55,10 +55,12 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             return
-        body = json.dumps({
-            "status": "healthy",
-            "model_name": type(self)._MODEL_NAME,
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "healthy",
+                "model_name": type(self)._MODEL_NAME,
+            }
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -87,12 +89,16 @@ def start_health_server(*, model_name: str, port: int, host: str = "0.0.0.0") ->
             logger.warning(
                 "fast-health server could not bind %s:%d: %s — "
                 "external probers will fall back to the async /health",
-                host, port, e,
+                host,
+                port,
+                e,
             )
             return
         logger.info(
             "fast-health server listening on %s:%d (model=%s)",
-            host, port, model_name,
+            host,
+            port,
+            model_name,
         )
         server.serve_forever()
 

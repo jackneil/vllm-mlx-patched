@@ -228,6 +228,7 @@ def serve_command(args):
         _health_port = _health_port_arg
     if _health_port is not None:
         from .fast_health import start_health_server
+
         served_name = (
             args.served_model_name
             if getattr(args, "served_model_name", None)

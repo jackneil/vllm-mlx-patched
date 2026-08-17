@@ -349,7 +349,9 @@ class BatchedEngine(BaseEngine):
                 )
                 num_servers = max(1, int(os.getenv("VLLM_MLX_NUM_SERVERS", "1")))
                 cache_limit_bytes = int(
-                    os.getenv("VLLM_MLX_CACHE_LIMIT_BYTES", str(32 * 1024 * 1024 * 1024))
+                    os.getenv(
+                        "VLLM_MLX_CACHE_LIMIT_BYTES", str(32 * 1024 * 1024 * 1024)
+                    )
                 )
                 if max_recommended > 0:
                     soft_limit = int((max_recommended * 0.90) / num_servers)

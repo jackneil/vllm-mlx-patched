@@ -55,6 +55,21 @@ class ReasoningParser(ABC):
                       text-based parsing is sufficient, so this is optional.
         """
         self.tokenizer = tokenizer
+        # Per-request hint set by the streaming handler on its per-request
+        # parser instance (never on the shared module-level parser): does the
+        # generation prompt this request was rendered with END inside an open
+        # reasoning block (e.g. Qwen3's default ``<think>\n`` tail)? Streaming
+        # parsers only see output text, so before any delimiter has appeared
+        # they cannot tell "we are inside a template-opened think block" from
+        # "the model is answering directly". The handler CAN tell - it renders
+        # the template with the request's own chat_template_kwargs - and
+        # passes the answer here.
+        #   True  -> output starts inside reasoning (legacy default guess).
+        #   False -> prompt closed/never opened reasoning: tagless output is
+        #            content (Qwen3 with enable_thinking=False, Layer 1).
+        #   None  -> unknown; parsers keep their legacy behavior.
+        # Parsers whose protocol makes this irrelevant simply ignore it.
+        self.prompt_opens_thinking: bool | None = None
 
     # -- Streaming router integration ---------------------------------------
     # The Anthropic streaming path in server.py uses a StreamingThinkRouter

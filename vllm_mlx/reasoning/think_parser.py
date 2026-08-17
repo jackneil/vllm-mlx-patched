@@ -130,13 +130,23 @@ class BaseThinkingReasoningParser(ReasoningParser):
         if self.end_token in current_text:
             return self._handle_implicit_think(delta_text, end_in_prev, end_in_delta)
 
-        # Case 3: No think tags seen yet
-        # We can't know if <think> was in the prompt, so we must make a choice:
-        # - Treat as content (safe, but loses reasoning if think was in prompt)
-        # - Treat as reasoning (risky, wrong if no thinking at all)
-        # We choose to treat as reasoning IF we haven't seen </think> yet,
-        # because if think was in prompt, we want to capture the reasoning.
-        # This will be corrected once </think> is seen.
+        # Case 3: No think tags seen yet.
+        # From the output text alone we can't know whether <think> was in the
+        # prompt. The streaming handler CAN know - it renders the template
+        # with this request's chat_template_kwargs - and tells us via
+        # prompt_opens_thinking (see ReasoningParser.__init__):
+        # - False: the prompt closed (or never opened) the think block, e.g.
+        #   Qwen3 with enable_thinking=False (Layer 1 first-turn-with-tools),
+        #   whose tail is `<think>\n\n</think>\n\n`. Tagless output IS the
+        #   answer. Labeling it reasoning here made the entire reply - tool
+        #   call markup included - stream out as reasoning with an empty
+        #   content field. A later `</think>` (stray) still routes through
+        #   Case 2 above.
+        # - True/None: legacy guess - treat as reasoning IF we haven't seen
+        #   </think> yet, because if think was in the prompt we want to
+        #   capture the reasoning. Corrected once </think> is seen.
+        if self.prompt_opens_thinking is False:
+            return DeltaMessage(content=delta_text)
         return DeltaMessage(reasoning=delta_text)
 
     def _handle_explicit_think(

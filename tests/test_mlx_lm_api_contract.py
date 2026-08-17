@@ -23,13 +23,18 @@ _SCHEDULER = Path(__file__).parent.parent / "vllm_mlx" / "scheduler.py"
 # Functions whose body is allowed to reference the forbidden attributes.
 # - _active_batches: the canonical helper itself (defines `_prompt_batch`
 #   and `_generation_batch` access).
-# - _install_mtp, _install_chunked_prefill: legacy closures containing
-#   `self=batch_gen` / `self=bg` default-kwarg rebinds. Both are gated
-#   at their call sites for mlx_lm 0.31.2+ (see version-gate in
-#   Scheduler._create_batch_generator). Keeping them dead-but-visible
-#   is cheaper than deleting 500+ lines in a focused drift fix; they
-#   will be rewritten or removed in a follow-up plan.
-_ALLOWLIST_FUNCS = {"_active_batches", "_install_mtp", "_install_chunked_prefill"}
+# - _install_prefill_cache_hooks: the 0.31.2+ cache-save hook installer.
+#   It patches instance methods ON the split batch objects, which is its
+#   whole job — the canonical read-only accessor doesn't apply.
+# - _install_mtp: legacy closures containing `self=batch_gen` default-kwarg
+#   rebinds, gated at the call site for mlx_lm 0.31.2+ (see version-gate in
+#   Scheduler._create_batch_generator). Kept source-visible as reference
+#   scaffolding for the MTP port.
+_ALLOWLIST_FUNCS = {
+    "_active_batches",
+    "_install_mtp",
+    "_install_prefill_cache_hooks",
+}
 
 _FORBIDDEN_ATTRS = {"active_batch", "_prompt_batch", "_generation_batch"}
 
@@ -57,9 +62,9 @@ def test_no_active_batch_or_split_batch_refs_outside_allowlist():
 
     Exceptions (allowlisted by function name — see _ALLOWLIST_FUNCS):
       - `_active_batches` itself defines the direct access.
-      - `_install_mtp` / `_install_chunked_prefill` are legacy closures
-        gated at their call sites; their bodies are unreachable on
-        mlx_lm 0.31.2+ but remain source-visible.
+      - `_install_prefill_cache_hooks` patches instance methods on the
+        split batches by design; `_install_mtp` is a legacy closure gated
+        at its call site, unreachable on mlx_lm 0.31.2+ but source-visible.
 
     The scan walks the AST so it is robust against comments, strings,
     renames, closures (including `self=batch_gen` default-kwarg rebinds),

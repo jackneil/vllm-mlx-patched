@@ -157,9 +157,7 @@ def _iter_attention_modules(model: Any):
                 yield f"mtp.{i}", attn
 
 
-def load_refusal_directions(
-    model: Any, path: str | Path, attn_cls: Any = None
-) -> int:
+def load_refusal_directions(model: Any, path: str | Path, attn_cls: Any = None) -> int:
     """Load direction vectors and install the projection hook.
 
     Args:

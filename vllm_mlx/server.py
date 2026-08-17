@@ -1137,9 +1137,7 @@ async def post_refusal_lambda(body: RefusalLambdaRequest):
     if not math.isfinite(value):
         raise HTTPException(status_code=400, detail="lambda must be a finite number")
     if not -10.0 <= value <= 10.0:
-        raise HTTPException(
-            status_code=400, detail="lambda must be between -10 and 10"
-        )
+        raise HTTPException(status_code=400, detail="lambda must be between -10 and 10")
     applied = set_lambda(value)
     logger.info("[refusal] lambda set to %.3f", applied)
     return {**status(), "lambda": applied}

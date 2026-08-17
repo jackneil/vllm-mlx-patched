@@ -198,6 +198,9 @@ def serve_command(args):
     if args.compile:
         print("  Compile: ENABLED (mx.compile with fused kernels)")
 
+    if args.refusal_dirs:
+        print(f"  Refusal dial: {args.refusal_dirs} (lambda=0 = stock)")
+
     # Load model with unified server
     load_model(
         args.model,
@@ -214,6 +217,7 @@ def serve_command(args):
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
         compile=args.compile,
+        refusal_dirs=args.refusal_dirs,
     )
 
     # Spawn the always-responsive health thread on a separate port so
@@ -947,6 +951,16 @@ Examples:
         type=int,
         default=1,
         help="Number of draft tokens per MTP step (default: 1)",
+    )
+    serve_parser.add_argument(
+        "--refusal-dirs",
+        type=str,
+        default=None,
+        help="Path or HF repo id of a refusal-direction sidecar "
+        "(refusal_dirs.safetensors) for DeepSeek-V4. Enables the runtime "
+        "POST /admin/refusal_lambda dial: 0 = stock (bit-exact), ~1.5 = "
+        "uncensored, negative = more reticent. Must already be in the HF "
+        "cache — serving never downloads.",
     )
     serve_parser.add_argument(
         "--mtp-drafter",

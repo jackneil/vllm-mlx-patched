@@ -76,6 +76,7 @@ jobs:
             tests/test_native_tool_format.py \
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
+            tests/test_prefill_cache_hooks.py \
             tests/test_mllm_cache.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \

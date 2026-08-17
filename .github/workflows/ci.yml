@@ -76,7 +76,6 @@ jobs:
             tests/test_native_tool_format.py \
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
-            tests/test_prefill_cache_hooks.py \
             tests/test_mllm_cache.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
@@ -134,6 +133,7 @@ jobs:
             tests/test_continuous_batching.py \
             tests/test_mlx_lm_arrays_cache_concurrent.py \
             tests/test_mlx_lm_api_contract.py \
+            tests/test_prefill_cache_hooks.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"

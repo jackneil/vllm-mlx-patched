@@ -288,6 +288,10 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+    # MTP sidecar repo/path. Qwen3.5-family checkpoints publish the MTP head
+    # separately from the base weights, so it must be named explicitly (or
+    # left None to try the conventional "<base>-MTP-<quant>" sibling repos).
+    mtp_drafter: str | None = None
 
 
 @dataclass
@@ -425,6 +429,214 @@ def _install_prefill_cache_hooks(
         prompt_cache_save is not None,
         mid_prefill_save is not None,
     )
+
+
+def _install_mtp_decode(batch_gen: "BatchGenerator", model: Any) -> dict:
+    """Install native MTP speculative decoding on an mlx_lm 0.31.2+ generator.
+
+    Each round runs ONE backbone pass over ``[confirmed, draft]`` and emits
+    two tokens when the draft is accepted, one when it is not — so decode
+    throughput scales with the acceptance rate (measured ~68% greedy on
+    Qwen3.8-27B, i.e. ~1.7 tokens per backbone pass).
+
+    Correctness rests on three invariants:
+
+    1. **Unbiased acceptance.** A draft is accepted only when it equals a
+       token freshly drawn from the target model's own distribution at the
+       verify position. Whatever is emitted is therefore always a genuine
+       target-model sample, for greedy AND stochastic samplers alike — no
+       importance-correction math required.
+    2. **Exact rollback.** A rejected draft leaves the KV caches by trimming
+       and the recurrent (GatedDeltaNet) caches by restoring the pre-draft
+       snapshot taken during the split forward. Recurrent state cannot be
+       un-mixed after the fact, which is why the verify pass uses
+       ``n_confirmed``.
+    3. **Nothing is emitted before it is cached.** A token is returned only
+       once the backbone has consumed it, so a finished request's extracted
+       prompt cache always matches the tokens actually emitted — the
+       property the prefix cache relies on when it stores that entry.
+
+    MTP owns ``next()`` only while the batch holds a single sequence with no
+    per-request logits processors; anything else delegates to the stock
+    implementation. Because ``_next_tokens``/``_next_logprobs`` keep pointing
+    at the one produced-but-unfed token after every round, that handoff needs
+    no special casing — a second sequence can join mid-stream and stock
+    batching resumes on the next step.
+
+    Returns the mutable stats dict (accepted / rejected / rounds).
+    """
+    from .patches.qwen3_5_mtp import clear_rollback, rollback_draft
+
+    gen = batch_gen._generation_batch
+    _orig_next = gen.next
+    Response = type(gen).Response
+
+    st: dict[str, Any] = {
+        "y": None,  # produced, not yet fed to the backbone, not yet emitted
+        "y_lp": None,
+        "draft": None,  # pending draft token id awaiting verification
+        "mtp_cache": None,
+        "accepted": 0,
+        "rejected": 0,
+        "rounds": 0,
+    }
+
+    def _reset():
+        st["y"] = None
+        st["y_lp"] = None
+        st["draft"] = None
+        st["mtp_cache"] = None
+
+    def _logprobs(row):
+        return row - mx.logsumexp(row, axis=-1, keepdims=True)
+
+    def _mtp_next():
+        # Single-sequence only: per-row accept/reject would otherwise need
+        # divergent caches inside one batch. Per-request logits processors
+        # (e.g. the thinking-token budget) are excluded because they must see
+        # every token exactly once through the batch's TokenBuffer.
+        if len(gen.uids) != 1 or any(gen.logits_processors):
+            if st["y"] is not None:
+                # _next_tokens already points at the unfed token — exactly
+                # what the stock stepper expects. Just drop the MTP state.
+                _reset()
+            return _orig_next()
+
+        if st["y"] is None:
+            if gen._next_tokens is None or gen._next_tokens.size == 0:
+                return _orig_next()
+            mx.eval(gen._next_tokens)
+            st["y"] = gen._next_tokens.tolist()[0]
+            st["y_lp"] = gen._next_logprobs[0] if gen._next_logprobs else None
+            st["mtp_cache"] = model.make_mtp_cache()
+
+        cache = gen.prompt_cache
+        sampler = (
+            gen.samplers[0] if any(gen.samplers) else None
+        ) or gen.fallback_sampler
+        uid = gen.uids[0]
+        y, draft = st["y"], st["draft"]
+        if draft is not None and not isinstance(draft, int):
+            draft = draft.item()  # forces the async draft from the previous round
+            st["draft"] = draft
+        emits: list[tuple[int, Any]] = []
+
+        if draft is None:
+            # Cold start: no pending draft, so run a plain single-token pass
+            # and use its hidden state to seed the first draft.
+            logits, hidden = model(
+                mx.array([[y]], mx.uint32), cache=cache, return_hidden=True
+            )
+            lp = _logprobs(logits[:, -1, :])
+            nxt = sampler(lp)
+            mx.eval(nxt, lp)
+            gen.tokens[0].append(y)
+            emits.append((y, st["y_lp"] if st["y_lp"] is not None else lp[0]))
+            nxt_id = nxt.item()
+            d_logits = model.mtp_forward(
+                hidden[:, -1:, :], mx.array([[nxt_id]], mx.uint32), st["mtp_cache"]
+            )
+            # async: the draft is not needed until the next round builds its
+            # input, so let it overlap response building and detokenization.
+            d = sampler(_logprobs(d_logits[:, -1, :]))
+            mx.async_eval(d)
+            st["draft"] = d
+            st["y"], st["y_lp"] = nxt_id, lp[0]
+        else:
+            # Verify: one pass over [confirmed, draft]. n_confirmed=1 makes the
+            # recurrent layers snapshot their state between the two tokens.
+            logits, hidden = model(
+                mx.array([[y, draft]], mx.uint32),
+                cache=cache,
+                return_hidden=True,
+                n_confirmed=1,
+            )
+            lp0, lp1 = _logprobs(logits[:, 0, :]), _logprobs(logits[:, 1, :])
+            verify, bonus = sampler(lp0), sampler(lp1)
+            mx.eval(verify, bonus, lp0, lp1)
+
+            gen.tokens[0].append(y)
+            emits.append((y, st["y_lp"] if st["y_lp"] is not None else lp0[0]))
+
+            if verify.item() == draft:
+                clear_rollback(cache)
+                st["accepted"] += 1
+                gen.tokens[0].append(draft)
+                emits.append((draft, lp0[0]))
+                bonus_id = bonus.item()
+                # Two MTP positions in one call: (h_y, draft) keeps the head's
+                # cache aligned with the accepted stream, (h_draft, bonus)
+                # produces the next draft.
+                d_logits = model.mtp_forward(
+                    hidden[:, 0:2, :],
+                    mx.array([[draft, bonus_id]], mx.uint32),
+                    st["mtp_cache"],
+                )
+                d = sampler(_logprobs(d_logits[:, -1, :]))
+                mx.async_eval(d)
+                st["draft"] = d
+                st["y"], st["y_lp"] = bonus_id, lp1[0]
+            else:
+                rollback_draft(cache)
+                st["rejected"] += 1
+                verify_id = verify.item()
+                d_logits = model.mtp_forward(
+                    hidden[:, 0:1, :],
+                    mx.array([[verify_id]], mx.uint32),
+                    st["mtp_cache"],
+                )
+                d = sampler(_logprobs(d_logits[:, -1, :]))
+                mx.async_eval(d)
+                st["draft"] = d
+                st["y"], st["y_lp"] = verify_id, lp0[0]
+
+        st["rounds"] += 1
+
+        responses = []
+        finished = False
+        for tok_id, lp in emits:
+            gen._num_tokens[0] += 1
+            finish_reason = None
+            if gen._num_tokens[0] >= gen.max_tokens[0]:
+                finish_reason = "length"
+            (
+                gen._matcher_states[0],
+                match_sequence,
+                current_state,
+            ) = gen.state_machines[0].match(gen._matcher_states[0], tok_id)
+            if match_sequence is not None and current_state is None:
+                finish_reason = "stop"
+            responses.append(
+                Response(
+                    uid=uid,
+                    token=tok_id,
+                    logprobs=lp,
+                    finish_reason=finish_reason,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    prompt_cache=gen.extract_cache(0) if finish_reason else None,
+                    all_tokens=gen.tokens[0] if finish_reason else None,
+                )
+            )
+            if finish_reason is not None:
+                finished = True
+                break
+
+        if finished:
+            gen.filter([])
+            _reset()
+        else:
+            # Keep the stock contract intact: _next_tokens is the single
+            # produced-but-unfed token, so extend()/filter() and any handoff
+            # back to stock stepping stay correct.
+            gen._next_tokens = mx.array([st["y"]], mx.uint32)
+            gen._next_logprobs = [st["y_lp"]]
+
+        return responses
+
+    gen.next = _mtp_next
+    logger.info("[MTP] native MTP speculative decoding installed")
+    return st
 
 
 def _install_mtp(
@@ -1159,24 +1371,22 @@ class Scheduler:
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
-            if hasattr(self.model, "mtp") and self.model.mtp is not None:
-                # mlx_lm 0.31.2+ replaced BatchGenerator.active_batch
-                # with split _prompt_batch + _generation_batch. The
-                # closures inside _install_mtp (_mtp_step, _mtp_next)
-                # still reference the old single-slot API and would
-                # crash on every decode step. Keep them dead under
-                # 0.31.2+ until a proper MTP port lands. Loud WARN so
-                # operators know MTP is not active.
+            # The Qwen3.5/3.8 head is attached at model-load time by
+            # patches.qwen3_5_mtp (mlx_lm has no MTP head for the arch and
+            # the weights ship as a separate repo); Qwen3-Next carries its
+            # own. Either way `mtp_forward` is the capability we need.
+            has_mtp_api = hasattr(self.model, "mtp_forward") and hasattr(
+                self.model, "make_mtp_cache"
+            )
+            if has_mtp_api and hasattr(bg, "_generation_batch"):
+                self._mtp_stats = _install_mtp_decode(bg, self.model)
+            elif hasattr(self.model, "mtp") and self.model.mtp is not None:
                 if hasattr(bg, "_generation_batch"):
                     logger.warning(
-                        "[MTP] Requested but not installed under mlx_lm "
-                        "0.31.2+ (BatchGenerator split batches require an "
-                        "MTP closure rewrite that has not shipped yet). "
-                        "Decode will run WITHOUT speculative draft "
-                        "acceleration. See UPSTREAM_PIN.md invariant #10 "
-                        "for contract status, and the LEGACY DEAD CODE "
-                        "docstring at vllm_mlx/scheduler.py::_install_mtp "
-                        "for the closures that need porting."
+                        "[MTP] Model exposes an MTP head but no "
+                        "mtp_forward/make_mtp_cache API, so native MTP "
+                        "decoding cannot be installed. Decode will run "
+                        "WITHOUT speculative draft acceleration."
                     )
                 else:
                     _install_mtp(

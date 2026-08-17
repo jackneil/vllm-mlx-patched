@@ -34,6 +34,10 @@ _ALLOWLIST_FUNCS = {
     "_active_batches",
     "_install_mtp",
     "_install_prefill_cache_hooks",
+    # Installs speculative decoding by replacing `next()` on the generation
+    # batch and reading its sampler/cache state — reaching into the split
+    # batches IS the job, so the read-only accessor does not apply.
+    "_install_mtp_decode",
 }
 
 _FORBIDDEN_ATTRS = {"active_batch", "_prompt_batch", "_generation_batch"}

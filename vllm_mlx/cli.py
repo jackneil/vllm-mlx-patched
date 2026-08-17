@@ -150,6 +150,7 @@ def serve_command(args):
             enable_mtp=args.enable_mtp,
             mtp_num_draft_tokens=args.mtp_num_draft_tokens,
             mtp_optimistic=args.mtp_optimistic,
+            mtp_drafter=args.mtp_drafter,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -946,6 +947,16 @@ Examples:
         type=int,
         default=1,
         help="Number of draft tokens per MTP step (default: 1)",
+    )
+    serve_parser.add_argument(
+        "--mtp-drafter",
+        type=str,
+        default=None,
+        help="Repo id or local path of the MTP head to load alongside the base "
+        "model (Qwen3.5-family publishes it separately, e.g. "
+        "mlx-community/Qwen3.8-27B-MTP-4bit). Must already be in the HF cache — "
+        "serving never downloads. Omit to try the conventional "
+        "'<base>-MTP-<quant>' sibling repos.",
     )
     serve_parser.add_argument(
         "--mtp-optimistic",

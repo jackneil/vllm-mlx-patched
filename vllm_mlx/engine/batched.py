@@ -22,6 +22,30 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+def _read_model_config(model_name: str) -> dict:
+    """Read a model's config.json from a local path or the HF cache.
+
+    Returns {} when the config cannot be located — callers treat that as
+    "no special architecture handling", never as a fatal error.
+    """
+    import json
+    from pathlib import Path
+
+    p = Path(model_name)
+    if not p.is_dir():
+        try:
+            from huggingface_hub import snapshot_download
+
+            p = Path(snapshot_download(model_name, local_files_only=True))
+        except Exception:
+            return {}
+    cfg = p / "config.json"
+    try:
+        return json.loads(cfg.read_text()) if cfg.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     """
     Extract images and videos from OpenAI-format messages.
@@ -319,7 +343,26 @@ class BatchedEngine(BaseEngine):
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             from ..patches.qwen3_next_mtp import validate_mtp_support
 
-            if validate_mtp_support(self._model):
+            # Qwen3.5/3.8 ship the MTP head as a separate repo and mlx_lm has
+            # no MTP head for the architecture, so inject it before validating.
+            # Qwen3-Next carries its head in-model and needs no injection.
+            if not validate_mtp_support(self._model):
+                from ..patches import qwen3_5_mtp
+
+                config = _read_model_config(self._model_name)
+                if config.get("model_type", "").startswith("qwen3_5"):
+                    qwen3_5_mtp.inject_mtp_support(
+                        self._model,
+                        self._model_name,
+                        config,
+                        drafter=self._scheduler_config.mtp_drafter,
+                    )
+
+            from ..patches.qwen3_5_mtp import (
+                validate_mtp_support as validate_qwen3_5_mtp,
+            )
+
+            if validate_mtp_support(self._model) or validate_qwen3_5_mtp(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:
                 logger.warning(

@@ -2652,6 +2652,7 @@ def _detect_starts_thinking(
     tokenizer,
     start_token: str,
     end_tokens: list[str],
+    chat_template_kwargs: dict | None = None,
 ) -> bool:
     """Detect if the model's chat template leaves thinking genuinely OPEN.
 
@@ -2660,6 +2661,19 @@ def _detect_starts_thinking(
     correctly handles Gemma4 where the template contains <|channel> but
     emits a CLOSED block (<|channel>thought\\n<channel|>) when
     enable_thinking is not set.
+
+    The probe is PER REQUEST, not per model: ``chat_template_kwargs`` must
+    be the same dict the engine will merge into its own render
+    (``BatchedEngine._apply_chat_template``, caller kwargs merged last), so
+    the answer matches the generation prompt this request actually gets.
+    That matters for Qwen3.x: the template defaults to an OPEN
+    ``<think>\\n`` tail, but with ``enable_thinking=False`` (Layer 1's
+    first-turn-with-tools auto-disable, or a client-set kwarg) it emits a
+    CLOSED ``<think>\\n\\n</think>\\n\\n`` tail. Probing without the kwarg
+    reported "open" for such requests, so the streaming router started in
+    thinking mode and a tagless answer streamed out entirely as a
+    ``thinking`` block with no ``text`` block at all - Claude Code rendered
+    nothing and re-prompted ("no visible output").
 
     Falls back to the naive text-in-template check if rendering fails
     (safe default: True means router starts in thinking mode).
@@ -2672,18 +2686,19 @@ def _detect_starts_thinking(
     if start_token not in chat_template or "add_generation_prompt" not in chat_template:
         return False
 
-    # NOTE: enable_thinking is deliberately NOT passed here. The probe must
-    # match the kwargs the BatchedEngine uses (batched.py:387-392), which
-    # also omits enable_thinking. Templates that default it to True (Qwen3)
-    # produce the correct open-thinking result; templates that default it to
-    # False (Gemma4) produce the correct closed-thinking result. If a future
-    # engine path passes enable_thinking explicitly, this probe must be
-    # updated to match.
+    # Same merge order as BatchedEngine._apply_chat_template: engine defaults
+    # first, caller-supplied chat_template_kwargs LAST so they override.
+    # Templates that default enable_thinking to True (Qwen3) render open when
+    # the kwarg is absent and closed when it is False; templates that default
+    # it to False (Gemma4) render closed either way.
+    template_kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
+    if chat_template_kwargs:
+        for _k, _v in chat_template_kwargs.items():
+            template_kwargs[_k] = _v
     try:
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": "x"}],
-            tokenize=False,
-            add_generation_prompt=True,
+            **template_kwargs,
         )
     except Exception:
         return True
@@ -3052,15 +3067,26 @@ async def _stream_anthropic_messages(
         _parser_label = "none"
 
     _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-    _starts_thinking = _detect_starts_thinking(_tokenizer, _start_token, _end_tokens)
+    # Probe with THIS request's chat_template_kwargs (post-Layer-1: the
+    # adapter has already injected enable_thinking=False when it fired), so
+    # the router's initial mode matches the generation prompt the engine
+    # will actually render for it. See _detect_starts_thinking.
+    _starts_thinking = _detect_starts_thinking(
+        _tokenizer,
+        _start_token,
+        _end_tokens,
+        chat_template_kwargs=openai_request.chat_template_kwargs,
+    )
 
     logger.info(
-        "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r",
+        "StreamingThinkRouter: parser=%s start=%r end=%r strip=%r start_in_thinking=%r "
+        "chat_template_kwargs=%r",
         _parser_label,
         _start_token,
         _end_tokens,
         _channel_strip,
         _starts_thinking,
+        openai_request.chat_template_kwargs,
     )
 
     think_router = StreamingThinkRouter(
@@ -3451,6 +3477,19 @@ async def stream_chat_completion(
     if _reasoning_parser:
         reasoning_parser = _reasoning_parser.__class__(
             getattr(_reasoning_parser, "tokenizer", None)
+        )
+        # Tell the per-request parser whether THIS request's generation
+        # prompt ends inside an open reasoning block. Same probe (and same
+        # post-Layer-1 chat_template_kwargs) the Anthropic stream uses for
+        # its StreamingThinkRouter, so both streaming paths agree: with the
+        # think block closed by the template (Qwen3 enable_thinking=False),
+        # tagless output - tool-call markup included - is content, and
+        # reaches the tool parser instead of vanishing into `reasoning`.
+        reasoning_parser.prompt_opens_thinking = _detect_starts_thinking(
+            engine.tokenizer if hasattr(engine, "tokenizer") else None,
+            reasoning_parser.start_token,
+            list(reasoning_parser.end_tokens),
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
     # Track accumulated text for reasoning parser

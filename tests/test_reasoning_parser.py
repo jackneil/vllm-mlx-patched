@@ -688,6 +688,78 @@ class TestQwen3SpecificCases:
                 assert reasoning is None or reasoning.strip() == ""
             assert expected_content in (content or "")
 
+    # -- prompt_opens_thinking hint (streaming Case 3) ------------------------
+
+    @staticmethod
+    def _stream(parser, tokens):
+        accumulated = ""
+        reasoning_parts, content_parts = [], []
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+        return "".join(reasoning_parts), "".join(content_parts)
+
+    def test_streaming_tagless_defaults_to_reasoning_when_hint_unknown(self, parser):
+        """Legacy Case 3: no hint (None) -> tagless deltas are reasoning."""
+        assert parser.prompt_opens_thinking is None
+        reasoning, content = self._stream(parser, ["PO", "NG"])
+        assert reasoning == "PONG"
+        assert content == ""
+
+    def test_streaming_tagless_is_reasoning_when_prompt_opens_thinking(self, parser):
+        """Hint True (template tail `<think>\\n`): tagless deltas are reasoning
+        until `</think>`, then content - implicit mode unchanged."""
+        parser.prompt_opens_thinking = True
+        reasoning, content = self._stream(
+            parser, ["thinking", " hard", "</think>", "PONG"]
+        )
+        assert reasoning == "thinking hard"
+        assert content == "PONG"
+
+    def test_streaming_tagless_is_content_when_prompt_closed_thinking(self, parser):
+        """Hint False (template tail `<think>\\n\\n</think>\\n\\n`, i.e.
+        enable_thinking=False / Layer 1): tagless deltas are CONTENT. This is
+        the Claude-Code 'no visible output' regression on the OpenAI stream."""
+        parser.prompt_opens_thinking = False
+        reasoning, content = self._stream(parser, ["PO", "NG"])
+        assert reasoning == ""
+        assert content == "PONG"
+
+    def test_streaming_tool_markup_is_content_when_prompt_closed_thinking(self, parser):
+        """With the think block closed, tool-call markup must surface as content
+        (that is what the tool parser consumes) rather than vanish into
+        reasoning."""
+        parser.prompt_opens_thinking = False
+        reasoning, content = self._stream(
+            parser, ["<tool_call>", '{"name":"Bash"}', "</tool_call>"]
+        )
+        assert reasoning == ""
+        assert content == '<tool_call>{"name":"Bash"}</tool_call>'
+
+    def test_streaming_explicit_tags_still_split_when_prompt_closed_thinking(
+        self, parser
+    ):
+        """Hint False must not break the explicit `<think>...</think>` case."""
+        parser.prompt_opens_thinking = False
+        reasoning, content = self._stream(
+            parser, ["<think>", "hmm", "</think>", "PONG"]
+        )
+        assert reasoning == "hmm"
+        assert content == "PONG"
+
+    def test_streaming_hint_is_per_instance(self):
+        """The hint lives on the per-request instance; a fresh parser has none."""
+        p1 = get_parser("qwen3")()
+        p1.prompt_opens_thinking = False
+        p2 = get_parser("qwen3")()
+        assert p2.prompt_opens_thinking is None
+
 
 class TestGptOssParser:
     """Tests for the GPT-OSS reasoning parser (channel-based format)."""

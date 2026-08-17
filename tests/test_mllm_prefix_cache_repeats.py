@@ -25,7 +25,6 @@ avoid GPU dependency.
 
 from __future__ import annotations
 
-import pytest
 
 from vllm_mlx.prefix_cache import PrefixCacheManager
 
@@ -33,6 +32,7 @@ from vllm_mlx.prefix_cache import PrefixCacheManager
 class _StubModel:
     """Minimal model stand-in. PrefixCacheManager only uses `id(model)` for
     fingerprinting so we do not need real model attributes."""
+
     pass
 
 
@@ -56,8 +56,12 @@ def test_full_match_returns_cache_and_empty_remaining():
     cache.store_cache(tokens, sentinel_state)
 
     cached_state, remaining = cache.fetch_cache(tokens)
-    assert cached_state is not None, "second identical fetch missed — re-prefill is forced"
-    assert remaining == [], f"full match must yield empty remaining, got {len(remaining)}"
+    assert (
+        cached_state is not None
+    ), "second identical fetch missed — re-prefill is forced"
+    assert (
+        remaining == []
+    ), f"full match must yield empty remaining, got {len(remaining)}"
     assert cache.stats.hits >= 1, "exact-match path didn't increment hits stat"
 
 
@@ -92,7 +96,9 @@ def test_shorter_prefix_match_returns_remaining_suffix():
     new = prefix + [99999]  # one more token
     cached, remaining = cache.fetch_cache(new)
     assert cached is not None, "supersequence fetch failed to hit"
-    assert remaining == [99999], f"remaining must be the new suffix, got {len(remaining)} tokens"
+    assert remaining == [
+        99999
+    ], f"remaining must be the new suffix, got {len(remaining)} tokens"
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +125,7 @@ def test_text_only_detection_for_tools_no_images():
     """The check at mllm_batch_generator.py:700-712 gates cache fetch on
     `text_only`. Claude Code's 144-tool /v1/messages has no images/videos —
     should be text_only."""
+
     class StubReq:
         def __init__(self, images=None, videos=None):
             self.images = images
@@ -186,7 +193,7 @@ def test_stats_track_hits_and_misses():
 
     cache.fetch_cache([1, 2, 3])  # hit
     cache.fetch_cache([1, 2, 3])  # hit
-    cache.fetch_cache([99, 88])   # miss
+    cache.fetch_cache([99, 88])  # miss
 
     assert cache.stats.hits == 2, f"expected 2 hits, got {cache.stats.hits}"
     assert cache.stats.misses == 1, f"expected 1 miss, got {cache.stats.misses}"

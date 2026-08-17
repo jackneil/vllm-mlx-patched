@@ -28,21 +28,24 @@ from __future__ import annotations
 
 import io
 import json
-from http.server import BaseHTTPRequestHandler
 
 
 def _make_response(handler_cls, model_name: str, path: str = "/health"):
     """Drive the handler through a fake socket so we can assert the
     response without actually opening a port."""
+
     class _StubServer:
         pass
+
     server = _StubServer()
 
     class _StubRequest:
         def __init__(self, raw: bytes):
             self._buf = io.BytesIO(raw)
+
         def makefile(self, mode, *a, **kw):
             return self._buf
+
         def sendall(self, *a, **kw):
             pass
 
@@ -107,9 +110,9 @@ def test_health_endpoint_uses_stable_shape_for_arena_detection():
     raw = _make_response(HealthHandler, model_name="x")
     body = json.loads(raw.decode("latin-1").split("\r\n\r\n", 1)[1])
     assert "model_name" in body, "arena needs model_name for vllm-mlx detection"
-    assert "loaded_model" not in body, (
-        "must NOT have loaded_model — that's the mlx-vlm signal"
-    )
+    assert (
+        "loaded_model" not in body
+    ), "must NOT have loaded_model — that's the mlx-vlm signal"
 
 
 def test_other_paths_return_404():
@@ -118,7 +121,9 @@ def test_other_paths_return_404():
     for path in ("/", "/v1/models", "/healthz", "/health.json", "/admin"):
         raw = _make_response(HealthHandler, model_name="x", path=path)
         text = raw.decode("latin-1")
-        assert text.startswith(("HTTP/1.0 404", "HTTP/1.1 404")), f"path {path}: {text[:80]}"
+        assert text.startswith(
+            ("HTTP/1.0 404", "HTTP/1.1 404")
+        ), f"path {path}: {text[:80]}"
 
 
 def test_handler_does_not_couple_to_engine_or_event_loop():

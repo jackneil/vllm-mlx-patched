@@ -38,6 +38,7 @@ Fix path on either failure: re-run the editable install:
 If this file fails in CI, do NOT merge — DeepSeek serving will be silently
 broken until the first user request crashes.
 """
+
 from __future__ import annotations
 
 import importlib

@@ -441,6 +441,7 @@ class MLLMBatchGenerator:
         # and the cascading hang in mlx-lm#883/#1015. Divide by an env-
         # supplied sibling count so the per-process budget stays sane.
         import os
+
         self._old_wired_limit = None
         if mx.metal.is_available():
             num_servers = max(1, int(os.getenv("VLLM_MLX_NUM_SERVERS", "1")))

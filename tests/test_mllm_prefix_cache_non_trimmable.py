@@ -18,10 +18,6 @@ they want.
 
 from __future__ import annotations
 
-from collections import deque
-
-import mlx.core as mx
-import pytest
 
 from vllm_mlx.prefix_cache import PrefixCacheManager
 
@@ -124,13 +120,11 @@ def test_handle_full_match_trimmable_cache():
     fetched, _ = cache.fetch_cache(tokens)
     assert fetched is not None
 
-    request_cache, input_ids, cached_prefix_len, cache_was_hit = (
-        _handle_full_match(
-            prefix_cache=cache,
-            prompt_cache=fetched,
-            full_token_ids=tokens,
-            language_model=_StubModel(),
-        )
+    request_cache, input_ids, cached_prefix_len, cache_was_hit = _handle_full_match(
+        prefix_cache=cache,
+        prompt_cache=fetched,
+        full_token_ids=tokens,
+        language_model=_StubModel(),
     )
     assert cache_was_hit is True
     assert cached_prefix_len == len(tokens) - 1
@@ -152,21 +146,19 @@ def test_handle_full_match_non_trimmable_cache_still_hits():
     fetched, _ = cache.fetch_cache(tokens)
     assert fetched is not None
 
-    request_cache, input_ids, cached_prefix_len, cache_was_hit = (
-        _handle_full_match(
-            prefix_cache=cache,
-            prompt_cache=fetched,
-            full_token_ids=tokens,
-            language_model=_StubModel(),
-        )
+    request_cache, input_ids, cached_prefix_len, cache_was_hit = _handle_full_match(
+        prefix_cache=cache,
+        prompt_cache=fetched,
+        full_token_ids=tokens,
+        language_model=_StubModel(),
     )
-    assert cache_was_hit is True, (
-        "full match with non-trimmable cache MUST hit — silent fallthrough is the bug"
-    )
+    assert (
+        cache_was_hit is True
+    ), "full match with non-trimmable cache MUST hit — silent fallthrough is the bug"
     assert cached_prefix_len == len(tokens) - 1
     assert input_ids is not None
     assert input_ids.tolist() == [[tokens[-1]]]
     # Cache returned as-is (no deep copy needed since not trimming)
-    assert request_cache is fetched, (
-        "non-trimmable cache should be returned as-is (no deep copy)"
-    )
+    assert (
+        request_cache is fetched
+    ), "non-trimmable cache should be returned as-is (no deep copy)"

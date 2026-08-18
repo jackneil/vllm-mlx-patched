@@ -960,7 +960,9 @@ Examples:
         "(refusal_dirs.safetensors) for DeepSeek-V4. Enables the runtime "
         "POST /admin/refusal_lambda dial: 0 = stock (bit-exact), ~1.5 = "
         "uncensored, negative = more reticent. Must already be in the HF "
-        "cache — serving never downloads.",
+        "cache (serving never downloads). Incompatible with --compile: "
+        "mx.compile freezes the dial at its trace-time value, so the install "
+        "refuses and the stock model is served.",
     )
     serve_parser.add_argument(
         "--mtp-drafter",

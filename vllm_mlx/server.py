@@ -155,8 +155,6 @@ CACHE_PERSIST_INTERVAL_SECONDS_DEFAULT: float = 300.0
 _cache_persist_interval_seconds: float = CACHE_PERSIST_INTERVAL_SECONDS_DEFAULT
 # Handle on the background flush loop so lifespan can cancel it on shutdown.
 _cache_flush_task: asyncio.Task | None = None
-# Overlap guard: a flush that outruns its interval must not stack.
-_cache_flush_running: bool = False
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
@@ -537,7 +535,12 @@ def _save_prefix_cache_to_disk() -> None:
 
 
 def _flush_prefix_cache_to_disk() -> None:
-    """Incrementally persist the hottest prefixes. Runs on a worker thread."""
+    """Incrementally persist the hottest prefixes.
+
+    Called synchronously on the event-loop thread by
+    :func:`_periodic_cache_flush_loop` — see that docstring for why it is not
+    offloaded to a worker.
+    """
     try:
         d = _get_cache_dir()
         saved = _engine.flush_cache_to_disk(d)
@@ -552,27 +555,33 @@ def _flush_prefix_cache_to_disk() -> None:
 async def _periodic_cache_flush_loop() -> None:
     """Flush the prefix cache to disk every _cache_persist_interval_seconds.
 
-    Runs for the life of the server. Every failure mode is contained: the
-    flush itself runs on a worker thread (safetensors writes are blocking),
-    a raising flush is logged and the loop keeps its schedule, and a flush
-    that outruns the interval makes the next tick skip rather than stack.
-    """
-    global _cache_flush_running
+    Runs for the life of the server. The flush runs SYNCHRONOUSLY on the
+    event-loop thread rather than via asyncio.to_thread. Two reasons, both
+    observed rather than theoretical:
 
+    * ``task.cancel()`` cannot stop a worker thread. With the flush offloaded,
+      the lifespan shutdown save ran CONCURRENTLY with an in-flight flush over
+      the same cache directory and interleaved their writes — corrupt entry
+      files that the committed index.json recorded as durable. On this thread
+      the cancel lands at the ``await`` and shutdown code physically cannot run
+      while a flush is executing.
+    * MLX evaluates arrays lazily against a per-thread stream, so serializing a
+      KV cache off the loop thread raises "There is no Stream(gpu, N) in
+      current thread" and the save silently fails. The shutdown save has always
+      run on this thread in production without stream errors.
+
+    The trade: the loop blocks the event loop for as long as new-entry saves
+    take. Entry files are content-keyed, so each prefix pays that cost exactly
+    once — a steady-state flush with nothing new does no serialization at all.
+
+    A raising flush is logged and the loop keeps its schedule: the next prefix
+    is exactly the one worth persisting.
+    """
     while True:
         await asyncio.sleep(_cache_persist_interval_seconds)
 
-        if _cache_flush_running:
-            logger.warning(
-                "[cache_persist] previous flush still running, skipping this tick"
-            )
-            continue
-
-        _cache_flush_running = True
         try:
-            await asyncio.to_thread(_flush_prefix_cache_to_disk)
-        except asyncio.CancelledError:
-            raise
+            _flush_prefix_cache_to_disk()
         except Exception as e:
             # Never let one bad flush kill the loop — the next prefix is
             # exactly the one worth persisting.
@@ -580,8 +589,6 @@ async def _periodic_cache_flush_loop() -> None:
                 f"[cache_persist] periodic flush raised: {e}",
                 exc_info=True,
             )
-        finally:
-            _cache_flush_running = False
 
 
 class _PrefixCacheEndpointAdapter:
@@ -749,8 +756,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: stop the periodic flush before the final save so the two
-    # can't race for the same cache directory.
+    # Shutdown: stop the periodic flush before the final save. The loop body is
+    # synchronous on this same thread, so the cancel either lands on the
+    # `await asyncio.sleep` (nothing in flight) or after the current flush has
+    # already returned — the two can never write the cache directory at once.
+    # (When the flush was offloaded with asyncio.to_thread, cancel() did NOT
+    # stop the worker and the shutdown save raced it.)
     if _cache_flush_task is not None:
         _cache_flush_task.cancel()
         try:

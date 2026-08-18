@@ -10,8 +10,12 @@ two load-bearing properties are (a) it actually fires repeatedly and (b) a
 raising flush never kills it.
 """
 
+import ast
 import asyncio
+import inspect
 import sys
+import textwrap
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -95,6 +99,65 @@ async def test_flush_helper_swallows_engine_errors(monkeypatch):
     monkeypatch.setattr(server, "_get_cache_dir", lambda: "/tmp/does-not-matter")
 
     server._flush_prefix_cache_to_disk()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_flush_runs_on_the_event_loop_thread(monkeypatch):
+    """The flush must NOT be offloaded with asyncio.to_thread. Two reasons,
+    both observed:
+
+    * task.cancel() cannot stop a worker thread, so the lifespan shutdown save
+      ran CONCURRENTLY with an in-flight flush over the same cache directory —
+      interleaved, corrupt entry files that index.json recorded as durable.
+    * MLX evaluates lazily against a per-thread stream, so serializing a KV
+      cache off the loop thread raises "There is no Stream(gpu, N) in current
+      thread" and the save silently fails.
+    """
+    seen = []
+    loop_thread = threading.current_thread()
+    monkeypatch.setattr(server, "_cache_persist_interval_seconds", 0.01)
+    monkeypatch.setattr(
+        server,
+        "_flush_prefix_cache_to_disk",
+        lambda: seen.append(threading.current_thread()),
+    )
+
+    task = asyncio.create_task(server._periodic_cache_flush_loop())
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if seen:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert seen, "the loop never flushed"
+    assert all(t is loop_thread for t in seen), (
+        f"the flush ran off the event-loop thread: "
+        f"{[t.name for t in seen]} != {loop_thread.name}"
+    )
+
+
+def test_the_loop_does_not_offload_the_flush_to_a_worker_thread():
+    """Source-level guard for the same regression, so re-introducing the
+    offload is caught even if the timing test happens to pass. The overlap
+    guard goes with it: with the flush on the loop thread, a tick physically
+    cannot start while the previous one is still running."""
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(server._periodic_cache_flush_loop))
+    )
+    fn = tree.body[0]
+    first = fn.body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        fn.body = fn.body[1:]  # the docstring EXPLAINS the offload; skip it
+    src = ast.unparse(fn)
+    assert "to_thread" not in src, (
+        "the periodic flush must run on the event-loop thread — see "
+        "test_the_periodic_flush_runs_on_the_event_loop_thread"
+    )
+    assert not hasattr(
+        server, "_cache_flush_running"
+    ), "the overlap guard is dead code once the flush is synchronous"
 
 
 # ---------------------------------------------------------------------------

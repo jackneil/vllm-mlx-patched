@@ -320,6 +320,108 @@ def _clear_mlx_buffer_cache() -> None:
         pass
 
 
+def _select_for_persist(
+    snapshot: list[tuple[tuple[int, ...], _CacheEntry]],
+    max_entries: int,
+    max_bytes: int,
+) -> tuple[list[tuple[str, tuple[int, ...], int]], dict[str, _CacheEntry]]:
+    """Pick the durable top-K out of an LRU snapshot (newest -> oldest).
+
+    Walks the snapshot newest-first and keeps an entry when fewer than
+    ``max_entries`` have been picked AND it fits the remaining byte budget. An
+    entry too big for what's left is *skipped*, not a stop signal — smaller
+    older prefixes still get their turn (packing).
+
+    Returns ``(selected, pending)`` where ``selected`` carries only scalars
+    (hash, token key, memory_bytes) and ``pending`` maps hash -> entry. Split
+    that way so the caller can release each entry's MLX arrays as soon as it
+    has been written, while still having everything the index needs. This
+    function is where the rejected entries' references die: they live only in
+    this frame.
+    """
+    selected: list[tuple[str, tuple[int, ...], int]] = []
+    pending: dict[str, _CacheEntry] = {}
+    remaining_bytes = max_bytes
+    for tokens_key, entry in reversed(snapshot):
+        if len(selected) >= max_entries:
+            break
+        if entry.memory_bytes > remaining_bytes:
+            continue
+        h = _tokens_hash(tokens_key)
+        selected.append((h, tokens_key, entry.memory_bytes))
+        pending[h] = entry
+        remaining_bytes -= entry.memory_bytes
+    return selected, pending
+
+
+def _write_entry_files(
+    cache_dir: str,
+    h: str,
+    tokens_key: tuple[int, ...],
+    entry: _CacheEntry,
+    save_prompt_cache: Any,
+) -> None:
+    """Write one entry's two durable files, atomically and collision-free.
+
+    Both files are built under a unique ``tempfile.mkstemp`` name and
+    committed by rename, so (a) a save that dies halfway — killed process,
+    full disk, Metal failure — never leaves a partial file at the final path,
+    and (b) two writers over the same cache directory cannot land in the same
+    temp and produce a file carrying bytes from both.
+
+    The tokens file is renamed ONLY after the safetensors rename succeeds: the
+    pair is loadable only if both exist, and a lone tokens file would make an
+    entry look half-durable to the incremental check.
+
+    Raises whatever the underlying save raises (after the Metal-pressure
+    clear + single retry) so the caller can log and move on to the next entry.
+    """
+    import array as _array
+    import os
+    import tempfile
+
+    entry_path = os.path.join(cache_dir, f"entry_{h}.safetensors")
+    tokens_path = os.path.join(cache_dir, f"entry_{h}_tokens.bin")
+
+    fd, tmp_entry = tempfile.mkstemp(
+        dir=cache_dir, prefix=f".entry_{h}.", suffix=".safetensors"
+    )
+    os.close(fd)
+    tmp_tokens: str | None = None
+    try:
+        metadata = {"num_tokens": str(len(tokens_key))}
+        try:
+            save_prompt_cache(tmp_entry, entry.cache, metadata=metadata)
+        except Exception as first_err:
+            _clear_mlx_buffer_cache()
+            logger.info(
+                f"[cache_persist] entry {h} failed once "
+                f"({first_err}); retrying after mx.clear_cache()"
+            )
+            save_prompt_cache(tmp_entry, entry.cache, metadata=metadata)
+
+        # Tokens go in a separate binary file (100K+ ints is much smaller as
+        # int32 than as JSON).
+        fd, tmp_tokens = tempfile.mkstemp(
+            dir=cache_dir, prefix=f".entry_{h}_tokens.", suffix=".bin"
+        )
+        with os.fdopen(fd, "wb") as f:
+            _array.array("i", tokens_key).tofile(f)  # 32-bit signed ints
+
+        os.rename(tmp_entry, entry_path)
+        tmp_entry = None  # type: ignore[assignment]
+        os.rename(tmp_tokens, tokens_path)
+        tmp_tokens = None
+    finally:
+        for leftover in (tmp_entry, tmp_tokens):
+            if leftover is None:
+                continue
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     """Create shallow copies of KVCache/QuantizedKVCache layers with offset reduced.
 
@@ -544,9 +646,11 @@ class MemoryAwarePrefixCache:
     Thread Safety:
         The entry-table mutators (fetch/store/remove/clear/load_from_disk)
         and flush_to_disk's snapshot take ``self._lock`` (an RLock), which is
-        what makes a periodic flush on a worker thread safe while the engine
-        loop keeps serving. Nothing else is synchronized — treat the rest of
-        the class as single-writer.
+        what makes a periodic flush safe while the engine loop keeps serving.
+        Persistence additionally holds ``self._persist_lock`` across its file
+        I/O so two flushes (or a flush and the shutdown save) can never write
+        the same cache directory at once. Nothing else is synchronized — treat
+        the rest of the class as single-writer.
     """
 
     def __init__(
@@ -569,6 +673,15 @@ class MemoryAwarePrefixCache:
         # locked public methods call each other's helpers (store -> _evict_lru).
         # Held only for in-memory bookkeeping — never across file I/O.
         self._lock = _threading.RLock()
+
+        # Serializes persistence for this cache: flush_to_disk holds it from
+        # selection through the index rename, and save_to_disk inherits it by
+        # delegation. Two writers over one cache directory interleave their
+        # entry bytes and prune each other's files out from under a committed
+        # index — reproduced by a reviewer as 3-of-4 entry files carrying bytes
+        # from both writers. Distinct from _lock: this one IS held across file
+        # I/O, which is exactly why it must never be the entry-table lock.
+        self._persist_lock = _threading.Lock()
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1116,7 +1229,13 @@ class MemoryAwarePrefixCache:
         signal — smaller older prefixes still get their turn (packing).
 
         Anything on disk outside the selected set is pruned, so the directory
-        holds exactly the durable top-K.
+        holds exactly the durable top-K. The one exception: an *empty*
+        in-memory cache is a no-op — a fresh boot or a just-cleared cache must
+        not wipe what the last run made durable.
+
+        Serialized per instance by ``self._persist_lock``, held from selection
+        through the index rename, so a periodic flush and the shutdown save
+        can never write the same directory at once.
 
         Args:
             cache_dir: Directory to persist into (created if absent).
@@ -1125,200 +1244,228 @@ class MemoryAwarePrefixCache:
             max_bytes: Durable byte budget. Defaults to the config's
                 ``persist_max_bytes``.
 
+        Raises:
+            ValueError: If ``max_entries`` < 1 or ``max_bytes`` <= 0. This
+                method PRUNES everything outside the selected set, so a
+                nonsense budget must fail loudly rather than quietly wipe the
+                durable cache.
+
         Returns:
             The number of entries newly written by *this* call (0 when
             everything selected was already durable).
         """
+        return self._flush_to_disk(cache_dir, max_entries, max_bytes)[0]
+
+    def _flush_to_disk(
+        self,
+        cache_dir: str,
+        max_entries: int | None = None,
+        max_bytes: int | None = None,
+    ) -> tuple[int, int]:
+        """Shared persistence implementation. See :meth:`flush_to_disk`.
+
+        Returns ``(newly_saved, durable_count)``. :meth:`save_to_disk` needs
+        the durable count to answer its historical bool from this call's own
+        knowledge, instead of re-reading index.json after the persistence lock
+        has been dropped (where a concurrent flush may be mid-rename).
+        """
         import json
         import os
+        import tempfile
         import time as _time
 
         if max_entries is None:
             max_entries = self._config.persist_max_entries
         if max_bytes is None:
             max_bytes = self._config.persist_max_bytes
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
+        if max_bytes <= 0:
+            raise ValueError(f"max_bytes must be > 0, got {max_bytes}")
 
         t0 = _time.monotonic()
 
-        # Snapshot under the lock so a concurrent store/fetch can't mutate the
-        # OrderedDict mid-iteration. The snapshot's references keep the MLX
-        # arrays alive even if an entry is evicted while we write it out, so
-        # every file save below happens OUTSIDE the lock.
-        with self._lock:
-            snapshot = list(self._entries.items())  # oldest -> newest
+        # Everything below — selection, entry writes, prune, index commit —
+        # runs under one lock. Dropping it between the prune and the index
+        # rename is what lets a second writer publish an index naming files
+        # this one is about to delete.
+        with self._persist_lock:
+            # Snapshot under _lock so a concurrent store/fetch can't mutate the
+            # OrderedDict mid-iteration. _select_for_persist keeps references
+            # ONLY to the entries it picked; the snapshot (and with it every
+            # rejected entry) is dropped before any file I/O starts.
+            with self._lock:
+                snapshot = list(self._entries.items())  # oldest -> newest
+            had_entries = bool(snapshot)
+            selected, pending = _select_for_persist(snapshot, max_entries, max_bytes)
+            del snapshot
 
-        # --- selection: newest -> oldest, packing into the byte budget ---
-        selected: list[tuple[str, tuple[int, ...], _CacheEntry]] = []
-        remaining_bytes = max_bytes
-        for tokens_key, entry in reversed(snapshot):
-            if len(selected) >= max_entries:
-                break
-            if entry.memory_bytes > remaining_bytes:
-                # Too big for what's left — skip it and keep walking so a
-                # smaller, older prefix can still be made durable.
-                continue
-            selected.append((_tokens_hash(tokens_key), tokens_key, entry))
-            remaining_bytes -= entry.memory_bytes
+            if not selected and not had_entries:
+                # Nothing in memory at all: a cache that was just cleared
+                # (DELETE /v1/cache) or a process that has not warmed up yet.
+                # Falling through would prune the durable set and publish an
+                # empty index — destroying the prefixes the LAST run made
+                # durable, which is the whole point of persisting them.
+                logger.debug(
+                    "[cache_persist] cache is empty; leaving %s untouched",
+                    cache_dir,
+                )
+                return 0, 0
 
-        os.makedirs(cache_dir, exist_ok=True)
+            os.makedirs(cache_dir, exist_ok=True)
 
-        def _paths(h: str) -> tuple[str, str]:
-            return (
-                os.path.join(cache_dir, f"entry_{h}.safetensors"),
-                os.path.join(cache_dir, f"entry_{h}_tokens.bin"),
-            )
+            def _paths(h: str) -> tuple[str, str]:
+                return (
+                    os.path.join(cache_dir, f"entry_{h}.safetensors"),
+                    os.path.join(cache_dir, f"entry_{h}_tokens.bin"),
+                )
 
-        # --- incremental: only entries not already durable need saving ---
-        need_save = [
-            item
-            for item in selected
-            if not all(os.path.exists(p) for p in _paths(item[0]))
-        ]
+            # --- incremental: only entries not already durable need saving ---
+            need_save = [
+                item
+                for item in selected
+                if not all(os.path.exists(p) for p in _paths(item[0]))
+            ]
+            need_save_hashes = {item[0] for item in need_save}
+            # Entries already on disk are not written again, so stop pinning
+            # their MLX arrays against eviction right now.
+            for h in list(pending):
+                if h not in need_save_hashes:
+                    del pending[h]
 
-        saved_hashes: set[str] = set()
-        if need_save:
-            try:
-                from mlx_lm.models.cache import save_prompt_cache
-            except ImportError:
-                logger.warning("[cache_persist] mlx_lm not available, cannot save")
-                return 0
-
-            _clear_mlx_buffer_cache()
-
-            for h, tokens_key, entry in need_save:
-                entry_path, tokens_path = _paths(h)
-
-                def _save_once(_p=entry_path, _e=entry, _k=tokens_key) -> None:
-                    save_prompt_cache(
-                        _p,
-                        _e.cache,
-                        metadata={"num_tokens": str(len(_k))},
-                    )
-
+            saved_hashes: set[str] = set()
+            if need_save:
                 try:
+                    from mlx_lm.models.cache import save_prompt_cache
+                except ImportError:
+                    logger.warning("[cache_persist] mlx_lm not available, cannot save")
+                    return 0, 0
+
+                _clear_mlx_buffer_cache()
+
+                for h, tokens_key, memory_bytes in need_save:
+                    entry = pending.pop(h)
+                    entry_path, _tokens_path = _paths(h)
                     try:
-                        _save_once()
-                    except Exception as first_err:
-                        _clear_mlx_buffer_cache()
-                        logger.info(
-                            f"[cache_persist] entry {h} failed once "
-                            f"({first_err}); retrying after mx.clear_cache()"
+                        _write_entry_files(
+                            cache_dir, h, tokens_key, entry, save_prompt_cache
                         )
-                        _save_once()
+                        saved_hashes.add(h)
+                        logger.info(
+                            f"[cache_persist] saved entry {h}: "
+                            f"{len(tokens_key)} tokens, "
+                            f"{memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
+                            f"file={entry_path}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[cache_persist] failed to save entry {h}: {e}")
+                    finally:
+                        # Release THIS entry the moment it is written rather
+                        # than holding the whole selection alive for the whole
+                        # save: a multi-GB flush would otherwise pin every
+                        # selected prefix against eviction for minutes.
+                        del entry
 
-                    # Tokens go in a separate binary file (100K+ ints is much
-                    # smaller as int32 than as JSON).
-                    import array as _array
+            # Durable set = everything selected that is actually on disk now.
+            durable = [
+                item
+                for item in selected
+                if item[0] in saved_hashes or item[0] not in need_save_hashes
+            ]
+            durable_hashes = {item[0] for item in durable}
 
-                    arr = _array.array("i", tokens_key)  # 32-bit signed ints
-                    with open(tokens_path, "wb") as f:
-                        arr.tofile(f)
-
-                    saved_hashes.add(h)
-                    logger.info(
-                        f"[cache_persist] saved entry {h}: "
-                        f"{len(tokens_key)} tokens, "
-                        f"{entry.memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
-                        f"file={entry_path}"
-                    )
-                except Exception as e:
-                    logger.warning(f"[cache_persist] failed to save entry {h}: {e}")
-
-        # Durable set = everything selected that is actually on disk now.
-        need_save_hashes = {item[0] for item in need_save}
-        durable = [
-            item
-            for item in selected
-            if item[0] in saved_hashes or item[0] not in need_save_hashes
-        ]
-        durable_hashes = {item[0] for item in durable}
-
-        # --- prune: disk holds exactly the durable top-K (this also sweeps
-        # away positional v3 leftovers, whose "hash" never matches) ---
-        pruned = 0
-        try:
-            for name in os.listdir(cache_dir):
-                if not name.startswith("entry_"):
-                    continue
-                if name.endswith(".safetensors"):
-                    h = name[len("entry_") : -len(".safetensors")]
-                elif name.endswith("_tokens.bin"):
-                    h = name[len("entry_") : -len("_tokens.bin")]
-                else:
-                    continue
-                if h in durable_hashes:
-                    continue
-                try:
-                    os.remove(os.path.join(cache_dir, name))
-                    pruned += 1
-                except OSError as e:
-                    logger.warning(f"[cache_persist] failed to prune {name}: {e}")
-        except OSError as e:
-            logger.warning(f"[cache_persist] prune scan failed: {e}")
-
-        # --- index, written oldest -> newest so load_from_disk rebuilds the
-        # OrderedDict with recency intact (MRU last) ---
-        index = {
-            "version": _CACHE_PERSIST_VERSION,
-            "model_fingerprint": self._model_fingerprint,
-            "num_entries": len(durable),
-            "total_memory_bytes": sum(e.memory_bytes for _, _, e in durable),
-            "entries": [
-                {
-                    "hash": h,
-                    "num_tokens": len(tokens_key),
-                    "memory_bytes": entry.memory_bytes,
-                }
-                for h, tokens_key, entry in reversed(durable)
-            ],
-        }
-
-        # Atomic: a crash (or a full disk) mid-write must never leave a
-        # half-written index.json that poisons the next boot.
-        index_path = os.path.join(cache_dir, "index.json")
-        tmp_path = index_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(index, f, indent=2)
-        try:
-            os.rename(tmp_path, index_path)
-        except OSError:
+            # --- prune: disk holds exactly the durable top-K (this also sweeps
+            # away positional v3 leftovers, whose "hash" never matches) ---
+            pruned = 0
             try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
+                for name in os.listdir(cache_dir):
+                    if not name.startswith("entry_"):
+                        continue
+                    if name.endswith(".safetensors"):
+                        h = name[len("entry_") : -len(".safetensors")]
+                    elif name.endswith("_tokens.bin"):
+                        h = name[len("entry_") : -len("_tokens.bin")]
+                    else:
+                        continue
+                    if h in durable_hashes:
+                        continue
+                    try:
+                        os.remove(os.path.join(cache_dir, name))
+                        pruned += 1
+                    except OSError as e:
+                        logger.warning(f"[cache_persist] failed to prune {name}: {e}")
+            except OSError as e:
+                logger.warning(f"[cache_persist] prune scan failed: {e}")
 
-        dt = _time.monotonic() - t0
-        logger.info(
-            f"[cache_persist] FLUSHED {len(saved_hashes)} new "
-            f"({len(durable)} durable, {pruned} files pruned) "
-            f"to {cache_dir} in {dt:.1f}s "
-            f"({index['total_memory_bytes'] / _BYTES_PER_MB:.0f}MB on disk)"
-        )
-        return len(saved_hashes)
+            # --- index, written oldest -> newest so load_from_disk rebuilds
+            # the OrderedDict with recency intact (MRU last) ---
+            index = {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": self._model_fingerprint,
+                "num_entries": len(durable),
+                "total_memory_bytes": sum(mem for _, _, mem in durable),
+                "entries": [
+                    {
+                        "hash": h,
+                        "num_tokens": len(tokens_key),
+                        "memory_bytes": memory_bytes,
+                    }
+                    for h, tokens_key, memory_bytes in reversed(durable)
+                ],
+            }
+
+            # Atomic: a crash (or a full disk) mid-write must never leave a
+            # half-written index.json that poisons the next boot. The temp name
+            # is unique (mkstemp), never a fixed index.json.tmp that a second
+            # writer would append its own bytes into.
+            index_path = os.path.join(cache_dir, "index.json")
+            fd, tmp_path = tempfile.mkstemp(
+                dir=cache_dir, prefix=".index.", suffix=".json"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(index, f, indent=2)
+                    # The index is the SINGLE point of total loss: a panic that
+                    # commits the rename ahead of the data blocks leaves a
+                    # truncated index, and the next boot then discards every
+                    # persisted prefix. Entry files are deliberately NOT
+                    # fsynced — losing one to power loss is self-healing, the
+                    # next flush simply re-saves it.
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.rename(tmp_path, index_path)
+            except BaseException:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            dt = _time.monotonic() - t0
+            logger.info(
+                f"[cache_persist] FLUSHED {len(saved_hashes)} new "
+                f"({len(durable)} durable, {pruned} files pruned) "
+                f"to {cache_dir} in {dt:.1f}s "
+                f"({index['total_memory_bytes'] / _BYTES_PER_MB:.0f}MB on disk)"
+            )
+            return len(saved_hashes), len(durable)
 
     def save_to_disk(self, cache_dir: str) -> bool:
         """Persist the cache at shutdown. Thin delegate to flush_to_disk().
 
-        Keeps the historical contract: True iff at least one entry is present
+        Keeps the historical contract: True iff at least one entry is durable
         on disk for this cache after the call, False when there was nothing to
-        save.
+        save (or when mlx_lm is missing and nothing could be written). The
+        answer comes from the flush itself — re-reading index.json here would
+        read it outside the persistence lock, and would report a *previous*
+        run's index as this call's success.
         """
-        import json
-        import os
-
         if not self._entries:
             logger.info("[cache_persist] nothing to save (0 entries)")
             return False
 
-        self.flush_to_disk(cache_dir)
-
-        try:
-            with open(os.path.join(cache_dir, "index.json")) as f:
-                return len(json.load(f).get("entries", [])) > 0
-        except Exception as e:
-            logger.warning(f"[cache_persist] could not confirm saved index: {e}")
-            return False
+        _newly_saved, durable_count = self._flush_to_disk(cache_dir)
+        return durable_count > 0
 
     def load_from_disk(self, cache_dir: str) -> int:
         """Load cache entries from disk.
@@ -1394,25 +1541,36 @@ class MemoryAwarePrefixCache:
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)
 
-                # Check if it fits
-                if self._current_memory + memory > self._max_memory:
-                    logger.info(
-                        f"[cache_persist] entry {h} would exceed memory limit "
-                        f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
-                        f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
-                    )
-                    break
-
                 tokens_key = tuple(tokens)
                 entry = _CacheEntry(
                     tokens=tokens_key,
                     cache=cache,
                     memory_bytes=memory,
                 )
+                # The fit check reads the memory counters under the lock and
+                # admits the entry in the same critical section: a concurrent
+                # store() moves both, and an unlocked read can admit an entry
+                # that pushes the cache past its limit.
                 with self._lock:
-                    self._entries[tokens_key] = entry
-                    self._current_memory += memory
-                    bisect.insort(self._sorted_keys, tokens_key)
+                    used = self._current_memory
+                    fits = used + memory <= self._max_memory
+                    if fits:
+                        self._entries[tokens_key] = entry
+                        self._current_memory += memory
+                        bisect.insort(self._sorted_keys, tokens_key)
+
+                if not fits:
+                    logger.info(
+                        f"[cache_persist] entry {h} would exceed memory limit "
+                        f"({(used + memory) / _BYTES_PER_MB:.0f}MB > "
+                        f"{self._max_memory / _BYTES_PER_MB:.0f}MB), skipping it"
+                    )
+                    # Skip, don't stop. The index is ordered oldest -> newest,
+                    # so breaking here would throw away the HOTTEST prefixes
+                    # because one older entry happened to be huge. Same packing
+                    # rule the flush selection uses.
+                    continue
+
                 loaded += 1
 
                 logger.info(
@@ -1422,14 +1580,31 @@ class MemoryAwarePrefixCache:
                 )
 
             except Exception as e:
-                logger.warning(f"[cache_persist] failed to load entry {h}: {e}")
+                # A durable entry we cannot read is dead weight: it stays in
+                # the index forever, is never loadable, and the flush's
+                # existence check treats it as already-saved so it is never
+                # rewritten. Delete both files and let the next flush re-save
+                # the prefix from memory.
+                logger.warning(
+                    f"[cache_persist] failed to load entry {h}: {e}; deleting "
+                    f"its files so the next flush re-saves it"
+                )
+                for path in (entry_path, tokens_path):
+                    try:
+                        os.remove(path)
+                    except OSError as rm_err:
+                        logger.warning(
+                            f"[cache_persist] could not delete {path}: {rm_err}"
+                        )
 
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+        with self._lock:
+            total_memory = self._current_memory
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = total_memory
 
         dt = _time.monotonic() - t0
         logger.info(
             f"[cache_persist] LOADED {loaded} entries from {cache_dir} "
-            f"in {dt:.1f}s ({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
+            f"in {dt:.1f}s ({total_memory / _BYTES_PER_MB:.0f}MB total)"
         )
         return loaded

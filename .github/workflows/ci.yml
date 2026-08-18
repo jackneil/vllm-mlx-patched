@@ -135,6 +135,7 @@ jobs:
             tests/test_mlx_lm_api_contract.py \
             tests/test_prefill_cache_hooks.py \
             tests/test_mtp_decode.py \
+            tests/test_deepseek_v4_refusal.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"

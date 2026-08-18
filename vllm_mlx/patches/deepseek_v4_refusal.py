@@ -47,6 +47,7 @@ Implementation notes:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 from typing import Any
@@ -111,7 +112,12 @@ def get_lambda() -> float:
 
 
 def set_lambda(value: float) -> float:
-    """Set the dial. Takes effect on the next forward pass, no reload."""
+    """Set the dial. Takes effect on the next attention-module call, no reload.
+
+    Not "the next request" and not "the next forward pass": the hook reads
+    lambda once per module per token, so a change lands mid-generation and
+    even mid-forward. See ``_install_hook`` for the measurement.
+    """
     return apply_lambda(value)[1]["lambda"]
 
 
@@ -149,19 +155,39 @@ def apply_projection(out: mx.array, direction: mx.array, lam: float) -> mx.array
     normalizes on load). This is the only place the math lives: the served
     hook calls straight into it.
 
-    The projection coefficient stays a ``sum(out * r)`` reduction rather than
-    the cheaper ``out @ r`` matvec: measured on [2, 37, 4096], the matvec is
-    NOT bit-identical to the reduction (max abs delta 3.3e-7 in float32,
-    1.6e-2 in bfloat16), and "lambda=0 is bit-exact stock" is the guarantee
-    this feature is sold on. The one-cast-per-forward cost is removed instead,
-    by handing this function an already-cast direction (see ``_direction_for``);
-    the ``astype`` below is then a same-dtype no-op and is kept so that direct
-    callers (tests, tools) still get a correct answer.
+    Exactness: **the bit-exactness guarantee is scoped to lambda=0**, and it is
+    delivered by the short-circuit below (measured at 0.005-0.009 ms to skip
+    all 61 layers), not by the form of the arithmetic. At lambda != 0 there is
+    no bit-exactness contract to keep — the model is being edited on purpose —
+    so the coefficient is computed as an ``out @ r`` matvec rather than a
+    ``sum(out * r)`` reduction. Measured, 61-layer chain, bf16, one ``mx.eval``:
+
+        B=1  T=   1   reduction  18.0ms   matvec  17.0ms   (1.06x)
+        B=32 T=   1   reduction  25.1ms   matvec  19.1ms   (1.32x)
+        B=1  T=2048   reduction 116.6ms   matvec  51.3ms   (2.27x)
+        B=1  T=8192   reduction 346.1ms   matvec  76.1ms   (4.55x)
+        peak memory, one layer at T=16384:  402.7MB -> 268.5MB
+
+    The speedup magnitude varies with concurrent GPU load — a re-run on a
+    busy box measured 1.1x-1.6x on the same shapes. The direction and the
+    peak-memory reduction are stable, and the memory half is pinned by a
+    test (100.7MB -> 67.1MB on the test's shapes).
+
+    and against an fp32 reference computed from the SAME rounded inputs the two
+    forms are equidistant at the dtypes actually served (bf16 1.561e-02 both,
+    fp16 1.876e-03 both; fp32 0.0 vs 2.384e-07, i.e. 1 ulp) — the bf16 "delta"
+    between them is rounding noise both forms carry, not accuracy one of them
+    has and the other lacks.
+
+    The one-cast-per-forward cost is removed by handing this function an
+    already-cast direction (see ``_direction_for``); the ``astype`` below is
+    then a same-dtype no-op and is kept so that direct callers (tests, tools)
+    still get a correct answer.
     """
     if lam == 0.0:
         return out
     r = direction.astype(out.dtype)
-    return out - lam * mx.sum(out * r, axis=-1, keepdims=True) * r
+    return out - lam * mx.expand_dims(out @ r, -1) * r
 
 
 def _unwrap_model(model: Any) -> Any:
@@ -213,6 +239,15 @@ def _find_compiled(model: Any) -> Any | None:
     while ``status()`` cheerfully reported ``{'lambda': 1.5,
     'installed': True}``. ``--compile`` and ``--refusal-dirs`` are independent
     serve flags, so that pairing is one checkbox away.
+
+    The refusal is deliberately kept even though ``--compile`` cannot bite
+    today: ``apply_compile`` assigns ``model.__call__`` as an *instance*
+    attribute and Python resolves ``model(x)`` against ``type(model).__call__``,
+    so with every serving call site using the implicit form the compiled trace
+    never runs (the demonstration lives in
+    ``test_apply_compile_is_bypassed_by_implicit_calls``). The day compile.py
+    is fixed to patch the class, this guard is what stops a frozen dial from
+    shipping with it — so this is future-proofing, not dead code.
     """
     try:
         from ..compile import is_compiled
@@ -323,8 +358,14 @@ def load_refusal_directions(model: Any, path: str | Path, attn_cls: Any = None) 
                 "trace-time constant — the dial would be FROZEN at %.3f "
                 "forever while /admin/refusal_lambda kept reporting the value "
                 "you set. --compile and --refusal-dirs are mutually "
-                "exclusive: restart with one or the other. Serving stock "
-                "model.",
+                "exclusive: restart with one or the other. Dropping --compile "
+                "costs you nothing today, because --compile is currently "
+                "INERT on the serving path anyway: apply_compile assigns the "
+                "compiled function to model.__call__ as an INSTANCE "
+                "attribute, while Python resolves model(x) against "
+                "type(model).__call__, and every serving call site is the "
+                "implicit model(...) form — so the compiled trace is never "
+                "the thing that runs. Serving stock model.",
                 get_lambda(),
             )
             return 0
@@ -369,11 +410,27 @@ def load_refusal_directions(model: Any, path: str | Path, attn_cls: Any = None) 
                 missing.append(key)
                 continue
             norm = mx.linalg.norm(vec).item()
-            if norm == 0:
+            # `norm == 0` is not the only unusable norm. A finite-but-huge
+            # vector — a truncated or corrupt sidecar whose bytes reinterpret
+            # as ~1e38 floats — passes _is_usable_direction's isfinite check
+            # and then OVERFLOWS here: norm is inf, `vec / inf` is all zeros,
+            # and an all-zero direction projects nothing at every lambda.
+            # Measured on [3e38]*4 float32: isfinite(vec).all() True,
+            # norm inf, norm == 0 False, normalized [0, 0, 0, 0], projection
+            # at lambda=1.5 unchanged. Without this branch the module is
+            # counted in `hooked`, logged as installed and reported by
+            # status(), while the dial does nothing for that layer forever —
+            # the exact "reports success while doing nothing" hole the rest of
+            # this loader exists to close. Reject unless the norm is finite
+            # AND strictly positive, and count it as an orphan like every
+            # other reject.
+            if not math.isfinite(norm) or norm <= 0.0:
                 logger.warning(
-                    "[refusal] %s has zero norm — no direction to project on, "
-                    "skipping",
+                    "[refusal] %s has %s norm (%r) — no usable direction to "
+                    "project on, skipping",
                     sidecar_key,
+                    "zero" if norm == 0.0 else "non-finite",
+                    norm,
                 )
                 missing.append(key)
                 continue
@@ -456,6 +513,12 @@ def _is_usable_direction(key: str, vec: mx.array, hidden: int | None) -> bool:
     all-NaN "direction" that serves perfectly at lambda=0 and turns the whole
     residual stream into NaN the moment somebody dials it up, arbitrarily far
     in time from the install that caused it.
+
+    Finite COMPONENTS are not enough on their own: a vector of ~1e38 floats
+    passes this check and then overflows to an infinite norm in the caller,
+    which normalizes to an all-zero direction. That case is rejected by the
+    norm guard in ``load_refusal_directions``, which is the reason that guard
+    tests ``math.isfinite(norm)`` and not just ``norm == 0``.
     """
     if vec.ndim != 1:
         logger.warning(
@@ -585,13 +648,24 @@ def _install_hook(attn_cls: Any) -> None:
 
     def _call_with_refusal(self, *args, **kwargs):
         out = original(self, *args, **kwargs)
-        # Deliberately UNLOCKED, unlike get_lambda(): this runs once per layer
-        # per token, and a single dict read is atomic under the GIL, so the
-        # worst case is that one forward pass in flight during a dial change
-        # sees the old value — which is exactly the semantics the admin route
-        # advertises ("effective on the next request"). Do not add a lock here;
-        # do not remove the lock from get_lambda()/apply_lambda(), which need it
-        # to give callers a coherent multi-field snapshot.
+        # Deliberately UNLOCKED, unlike get_lambda(): this runs once per
+        # attention module per token, and a single dict read is atomic under
+        # the GIL. Be precise about what that costs. The read is per MODULE,
+        # not per forward pass, so a dial change that lands mid-pass produces
+        # a HYBRID forward: the modules already run used the old lambda, the
+        # rest use the new one, and the pass as a whole corresponds to no
+        # configured lambda. Measured on a 61-layer chain flipped at layer 30:
+        #
+        #     layer 0..3         -> [1.0, 1.0, 1.0, 1.0]     (lambda = 0)
+        #     layer 29,30,31,60  -> [1.0, -0.5, 0.25, -0.0]  (lambda = 1.5)
+        #
+        # i.e. one forward pass mixed lambda=0 and lambda=1.5 across layers.
+        # A per-forward snapshot would need a model-level hook, which is a
+        # design change, not a comment fix — until then this IS the semantics,
+        # and POST /admin/refusal_lambda documents it as landing mid-request.
+        # Do not add a lock here; do not remove the lock from
+        # get_lambda()/apply_lambda(), which need it to give callers a
+        # coherent multi-field snapshot.
         lam = _state["lambda"]
         if lam == 0.0:
             # Bit-exact stock: no arithmetic, no dict lookup.

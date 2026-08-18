@@ -678,3 +678,113 @@ def test_load_rejects_fingerprint_mismatch(tmp_path):
     )
     cache = MemoryAwarePrefixCache(model, MemoryCacheConfig(max_memory_mb=8))
     assert cache.load_from_disk(str(d)) == 0
+
+
+# ---------------------------------------------------------------------------
+# save_to_disk Metal-pressure retry (2026-08-17). At shutdown the dying
+# engine's state plus MLX's buffer cache can sit near the Metal resource
+# limit, and save_prompt_cache's .state materialization then fails with
+# "[metal::malloc] Resource limit exceeded" — observed live: 86/88 entries
+# (59 GB of warm prefixes) lost on one restart. save_to_disk must return the
+# buffer cache's blocks and retry once before giving up on an entry.
+# ---------------------------------------------------------------------------
+
+
+def _persist_cache_with_entries(n):
+    from vllm_mlx.memory_cache import (
+        MemoryAwarePrefixCache,
+        MemoryCacheConfig,
+        _CacheEntry,
+    )
+
+    model = MagicMock()
+    model.config = MagicMock(
+        num_hidden_layers=2,
+        hidden_size=64,
+        vocab_size=1000,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=128,
+        model_type="qwen3",
+    )
+    cache = MemoryAwarePrefixCache(
+        model, MemoryCacheConfig(max_memory_mb=64, max_entries=8)
+    )
+    for i in range(n):
+        key = tuple(range(10 * i, 10 * i + 5))
+        cache._entries[key] = _CacheEntry(
+            tokens=key, cache=[MagicMock()], memory_bytes=1024
+        )
+    return cache
+
+
+def test_save_to_disk_retries_a_failed_entry_after_clearing_the_buffer_cache(
+    tmp_path, monkeypatch
+):
+    """An entry whose first save dies on Metal pressure must be retried after
+    mx.clear_cache() — and the retry must come AFTER a clear, not blind."""
+    import mlx.core as mx  # noqa: F401 — asserts the patch target exists
+
+    events = []
+    attempts = {"n": 0}
+
+    def fake_save(path, cache_obj, metadata=None):
+        attempts["n"] += 1
+        if attempts["n"] % 2 == 1:  # first attempt per entry fails
+            events.append("save-fail")
+            raise RuntimeError("[metal::malloc] Resource limit (499000) exceeded.")
+        events.append("save-ok")
+        with open(path, "wb") as f:
+            f.write(b"x")
+
+    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", fake_save)
+    monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear"))
+
+    cache = _persist_cache_with_entries(2)
+    assert cache.save_to_disk(str(tmp_path)) is True
+
+    saved = [e for e in events if e == "save-ok"]
+    assert len(saved) == 2, (
+        f"both entries must survive a first-attempt Metal failure via the "
+        f"retry; events={events}"
+    )
+    # Every failure is followed by a clear and then the retry.
+    for i, e in enumerate(events):
+        if e == "save-fail":
+            assert events[i + 1 : i + 3] == [
+                "clear",
+                "save-ok",
+            ], f"retry must run after mx.clear_cache(), got {events}"
+    # And one proactive clear happens before any save attempt at all.
+    assert events[0] == "clear", f"expected an up-front clear, got {events}"
+
+
+def test_save_to_disk_gives_up_on_an_entry_after_exactly_one_retry(
+    tmp_path, monkeypatch
+):
+    """A persistently-failing entry is skipped after two attempts — the retry
+    must not loop, and the other entries must still be saved."""
+    calls = {"n": 0}
+
+    def always_fail_first_key(path, cache_obj, metadata=None):
+        calls["n"] += 1
+        if "entry_0" in path:
+            raise RuntimeError("[metal::malloc] Resource limit (499000) exceeded.")
+        with open(path, "wb") as f:
+            f.write(b"x")
+
+    monkeypatch.setattr("mlx_lm.models.cache.save_prompt_cache", always_fail_first_key)
+    monkeypatch.setattr("mlx.core.clear_cache", lambda: None)
+
+    cache = _persist_cache_with_entries(2)
+    assert cache.save_to_disk(str(tmp_path)) is True  # entry 1 still saved
+
+    # entry_0: initial + one retry = 2 attempts; entry_1: 1 attempt.
+    assert (
+        calls["n"] == 3
+    ), f"expected exactly one retry for the bad entry, got {calls['n']}"
+    import json as _json
+
+    index = _json.loads((tmp_path / "index.json").read_text())
+    assert index["num_entries"] == 2
+    assert [e["index"] for e in index["entries"]] == [1]

@@ -39,6 +39,9 @@ Implementation notes:
     constraint, so we get exactness and zero cost.)
   * ``apply_projection`` is the single implementation of the math. The hook
     calls it, so a test of ``apply_projection`` is a test of what is served.
+  * The dial is **incompatible with ``--compile``** and refuses to install
+    when the model forward pass is already wrapped by ``mx.compile``. See
+    ``_find_compiled`` for the measurement that motivates the refusal.
 """
 
 from __future__ import annotations
@@ -62,12 +65,44 @@ _state: dict[str, Any] = {"lambda": 0.0, "installed": False, "modules": 0}
 # id(attention_module) -> unit direction (mx.array, shape [hidden_size])
 _directions: dict[int, mx.array] = {}
 
+# (id(attention_module), out.dtype) -> the direction pre-cast to that dtype.
+# The activation dtype is fixed for the life of a served model, so this cast
+# happens once per module instead of once per forward pass. Bit-identical to
+# casting inline: it is the same astype on the same source array. Cleared in
+# lockstep with _directions (see _clear_directions) so a re-install can never
+# serve a stale cast.
+_cast_cache: dict[tuple[int, Any], mx.array] = {}
+
 # Strong references to every hooked module, so the ids used as keys in
 # _directions can never be recycled while this process lives.
 _hooked_modules: list[Any] = []
 
 _PATCH_FLAG = "_vllm_mlx_refusal_patched"
 _ORIGINAL_CALL = "_vllm_mlx_refusal_original_call"
+
+# The documented sidecar filename. Preferred by name when a directory or an HF
+# snapshot holds more than one .safetensors file, because the DeepSeek-V4
+# checkpoint itself carries tensors under the SAME key namespace the sidecar
+# uses (layers.N.attn.wo_b): pointing --refusal-dirs at a model snapshot would
+# otherwise load real attention biases as "directions" and corrupt the model at
+# any lambda != 0, with a cheerful "installed on N modules" in the log.
+_SIDECAR_BASENAME = "refusal_dirs.safetensors"
+
+# One float32 unit vector per attention module: 61 backbone layers + 3 MTP
+# blocks at hidden 4096 is ~757 KB for the published sidecar. Anything past
+# this is not a direction sidecar; warn rather than reject, because a future
+# architecture could legitimately be larger.
+_IMPLAUSIBLE_SIDECAR_BYTES = 64 * 1024 * 1024
+
+
+def _clear_directions() -> None:
+    """Drop the direction map, its cast cache, and the module strong refs.
+
+    Single entry point so the three structures can never drift apart.
+    """
+    _directions.clear()
+    _cast_cache.clear()
+    _hooked_modules.clear()
 
 
 def get_lambda() -> float:
@@ -77,9 +112,25 @@ def get_lambda() -> float:
 
 def set_lambda(value: float) -> float:
     """Set the dial. Takes effect on the next forward pass, no reload."""
+    return apply_lambda(value)[1]["lambda"]
+
+
+def apply_lambda(value: float) -> tuple[float, dict]:
+    """Set the dial and read the resulting state back under ONE lock hold.
+
+    Returns ``(previous_lambda, status)``. Callers that report what they set
+    must use this rather than ``set_lambda`` + ``status``: with two concurrent
+    writers, three separate lock acquisitions let a caller be told its own
+    input while a different value is live.
+    """
     with _lock:
+        previous = float(_state["lambda"])
         _state["lambda"] = float(value)
-        return float(_state["lambda"])
+        return previous, {
+            "lambda": float(_state["lambda"]),
+            "installed": bool(_state["installed"]),
+            "modules": int(_state["modules"]),
+        }
 
 
 def status() -> dict:
@@ -97,6 +148,15 @@ def apply_projection(out: mx.array, direction: mx.array, lam: float) -> mx.array
     ``direction`` must already be a unit vector (``load_refusal_directions``
     normalizes on load). This is the only place the math lives: the served
     hook calls straight into it.
+
+    The projection coefficient stays a ``sum(out * r)`` reduction rather than
+    the cheaper ``out @ r`` matvec: measured on [2, 37, 4096], the matvec is
+    NOT bit-identical to the reduction (max abs delta 3.3e-7 in float32,
+    1.6e-2 in bfloat16), and "lambda=0 is bit-exact stock" is the guarantee
+    this feature is sold on. The one-cast-per-forward cost is removed instead,
+    by handing this function an already-cast direction (see ``_direction_for``);
+    the ``astype`` below is then a same-dtype no-op and is kept so that direct
+    callers (tests, tools) still get a correct answer.
     """
     if lam == 0.0:
         return out
@@ -130,6 +190,67 @@ def _unwrap_model(model: Any) -> Any:
     return best if found else model
 
 
+def _find_compiled(model: Any) -> Any | None:
+    """Return the first object in the ``.model`` chain wrapped by ``mx.compile``.
+
+    ``vllm_mlx.compile.apply_compile`` replaces an object's ``__call__`` with
+    ``mx.compile(..., shapeless=True)`` and stamps ``_vllm_mlx_compiled`` on it.
+    It is applied at different depths depending on the engine — BatchedEngine
+    compiles ``engine._model`` itself, SimpleEngine compiles
+    ``engine._model.model`` — and ``_install_refusal_directions`` always hands
+    us ``engine._model``, so the whole chain has to be checked.
+
+    Why this matters: ``mx.compile`` traces the wrapped function once and
+    reuses the trace. The hook's ``lam = _state["lambda"]`` is a plain Python
+    read, so it is baked in as a trace-time CONSTANT and never re-read.
+    Measured on a synthetic 1-layer model, ``r = [.5,.5,.5,.5]``, out = ones:
+
+        EAGER    lam=0    -> [ 1.0,  1.0,  1.0,  1.0]
+        EAGER    lam=1.5  -> [-0.5, -0.5, -0.5, -0.5]   dial works
+        COMPILED trace@0  -> [ 1.0,  1.0,  1.0,  1.0]
+        COMPILED lam=1.5  -> [ 1.0,  1.0,  1.0,  1.0]   dial FROZEN
+
+    while ``status()`` cheerfully reported ``{'lambda': 1.5,
+    'installed': True}``. ``--compile`` and ``--refusal-dirs`` are independent
+    serve flags, so that pairing is one checkbox away.
+    """
+    try:
+        from ..compile import is_compiled
+    except Exception:  # pragma: no cover - compile module is always importable
+        logger.exception("[refusal] could not import the compile probe")
+        return None
+
+    current = model
+    for _ in range(5):
+        if is_compiled(current):
+            return current
+        nxt = getattr(current, "model", None)
+        if nxt is None or nxt is current:
+            return None
+        current = nxt
+    return None
+
+
+def _hidden_size(model: Any) -> int | None:
+    """Best-effort hidden size from the model's config, or None if unreachable.
+
+    Used only to reject a sidecar whose vectors are the wrong width; every
+    failure mode degrades to "skip the check", never to a false rejection.
+    """
+    current = model
+    for _ in range(5):
+        for holder in ("args", "config"):
+            cfg = getattr(current, holder, None)
+            size = getattr(cfg, "hidden_size", None) if cfg is not None else None
+            if isinstance(size, int) and size > 0:
+                return size
+        nxt = getattr(current, "model", None)
+        if nxt is None or nxt is current:
+            return None
+        current = nxt
+    return None
+
+
 def _iter_attention_modules(model: Any):
     """Yield (sidecar_key_prefix, attention_module) for every hookable module.
 
@@ -144,6 +265,15 @@ def _iter_attention_modules(model: Any):
         if attn is not None:
             yield f"layers.{i}", attn
 
+    # The mtp branch is dead on today's mlx_lm and kept deliberately.
+    # mlx-lm-v4's DeepseekV4 sanitize() drops every `mtp.` weight at load
+    # ("1) Drop MTP + any layers beyond n_layers" -> `if k.startswith("mtp."):
+    # continue`, mlx_lm/models/deepseek_v4.py), and its docstring lists
+    # `mtp.0.* (dropped)`. So the checkpoint's MTP blocks do not exist as
+    # modules at inference and the sidecar's mtp.0/1/2.attn.wo_b directions are
+    # STRUCTURALLY unmatchable here — that is the expected orphan count in the
+    # install log, not a mapping bug. Kept so a future mlx_lm that does keep
+    # MTP blocks gets them hooked without a code change.
     mtp = getattr(inner, "mtp", None)
     if mtp is None:
         mtp = getattr(model, "mtp", None)
@@ -173,69 +303,220 @@ def load_refusal_directions(model: Any, path: str | Path, attn_cls: Any = None) 
     """
     # Always start from a clean slate: a re-install replaces the previous
     # mapping rather than accumulating stale entries from an unloaded model.
-    _directions.clear()
-    _hooked_modules.clear()
+    _clear_directions()
     with _lock:
         _state["installed"] = False
         _state["modules"] = 0
 
     try:
-        f = _resolve_path(path)
-        if f is None:
-            logger.warning("[refusal] no refusal_dirs.safetensors found at %s", path)
+        # A dial that cannot move must never report itself installed: under
+        # mx.compile the lambda read is frozen into the trace, so the hook
+        # would serve one fixed value while status() and the admin route
+        # reported another. Refuse, so status() stays false and POST
+        # /admin/refusal_lambda 409s instead of 200-ing a no-op.
+        compiled = _find_compiled(model)
+        if compiled is not None:
+            logger.error(
+                "[refusal] refusing to install: this model's forward pass is "
+                "already wrapped by mx.compile (--compile), and "
+                "mx.compile(shapeless=True) captures the lambda read as a "
+                "trace-time constant — the dial would be FROZEN at %.3f "
+                "forever while /admin/refusal_lambda kept reporting the value "
+                "you set. --compile and --refusal-dirs are mutually "
+                "exclusive: restart with one or the other. Serving stock "
+                "model.",
+                get_lambda(),
+            )
             return 0
 
+        f = _resolve_path(path)
+        if f is None:
+            logger.warning("[refusal] no %s found at %s", _SIDECAR_BASENAME, path)
+            return 0
+
+        resolved = f.resolve()
+        size = resolved.stat().st_size
+        logger.info(
+            "[refusal] loading directions from %s (%.1f KB)", resolved, size / 1024
+        )
+        if size > _IMPLAUSIBLE_SIDECAR_BYTES:
+            logger.warning(
+                "[refusal] %s is %.1f MB, far larger than a direction sidecar "
+                "(the published one is ~757 KB). If this is a model snapshot "
+                "rather than a sidecar, its own layers.N.attn.wo_b tensors "
+                "will be normalized into bogus 'directions' and will corrupt "
+                "generation at any lambda != 0.",
+                resolved,
+                size / 1e6,
+            )
+
         raw = mx.load(str(f))
+        hidden = _hidden_size(model)
         hooked = 0
-        missing = []
+        modules_seen = 0
+        missing: list[str] = []
+        matched: set[str] = set()
         for key, attn in _iter_attention_modules(model):
-            vec = raw.get(f"{key}.attn.wo_b")
+            modules_seen += 1
+            sidecar_key = f"{key}.attn.wo_b"
+            vec = raw.get(sidecar_key)
             if vec is None:
+                missing.append(key)
+                continue
+            if not _is_usable_direction(sidecar_key, vec, hidden):
+                # Rejected tensors stay unmatched on purpose: they are counted
+                # and named as orphans below rather than silently hooked.
+                missing.append(key)
+                continue
+            norm = mx.linalg.norm(vec).item()
+            if norm == 0:
+                logger.warning(
+                    "[refusal] %s has zero norm — no direction to project on, "
+                    "skipping",
+                    sidecar_key,
+                )
                 missing.append(key)
                 continue
             # Normalize defensively: the projection identity assumes a UNIT
             # direction, and a non-unit vector would silently rescale lambda.
-            norm = mx.linalg.norm(vec).item()
-            if norm == 0:
-                missing.append(key)
-                continue
             _directions[id(attn)] = (vec / norm).astype(mx.float32)
             _hooked_modules.append(attn)
+            matched.add(sidecar_key)
             hooked += 1
 
         if not hooked:
             logger.warning(
                 "[refusal] sidecar has %d tensors but none matched this "
-                "model's modules — hook NOT installed",
+                "model's %d attention modules — hook NOT installed",
                 len(raw),
+                modules_seen,
             )
-            _directions.clear()
-            _hooked_modules.clear()
+            _clear_directions()
             return 0
 
         _install_hook(attn_cls if attn_cls is not None else _resolve_attention_class())
         with _lock:
             _state["installed"] = True
             _state["modules"] = hooked
-        logger.info(
-            "[refusal] rank-1 refusal projection installed on %d modules "
-            "(lambda=%.3f, %d sidecar tensors unmatched)",
+
+        orphans = [k for k in sorted(raw) if k not in matched]
+        # A partial mapping is the dangerous case (e.g. a pipeline-sliced view
+        # exposing 20 of 61 layers): it installs, serves, and looks fine. Only
+        # a full 1:1 mapping is routine enough for INFO.
+        level = logging.INFO if hooked == len(raw) else logging.WARNING
+        logger.log(
+            level,
+            "[refusal] rank-1 refusal projection installed: %d model attention "
+            "modules found, %d sidecar directions loaded, %d modules hooked "
+            "(lambda=%.3f) from %s",
+            modules_seen,
+            len(raw),
             hooked,
             get_lambda(),
-            len(raw) - hooked,
+            resolved,
         )
+        if orphans:
+            logger.log(
+                level,
+                "[refusal] %d sidecar direction(s) matched no model module: %s "
+                "— on mlx_lm's deepseek_v4 the 3 mtp.N.attn.wo_b keys are "
+                "EXPECTED orphans (it drops all mtp.* weights at load); "
+                "anything else here means the sidecar does not match this "
+                "checkpoint.",
+                len(orphans),
+                orphans,
+            )
         if missing:
-            logger.info("[refusal] modules without a direction: %s", missing[:8])
+            logger.log(
+                level,
+                "[refusal] %d model module(s) got no usable direction: %s",
+                len(missing),
+                missing[:8],
+            )
         return hooked
 
     except Exception:
         logger.exception("[refusal] failed to install — serving stock model")
-        _directions.clear()
-        _hooked_modules.clear()
+        _clear_directions()
         with _lock:
             _state["installed"] = False
             _state["modules"] = 0
         return 0
+
+
+def _is_usable_direction(key: str, vec: mx.array, hidden: int | None) -> bool:
+    """Reject sidecar tensors that would corrupt or poison the residual stream.
+
+    Shape: a ``[1, D]`` sidecar broadcasts cleanly through ``apply_projection``
+    and silently changes the math; ``[D, 1]`` corrupts the output outright.
+    Only a 1-D ``[hidden_size]`` vector is a direction.
+
+    Finiteness: ``mx.linalg.norm`` of a NaN vector is NaN, and ``nan == 0`` is
+    False, so the zero-norm guard alone lets it through; ``vec / nan`` is an
+    all-NaN "direction" that serves perfectly at lambda=0 and turns the whole
+    residual stream into NaN the moment somebody dials it up, arbitrarily far
+    in time from the install that caused it.
+    """
+    if vec.ndim != 1:
+        logger.warning(
+            "[refusal] %s has shape %s; a direction must be 1-D [hidden_size] "
+            "— skipping",
+            key,
+            tuple(vec.shape),
+        )
+        return False
+    if hidden is not None and vec.shape[0] != hidden:
+        logger.warning(
+            "[refusal] %s has length %d but this model's hidden size is %d "
+            "— skipping",
+            key,
+            vec.shape[0],
+            hidden,
+        )
+        return False
+    if not bool(mx.isfinite(vec).all().item()):
+        logger.warning(
+            "[refusal] %s contains non-finite values (nan/inf) — skipping; a "
+            "NaN direction would poison the residual stream at any lambda != 0",
+            key,
+        )
+        return False
+    return True
+
+
+def _pick_sidecar(d: Path) -> Path | None:
+    """Choose the sidecar inside a directory, preferring the documented name.
+
+    ``refusal_dirs.safetensors`` is what both the CLI help and this module's
+    docstring name, so it wins outright. Falling back to an unsorted
+    ``glob()[0]`` made the same config load different bytes on different
+    machines (and after a re-download), so the fallback is sorted and loud.
+    """
+    named = d / _SIDECAR_BASENAME
+    if named.is_file():
+        return named
+    hits = sorted(d.glob("*.safetensors"))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        logger.warning(
+            "[refusal] %s not found in %s; %d .safetensors candidates present, "
+            "using the lexicographically first (%s). Point --refusal-dirs at "
+            "the sidecar file itself to remove the ambiguity.",
+            _SIDECAR_BASENAME,
+            d,
+            len(hits),
+            hits[0].name,
+        )
+    else:
+        logger.warning(
+            "[refusal] %s not found in %s; using the only .safetensors there "
+            "(%s), which may not be a direction sidecar.",
+            _SIDECAR_BASENAME,
+            d,
+            hits[0].name,
+        )
+    return hits[0]
 
 
 def _resolve_path(path: str | Path) -> Path | None:
@@ -243,18 +524,35 @@ def _resolve_path(path: str | Path) -> Path | None:
     if p.is_file():
         return p
     if p.is_dir():
-        hits = list(p.glob("*.safetensors"))
-        return hits[0] if hits else None
+        picked = _pick_sidecar(p)
+        if picked is None:
+            logger.warning(
+                "[refusal] %s is a directory but contains no .safetensors file",
+                p,
+            )
+        return picked
     try:
         from huggingface_hub import snapshot_download
 
         # local_files_only: serving never downloads; the arena's hf_catalog
         # is the only sanctioned path for pulling weights.
         d = Path(snapshot_download(str(path), local_files_only=True))
-        hits = list(d.glob("*.safetensors"))
-        return hits[0] if hits else None
     except Exception:
+        # Do not collapse "no such path", "not in the HF cache", "hub not
+        # installed" and "repo id typo" into one indistinguishable None — an
+        # operator has to be able to tell `hf download` from `fix the path`
+        # without reading this source.
+        logger.exception(
+            "[refusal] %r is neither an existing file nor a directory, and "
+            "could not be resolved from the local HF cache (downloads are "
+            "disabled here). Pre-download it, or pass a local path.",
+            str(path),
+        )
         return None
+    picked = _pick_sidecar(d)
+    if picked is None:
+        logger.warning("[refusal] HF snapshot %s contains no .safetensors file", d)
+    return picked
 
 
 def _resolve_attention_class() -> Any:
@@ -262,6 +560,20 @@ def _resolve_attention_class() -> Any:
     from mlx_lm.models.deepseek_v4 import V4Attention
 
     return V4Attention
+
+
+def _direction_for(module_id: int, dtype: Any) -> mx.array | None:
+    """The module's direction, cast to ``dtype`` once instead of per forward."""
+    key = (module_id, dtype)
+    cached = _cast_cache.get(key)
+    if cached is not None:
+        return cached
+    base = _directions.get(module_id)
+    if base is None:
+        return None
+    cached = base.astype(dtype)
+    _cast_cache[key] = cached
+    return cached
 
 
 def _install_hook(attn_cls: Any) -> None:
@@ -273,11 +585,18 @@ def _install_hook(attn_cls: Any) -> None:
 
     def _call_with_refusal(self, *args, **kwargs):
         out = original(self, *args, **kwargs)
+        # Deliberately UNLOCKED, unlike get_lambda(): this runs once per layer
+        # per token, and a single dict read is atomic under the GIL, so the
+        # worst case is that one forward pass in flight during a dial change
+        # sees the old value — which is exactly the semantics the admin route
+        # advertises ("effective on the next request"). Do not add a lock here;
+        # do not remove the lock from get_lambda()/apply_lambda(), which need it
+        # to give callers a coherent multi-field snapshot.
         lam = _state["lambda"]
         if lam == 0.0:
             # Bit-exact stock: no arithmetic, no dict lookup.
             return out
-        r = _directions.get(id(self))
+        r = _direction_for(id(self), out.dtype)
         if r is None:
             return out
         return apply_projection(out, r, lam)
@@ -307,8 +626,7 @@ def reset(attn_cls: Any = None) -> None:
     """
     if attn_cls is not None:
         uninstall_hook(attn_cls)
-    _directions.clear()
-    _hooked_modules.clear()
+    _clear_directions()
     with _lock:
         _state["lambda"] = 0.0
         _state["installed"] = False

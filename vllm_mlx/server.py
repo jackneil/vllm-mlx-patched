@@ -1106,7 +1106,7 @@ class RefusalLambdaRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-@app.get("/admin/refusal_lambda")
+@app.get("/admin/refusal_lambda", dependencies=[Depends(verify_api_key)])
 async def get_refusal_lambda():
     """Current refusal-direction dial and whether the hook is installed."""
     from .patches.deepseek_v4_refusal import status
@@ -1114,15 +1114,15 @@ async def get_refusal_lambda():
     return status()
 
 
-@app.post("/admin/refusal_lambda")
-async def post_refusal_lambda(body: RefusalLambdaRequest):
+@app.post("/admin/refusal_lambda", dependencies=[Depends(verify_api_key)])
+async def post_refusal_lambda(request: Request, body: RefusalLambdaRequest):
     """Set the refusal-direction dial; effective on the next request.
 
     0 is stock (bit-exact), ~1.5 removes refusal, negative values make the
     model more reticent than stock. Rejected when no directions are loaded,
     so a silent no-op can never be mistaken for a working dial.
     """
-    from .patches.deepseek_v4_refusal import set_lambda, status
+    from .patches.deepseek_v4_refusal import apply_lambda, status
 
     st = status()
     if not st["installed"]:
@@ -1138,9 +1138,23 @@ async def post_refusal_lambda(body: RefusalLambdaRequest):
         raise HTTPException(status_code=400, detail="lambda must be a finite number")
     if not -10.0 <= value <= 10.0:
         raise HTTPException(status_code=400, detail="lambda must be between -10 and 10")
-    applied = set_lambda(value)
-    logger.info("[refusal] lambda set to %.3f", applied)
-    return {**status(), "lambda": applied}
+    # One lock hold: set and read back together. Echoing `value` instead would
+    # let two concurrent POSTs each be told their own input while a third value
+    # is live. What comes back is what the next forward pass will actually use.
+    previous, applied = apply_lambda(value)
+    # This is the entire audit trail for a safety-relevant change, so it names
+    # the actor, the old value and the new one — not just the new one.
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(
+        "[refusal] lambda changed %.3f -> %.3f by client %s "
+        "(installed=%s, modules=%d)",
+        previous,
+        applied["lambda"],
+        client_host,
+        applied["installed"],
+        applied["modules"],
+    )
+    return applied
 
 
 @app.get("/v1/cache/stats")

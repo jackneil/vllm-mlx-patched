@@ -1038,15 +1038,47 @@ class MemoryAwarePrefixCache:
             "entries": [],
         }
 
+        # Serializing an entry is not allocation-free: save_prompt_cache
+        # materializes each layer cache's .state, which needs fresh Metal
+        # buffers. At shutdown — the only production call site — the dying
+        # engine's state plus MLX's buffer cache of freed-but-retained blocks
+        # can sit near the Metal resource limit, and then every large entry
+        # fails with "[metal::malloc] Resource limit exceeded" (observed
+        # 2026-08-17: 86/88 entries lost, 59 GB of warm prefixes gone —
+        # exactly the caches most worth persisting). Returning the buffer
+        # cache's blocks up front, and once more between a failure and one
+        # retry, is what lets those saves complete.
+        def _clear_mlx_buffer_cache() -> None:
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass  # no MLX (unit tests) or old API — retry still runs
+
+        _clear_mlx_buffer_cache()
+
         saved = 0
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-            try:
+
+            def _save_once() -> None:
                 save_prompt_cache(
                     entry_path,
                     entry.cache,
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
+
+            try:
+                try:
+                    _save_once()
+                except Exception as first_err:
+                    _clear_mlx_buffer_cache()
+                    logger.info(
+                        f"[cache_persist] entry {i} failed once "
+                        f"({first_err}); retrying after mx.clear_cache()"
+                    )
+                    _save_once()
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
                 tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
                 import array as _array

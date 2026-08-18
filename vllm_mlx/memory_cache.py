@@ -442,7 +442,17 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     Supports both KVCache (keys/values are arrays) and QuantizedKVCache
     (keys/values are 3-tuples of arrays).
     """
-    from mlx_lm.models.cache import KVCache
+    try:
+        from mlx_lm.models.cache import KVCache
+    except ImportError:
+        # Environments without mlx_lm (the no-MLX CI test lane) still route
+        # mock-based fetches through this trim path. Production always has
+        # mlx_lm; the shim only needs the attribute surface the scheduler
+        # and tests read.
+        class KVCache:  # noqa: N801 - mirrors the mlx_lm class name
+            keys = None
+            values = None
+            offset = 0
 
     try:
         from mlx_lm.models.cache import QuantizedKVCache

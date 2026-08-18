@@ -136,11 +136,21 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Cache with a state property. The common shape is (keys, values),
+            # but CacheList and recurrent caches nest arbitrarily; a two-way
+            # unpack raised here and the swallowed error accounted the whole
+            # entry as 0 bytes, so the byte-based LRU never evicted it
+            # (upstream #683 hit Metal buffer exhaustion this way). Walk the
+            # structure generically instead.
+            def _walk_state(obj) -> int:
+                if obj is None:
+                    return 0
+                if isinstance(obj, (list, tuple)):
+                    return sum(_walk_state(item) for item in obj)
+                return _array_memory(obj)
+
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _walk_state(layer_cache.state)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
@@ -757,18 +767,32 @@ class MemoryAwarePrefixCache:
         tokens_key = tuple(tokens)
 
         # --- O(1) exact match ---
+        # Never return a cache that covers the ENTIRE key: the scheduler must
+        # feed at least one token to kick off generation, and feeding
+        # prompt[-1] into a cache that already contains it duplicates the
+        # final token (upstream #683 measured the same prompt returning a
+        # different answer). When every layer is trimmable, trim one token
+        # off the returned copy and hand back the last token as remaining;
+        # otherwise fall through — the divergent-suffix paths below skip
+        # non-trimmable candidates, so the request cold-prefills correctly.
         if tokens_key in self._entries:
             entry = self._entries[tokens_key]
-            self._entries.move_to_end(tokens_key)
-            self._stats.hits += 1
-            self._stats.tokens_saved += len(tokens)
-            self._last_match_type = "exact"
-            cache_out = (
-                _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
-                else entry.cache
+            exact_trimmable = not any(
+                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                for lc in entry.cache
             )
-            return cache_out, []
+            if exact_trimmable:
+                self._entries.move_to_end(tokens_key)
+                self._stats.hits += 1
+                self._stats.tokens_saved += len(tokens) - 1
+                self._last_match_type = "exact"
+                trimmed = _trim_cache_offset(entry.cache, 1)
+                cache_out = (
+                    _dequantize_cache(trimmed)
+                    if self._config.kv_quantize
+                    else trimmed
+                )
+                return cache_out, tokens[-1:]
 
         # --- O(log N) prefix & supersequence match via sorted index ---
         best_match: _CacheEntry | None = None
@@ -833,28 +857,19 @@ class MemoryAwarePrefixCache:
                     "non-trimmable cache layers (hybrid model)"
                 )
             elif excess > 0:
-                trimmed_cache = _trim_cache_offset(best_super.cache, excess)
+                # Trim excess + 1 so the returned cache never covers the whole
+                # key (see the exact-match note above).
+                trimmed_cache = _trim_cache_offset(best_super.cache, excess + 1)
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
-                self._stats.tokens_saved += n_requested
+                self._stats.tokens_saved += n_requested - 1
                 self._last_match_type = "supersequence"
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
                     if self._config.kv_quantize
                     else trimmed_cache
                 )
-                return trimmed_cache, []
-            else:
-                self._entries.move_to_end(best_super.tokens)
-                self._stats.hits += 1
-                self._stats.tokens_saved += n_requested
-                self._last_match_type = "supersequence"
-                cache_out = (
-                    _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
-                    else best_super.cache
-                )
-                return cache_out, []
+                return trimmed_cache, tokens[-1:]
 
         # --- Prefix match ---
         if best_match is not None:

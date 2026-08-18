@@ -258,6 +258,10 @@ class SchedulerConfig:
     cache_memory_mb: int | None = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
+    # Durable top-K written by flush_to_disk() / save_to_disk()
+    cache_persist_max_entries: int = 10
+    cache_persist_max_bytes: int = 64 * 1024**3
+
     # KV cache quantization (reduces prefix cache memory)
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -1179,6 +1183,8 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    persist_max_entries=self.config.cache_persist_max_entries,
+                    persist_max_bytes=self.config.cache_persist_max_bytes,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -2948,6 +2954,16 @@ class Scheduler:
             return self.memory_aware_cache.save_to_disk(cache_dir)
         logger.info("[cache_persist] no memory-aware cache to save")
         return False
+
+    def flush_cache_to_disk(self, cache_dir: str) -> int:
+        """Incrementally persist the most-recent prefixes while serving.
+
+        Returns the number of entries newly written by this flush.
+        """
+        if self.memory_aware_cache is not None:
+            return self.memory_aware_cache.flush_to_disk(cache_dir)
+        logger.debug("[cache_persist] no memory-aware cache to flush")
+        return 0
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""

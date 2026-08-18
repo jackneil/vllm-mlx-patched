@@ -41,6 +41,7 @@ def serve_command(args):
     server._api_key = args.api_key
     server._default_timeout = args.timeout
     server._streaming_max_seconds = args.streaming_max_seconds
+    server._cache_persist_interval_seconds = args.cache_persist_interval_seconds
     server._max_thinking_token_budget = args.max_thinking_token_budget
     server._disable_qwen3_first_turn_no_think = args.disable_qwen3_first_turn_no_think
     if args.rate_limit > 0:
@@ -140,6 +141,9 @@ def serve_command(args):
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
+            # Durable top-K persisted to disk (periodic flush + shutdown save)
+            cache_persist_max_entries=args.cache_persist_max_entries,
+            cache_persist_max_bytes=int(args.cache_persist_max_gb * 1024**3),
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -1045,6 +1049,7 @@ Examples:
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
     )
+    from .server import CACHE_PERSIST_INTERVAL_SECONDS_DEFAULT as _CACHE_FLUSH_DEFAULT
     from .server import STREAMING_MAX_SECONDS_DEFAULT as _STREAMING_DEFAULT
 
     def _nonneg_float(raw: str) -> float:
@@ -1083,6 +1088,75 @@ Examples:
             "Mitigates the Qwen3.x 'interleaved thinking' trap and any "
             "other model-side non-termination. Set higher if you legitimately "
             "stream >260s responses; set to 0 to disable the cap."
+        ),
+    )
+
+    def _cache_persist_interval(raw: str) -> float:
+        v = float(raw)
+        if v < 0:
+            raise argparse.ArgumentTypeError(
+                f"--cache-persist-interval-seconds must be >= 0 (got {v}). "
+                "Use 0 to persist only at shutdown."
+            )
+        return v
+
+    def _cache_persist_entries(raw: str) -> int:
+        try:
+            v = int(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--cache-persist-max-entries must be an integer (got {raw!r})."
+            )
+        if v < 1:
+            raise argparse.ArgumentTypeError(
+                f"--cache-persist-max-entries must be >= 1 (got {v}). "
+                "Use --cache-persist-interval-seconds 0 to disable periodic "
+                "persistence instead."
+            )
+        return v
+
+    def _cache_persist_gb(raw: str) -> float:
+        v = float(raw)
+        if v <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--cache-persist-max-gb must be > 0 (got {v}). "
+                "Use --cache-persist-interval-seconds 0 to disable periodic "
+                "persistence instead."
+            )
+        return v
+
+    serve_parser.add_argument(
+        "--cache-persist-interval-seconds",
+        type=_cache_persist_interval,
+        default=_CACHE_FLUSH_DEFAULT,
+        help=(
+            "How often the prefix cache is flushed to disk while serving "
+            "(default: 300s). Persistence used to be shutdown-only, so a "
+            "kernel panic — or a shutdown save that failed under Metal "
+            "pressure — threw away every warm prefix, including the "
+            "expensive Claude Code system-prompt prefill. The flush is "
+            "incremental: entries already on disk are not rewritten. "
+            "Set to 0 to persist only at shutdown."
+        ),
+    )
+    serve_parser.add_argument(
+        "--cache-persist-max-entries",
+        type=_cache_persist_entries,
+        default=10,
+        help=(
+            "How many of the most-recently-used prefixes to keep durable on "
+            "disk (default: 10). Applies to both the periodic flush and the "
+            "shutdown save."
+        ),
+    )
+    serve_parser.add_argument(
+        "--cache-persist-max-gb",
+        type=_cache_persist_gb,
+        default=64.0,
+        help=(
+            "Disk budget for the durable prefix set in GB (default: 64). "
+            "Entries are packed newest-first; one that doesn't fit is skipped "
+            "so smaller older prefixes still get persisted."
         ),
     )
     serve_parser.add_argument(

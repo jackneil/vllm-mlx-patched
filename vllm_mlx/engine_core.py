@@ -668,6 +668,10 @@ class EngineCore:
         """Save prefix cache to disk."""
         return self.scheduler.save_cache_to_disk(cache_dir)
 
+    def flush_cache_to_disk(self, cache_dir: str) -> int:
+        """Incrementally persist the most-recent prefixes. Returns new writes."""
+        return self.scheduler.flush_cache_to_disk(cache_dir)
+
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
@@ -815,6 +819,10 @@ class AsyncEngineCore:
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk."""
         return self.engine.save_cache_to_disk(cache_dir)
+
+    def flush_cache_to_disk(self, cache_dir: str) -> int:
+        """Incrementally persist the most-recent prefixes. Returns new writes."""
+        return self.engine.flush_cache_to_disk(cache_dir)
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""

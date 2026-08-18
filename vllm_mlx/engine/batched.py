@@ -985,6 +985,15 @@ class BatchedEngine(BaseEngine):
             return self._engine.save_cache_to_disk(cache_dir)
         return False
 
+    def flush_cache_to_disk(self, cache_dir: str) -> int:
+        """Incrementally persist the most-recent prefixes while serving.
+
+        Returns the number of entries newly written by this flush.
+        """
+        if self._engine:
+            return self._engine.flush_cache_to_disk(cache_dir)
+        return 0
+
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._engine:

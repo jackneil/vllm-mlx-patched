@@ -41,7 +41,18 @@ _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 3
+#
+# v4 (2026-08-17): content-keyed entry filenames (entry_<sha16>.safetensors)
+# instead of positional entry_<i>, so periodic incremental flushes can tell
+# "already durable on disk" from "new" without re-serializing everything.
+# v3 dirs are simply discarded on load and the cache re-warms.
+_CACHE_PERSIST_VERSION = 4
+
+# Defaults for the durable top-K written by flush_to_disk(). Ten entries at
+# up to 64 GB covers the Claude Code system-prompt prefixes we actually care
+# about surviving a crash without pinning the whole warm cache to disk.
+_DEFAULT_PERSIST_MAX_ENTRIES = 10
+_DEFAULT_PERSIST_MAX_BYTES = 64 * 1024**3
 
 
 def _get_available_memory() -> int:
@@ -159,6 +170,9 @@ class MemoryCacheConfig:
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
+        persist_max_entries: How many of the most-recent entries flush_to_disk()
+            keeps durable on disk.
+        persist_max_bytes: Byte budget the durable set must fit inside.
     """
 
     max_memory_mb: int | None = None
@@ -169,6 +183,8 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    persist_max_entries: int = _DEFAULT_PERSIST_MAX_ENTRIES
+    persist_max_bytes: int = _DEFAULT_PERSIST_MAX_BYTES
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -180,6 +196,14 @@ class MemoryCacheConfig:
         if self.kv_min_quantize_tokens < 0:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
+            )
+        if self.persist_max_entries < 1:
+            raise ValueError(
+                f"persist_max_entries must be >= 1, got {self.persist_max_entries}"
+            )
+        if self.persist_max_bytes <= 0:
+            raise ValueError(
+                f"persist_max_bytes must be > 0, got {self.persist_max_bytes}"
             )
 
     def compute_memory_limit(self) -> int:
@@ -256,6 +280,44 @@ class _CacheEntry:
             cache=cache,
             memory_bytes=memory,
         )
+
+
+def _tokens_hash(tokens_key: tuple[int, ...]) -> str:
+    """Content-address a token key for its on-disk filename.
+
+    The persisted filename is derived from the tokens themselves so a flush
+    can ask "is this exact prefix already durable?" with a single os.path
+    existence check — no positional index to keep in sync, and no
+    re-serialization of entries that have not changed.
+    """
+    import array as _array
+    import hashlib as _hashlib
+
+    return _hashlib.sha256(_array.array("i", tokens_key).tobytes()).hexdigest()[:16]
+
+
+def _clear_mlx_buffer_cache() -> None:
+    """Return MLX's buffer-cache blocks to Metal.
+
+    Serializing an entry is not allocation-free: save_prompt_cache
+    materializes each layer cache's .state, which needs fresh Metal buffers.
+    Under pressure — a dying engine at shutdown, or a busy server mid-flush —
+    MLX's cache of freed-but-retained blocks can sit near the Metal resource
+    limit and every large entry then fails with "[metal::malloc] Resource
+    limit exceeded" (observed 2026-08-17: 86/88 entries lost, 59 GB of warm
+    prefixes gone — exactly the caches most worth persisting). Returning
+    those blocks up front, and once more between a failure and one retry, is
+    what lets the saves complete.
+
+    Silently no-ops when MLX is absent (unit tests) or the API is older; the
+    retry still runs either way.
+    """
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:
+        pass
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
@@ -480,7 +542,11 @@ class MemoryAwarePrefixCache:
     - OrderedDict for O(1) LRU operations
 
     Thread Safety:
-        This class is NOT thread-safe. Use external locking if needed.
+        The entry-table mutators (fetch/store/remove/clear/load_from_disk)
+        and flush_to_disk's snapshot take ``self._lock`` (an RLock), which is
+        what makes a periodic flush on a worker thread safe while the engine
+        loop keeps serving. Nothing else is synchronized — treat the rest of
+        the class as single-writer.
     """
 
     def __init__(
@@ -498,6 +564,11 @@ class MemoryAwarePrefixCache:
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
         self._model_fingerprint = _compute_model_fingerprint(model)
+
+        # Guards the entry table + sorted index. Reentrant because the
+        # locked public methods call each other's helpers (store -> _evict_lru).
+        # Held only for in-memory bookkeeping — never across file I/O.
+        self._lock = _threading.RLock()
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -537,6 +608,16 @@ class MemoryAwarePrefixCache:
         )
 
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
+        """Locked wrapper around :meth:`_fetch_unlocked`.
+
+        fetch() reorders the LRU OrderedDict (move_to_end), which would make a
+        concurrent flush snapshot blow up mid-iteration. See the class-level
+        Thread Safety note.
+        """
+        with self._lock:
+            return self._fetch_unlocked(tokens)
+
+    def _fetch_unlocked(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
         Find cached KV state for the given tokens.
 
@@ -751,6 +832,13 @@ class MemoryAwarePrefixCache:
     def store(
         self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
     ) -> bool:
+        """Locked wrapper around :meth:`_store_unlocked`."""
+        with self._lock:
+            return self._store_unlocked(tokens, cache, evict_prefixes=evict_prefixes)
+
+    def _store_unlocked(
+        self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
+    ) -> bool:
         """
         Store KV cache for future reuse.
 
@@ -889,15 +977,16 @@ class MemoryAwarePrefixCache:
         Returns:
             True if entry was found and removed.
         """
-        tokens_key = tuple(tokens)
-        entry = self._entries.pop(tokens_key, None)
-        if entry is not None:
-            self._current_memory -= entry.memory_bytes
-            self._remove_from_sorted(tokens_key)
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
-            return True
-        return False
+        with self._lock:
+            tokens_key = tuple(tokens)
+            entry = self._entries.pop(tokens_key, None)
+            if entry is not None:
+                self._current_memory -= entry.memory_bytes
+                self._remove_from_sorted(tokens_key)
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                return True
+            return False
 
     def clear(self) -> bool:
         """Clear all cached entries.
@@ -925,10 +1014,11 @@ class MemoryAwarePrefixCache:
                 )
                 return False
 
-            self._entries.clear()
-            self._sorted_keys.clear()
-            self._current_memory = 0
-            self._stats = CacheStats(max_memory_bytes=self._max_memory)
+            with self._lock:
+                self._entries.clear()
+                self._sorted_keys.clear()
+                self._current_memory = 0
+                self._stats = CacheStats(max_memory_bytes=self._max_memory)
             logger.debug("Cache cleared")
             return True
 
@@ -1000,124 +1090,242 @@ class MemoryAwarePrefixCache:
     # Disk persistence — survives server restarts
     # -----------------------------------------------------------------
 
-    def save_to_disk(self, cache_dir: str) -> bool:
-        """Save all cache entries to disk using mlx_lm's safetensors format.
+    def flush_to_disk(
+        self,
+        cache_dir: str,
+        max_entries: int | None = None,
+        max_bytes: int | None = None,
+    ) -> int:
+        """Make the N most-recent cache prefixes durable on disk, incrementally.
 
-        Directory layout::
+        This is the single persistence implementation; :meth:`save_to_disk`
+        (the shutdown path) delegates here. It is safe to call repeatedly on a
+        live, serving process: entries already on disk are left alone, so a
+        steady-state flush with no new prefixes does zero MLX work.
+
+        Directory layout (format v4)::
 
             cache_dir/
-              index.json          # token keys + metadata per entry
-              entry_0.safetensors # KV arrays for entry 0
-              entry_1.safetensors
-              ...
+              index.json                     # ordered oldest -> newest
+              entry_<sha16>.safetensors      # KV arrays, content-keyed
+              entry_<sha16>_tokens.bin       # int32 token key
 
-        Returns True if at least one entry was saved.
+        Selection walks the LRU newest-first and keeps an entry when fewer
+        than ``max_entries`` have been picked AND it fits the remaining byte
+        budget. An entry too big for what's left is *skipped*, not a stop
+        signal — smaller older prefixes still get their turn (packing).
+
+        Anything on disk outside the selected set is pruned, so the directory
+        holds exactly the durable top-K.
+
+        Args:
+            cache_dir: Directory to persist into (created if absent).
+            max_entries: Durable entry count. Defaults to the config's
+                ``persist_max_entries``.
+            max_bytes: Durable byte budget. Defaults to the config's
+                ``persist_max_bytes``.
+
+        Returns:
+            The number of entries newly written by *this* call (0 when
+            everything selected was already durable).
         """
         import json
         import os
         import time as _time
 
+        if max_entries is None:
+            max_entries = self._config.persist_max_entries
+        if max_bytes is None:
+            max_bytes = self._config.persist_max_bytes
+
+        t0 = _time.monotonic()
+
+        # Snapshot under the lock so a concurrent store/fetch can't mutate the
+        # OrderedDict mid-iteration. The snapshot's references keep the MLX
+        # arrays alive even if an entry is evicted while we write it out, so
+        # every file save below happens OUTSIDE the lock.
+        with self._lock:
+            snapshot = list(self._entries.items())  # oldest -> newest
+
+        # --- selection: newest -> oldest, packing into the byte budget ---
+        selected: list[tuple[str, tuple[int, ...], _CacheEntry]] = []
+        remaining_bytes = max_bytes
+        for tokens_key, entry in reversed(snapshot):
+            if len(selected) >= max_entries:
+                break
+            if entry.memory_bytes > remaining_bytes:
+                # Too big for what's left — skip it and keep walking so a
+                # smaller, older prefix can still be made durable.
+                continue
+            selected.append((_tokens_hash(tokens_key), tokens_key, entry))
+            remaining_bytes -= entry.memory_bytes
+
+        os.makedirs(cache_dir, exist_ok=True)
+
+        def _paths(h: str) -> tuple[str, str]:
+            return (
+                os.path.join(cache_dir, f"entry_{h}.safetensors"),
+                os.path.join(cache_dir, f"entry_{h}_tokens.bin"),
+            )
+
+        # --- incremental: only entries not already durable need saving ---
+        need_save = [
+            item
+            for item in selected
+            if not all(os.path.exists(p) for p in _paths(item[0]))
+        ]
+
+        saved_hashes: set[str] = set()
+        if need_save:
+            try:
+                from mlx_lm.models.cache import save_prompt_cache
+            except ImportError:
+                logger.warning("[cache_persist] mlx_lm not available, cannot save")
+                return 0
+
+            _clear_mlx_buffer_cache()
+
+            for h, tokens_key, entry in need_save:
+                entry_path, tokens_path = _paths(h)
+
+                def _save_once(_p=entry_path, _e=entry, _k=tokens_key) -> None:
+                    save_prompt_cache(
+                        _p,
+                        _e.cache,
+                        metadata={"num_tokens": str(len(_k))},
+                    )
+
+                try:
+                    try:
+                        _save_once()
+                    except Exception as first_err:
+                        _clear_mlx_buffer_cache()
+                        logger.info(
+                            f"[cache_persist] entry {h} failed once "
+                            f"({first_err}); retrying after mx.clear_cache()"
+                        )
+                        _save_once()
+
+                    # Tokens go in a separate binary file (100K+ ints is much
+                    # smaller as int32 than as JSON).
+                    import array as _array
+
+                    arr = _array.array("i", tokens_key)  # 32-bit signed ints
+                    with open(tokens_path, "wb") as f:
+                        arr.tofile(f)
+
+                    saved_hashes.add(h)
+                    logger.info(
+                        f"[cache_persist] saved entry {h}: "
+                        f"{len(tokens_key)} tokens, "
+                        f"{entry.memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
+                        f"file={entry_path}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[cache_persist] failed to save entry {h}: {e}")
+
+        # Durable set = everything selected that is actually on disk now.
+        need_save_hashes = {item[0] for item in need_save}
+        durable = [
+            item
+            for item in selected
+            if item[0] in saved_hashes or item[0] not in need_save_hashes
+        ]
+        durable_hashes = {item[0] for item in durable}
+
+        # --- prune: disk holds exactly the durable top-K (this also sweeps
+        # away positional v3 leftovers, whose "hash" never matches) ---
+        pruned = 0
+        try:
+            for name in os.listdir(cache_dir):
+                if not name.startswith("entry_"):
+                    continue
+                if name.endswith(".safetensors"):
+                    h = name[len("entry_") : -len(".safetensors")]
+                elif name.endswith("_tokens.bin"):
+                    h = name[len("entry_") : -len("_tokens.bin")]
+                else:
+                    continue
+                if h in durable_hashes:
+                    continue
+                try:
+                    os.remove(os.path.join(cache_dir, name))
+                    pruned += 1
+                except OSError as e:
+                    logger.warning(f"[cache_persist] failed to prune {name}: {e}")
+        except OSError as e:
+            logger.warning(f"[cache_persist] prune scan failed: {e}")
+
+        # --- index, written oldest -> newest so load_from_disk rebuilds the
+        # OrderedDict with recency intact (MRU last) ---
+        index = {
+            "version": _CACHE_PERSIST_VERSION,
+            "model_fingerprint": self._model_fingerprint,
+            "num_entries": len(durable),
+            "total_memory_bytes": sum(e.memory_bytes for _, _, e in durable),
+            "entries": [
+                {
+                    "hash": h,
+                    "num_tokens": len(tokens_key),
+                    "memory_bytes": entry.memory_bytes,
+                }
+                for h, tokens_key, entry in reversed(durable)
+            ],
+        }
+
+        # Atomic: a crash (or a full disk) mid-write must never leave a
+        # half-written index.json that poisons the next boot.
+        index_path = os.path.join(cache_dir, "index.json")
+        tmp_path = index_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(index, f, indent=2)
+        try:
+            os.rename(tmp_path, index_path)
+        except OSError:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[cache_persist] FLUSHED {len(saved_hashes)} new "
+            f"({len(durable)} durable, {pruned} files pruned) "
+            f"to {cache_dir} in {dt:.1f}s "
+            f"({index['total_memory_bytes'] / _BYTES_PER_MB:.0f}MB on disk)"
+        )
+        return len(saved_hashes)
+
+    def save_to_disk(self, cache_dir: str) -> bool:
+        """Persist the cache at shutdown. Thin delegate to flush_to_disk().
+
+        Keeps the historical contract: True iff at least one entry is present
+        on disk for this cache after the call, False when there was nothing to
+        save.
+        """
+        import json
+        import os
+
         if not self._entries:
             logger.info("[cache_persist] nothing to save (0 entries)")
             return False
 
-        t0 = _time.monotonic()
-        os.makedirs(cache_dir, exist_ok=True)
+        self.flush_to_disk(cache_dir)
 
         try:
-            from mlx_lm.models.cache import save_prompt_cache
-        except ImportError:
-            logger.warning("[cache_persist] mlx_lm not available, cannot save")
+            with open(os.path.join(cache_dir, "index.json")) as f:
+                return len(json.load(f).get("entries", [])) > 0
+        except Exception as e:
+            logger.warning(f"[cache_persist] could not confirm saved index: {e}")
             return False
-
-        index = {
-            "version": _CACHE_PERSIST_VERSION,
-            "model_fingerprint": self._model_fingerprint,
-            "num_entries": len(self._entries),
-            "total_memory_bytes": self._current_memory,
-            "entries": [],
-        }
-
-        # Serializing an entry is not allocation-free: save_prompt_cache
-        # materializes each layer cache's .state, which needs fresh Metal
-        # buffers. At shutdown — the only production call site — the dying
-        # engine's state plus MLX's buffer cache of freed-but-retained blocks
-        # can sit near the Metal resource limit, and then every large entry
-        # fails with "[metal::malloc] Resource limit exceeded" (observed
-        # 2026-08-17: 86/88 entries lost, 59 GB of warm prefixes gone —
-        # exactly the caches most worth persisting). Returning the buffer
-        # cache's blocks up front, and once more between a failure and one
-        # retry, is what lets those saves complete.
-        def _clear_mlx_buffer_cache() -> None:
-            try:
-                import mlx.core as mx
-
-                mx.clear_cache()
-            except Exception:
-                pass  # no MLX (unit tests) or old API — retry still runs
-
-        _clear_mlx_buffer_cache()
-
-        saved = 0
-        for i, (tokens_key, entry) in enumerate(self._entries.items()):
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-
-            def _save_once() -> None:
-                save_prompt_cache(
-                    entry_path,
-                    entry.cache,
-                    metadata={"num_tokens": str(len(tokens_key))},
-                )
-
-            try:
-                try:
-                    _save_once()
-                except Exception as first_err:
-                    _clear_mlx_buffer_cache()
-                    logger.info(
-                        f"[cache_persist] entry {i} failed once "
-                        f"({first_err}); retrying after mx.clear_cache()"
-                    )
-                    _save_once()
-                # Save tokens separately (can be 100K+ ints → binary is smaller)
-                tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
-                import array as _array
-
-                arr = _array.array("i", tokens_key)  # 32-bit signed ints
-                with open(tokens_path, "wb") as f:
-                    arr.tofile(f)
-
-                index["entries"].append(
-                    {
-                        "index": i,
-                        "num_tokens": len(tokens_key),
-                        "memory_bytes": entry.memory_bytes,
-                    }
-                )
-                saved += 1
-                logger.info(
-                    f"[cache_persist] saved entry {i}: "
-                    f"{len(tokens_key)} tokens, "
-                    f"{entry.memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
-                    f"file={entry_path}"
-                )
-            except Exception as e:
-                logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
-
-        index_path = os.path.join(cache_dir, "index.json")
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2)
-
-        dt = _time.monotonic() - t0
-        logger.info(
-            f"[cache_persist] SAVED {saved}/{len(self._entries)} entries "
-            f"to {cache_dir} in {dt:.1f}s "
-            f"({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
-        )
-        return saved > 0
 
     def load_from_disk(self, cache_dir: str) -> int:
         """Load cache entries from disk.
+
+        Entries are loaded in index order (oldest -> newest) so the rebuilt
+        OrderedDict carries the recency the flush observed: the MRU prefix
+        ends up last and is therefore the last thing evicted.
 
         Returns the number of entries successfully loaded.
         """
@@ -1160,12 +1368,15 @@ class MemoryAwarePrefixCache:
 
         loaded = 0
         for entry_meta in index.get("entries", []):
-            i = entry_meta["index"]
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-            tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+            h = entry_meta.get("hash")
+            if not h:
+                logger.warning("[cache_persist] index entry has no hash, skipping")
+                continue
+            entry_path = os.path.join(cache_dir, f"entry_{h}.safetensors")
+            tokens_path = os.path.join(cache_dir, f"entry_{h}_tokens.bin")
 
             if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
-                logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
+                logger.warning(f"[cache_persist] missing files for entry {h}, skipping")
                 continue
 
             try:
@@ -1186,7 +1397,7 @@ class MemoryAwarePrefixCache:
                 # Check if it fits
                 if self._current_memory + memory > self._max_memory:
                     logger.info(
-                        f"[cache_persist] entry {i} would exceed memory limit "
+                        f"[cache_persist] entry {h} would exceed memory limit "
                         f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
                         f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
                     )
@@ -1198,19 +1409,20 @@ class MemoryAwarePrefixCache:
                     cache=cache,
                     memory_bytes=memory,
                 )
-                self._entries[tokens_key] = entry
-                self._current_memory += memory
-                bisect.insort(self._sorted_keys, tokens_key)
+                with self._lock:
+                    self._entries[tokens_key] = entry
+                    self._current_memory += memory
+                    bisect.insort(self._sorted_keys, tokens_key)
                 loaded += 1
 
                 logger.info(
-                    f"[cache_persist] loaded entry {i}: "
+                    f"[cache_persist] loaded entry {h}: "
                     f"{len(tokens)} tokens, "
                     f"{memory / _BYTES_PER_MB:.1f}MB KV"
                 )
 
             except Exception as e:
-                logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
+                logger.warning(f"[cache_persist] failed to load entry {h}: {e}")
 
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory

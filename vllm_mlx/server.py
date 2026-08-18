@@ -146,6 +146,17 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 # guidance.
 STREAMING_MAX_SECONDS_DEFAULT: float = 260.0
 _streaming_max_seconds: float = STREAMING_MAX_SECONDS_DEFAULT
+# How often the prefix cache is flushed to disk while the server is live.
+# Persistence used to happen only at shutdown, so a kernel panic (or a
+# shutdown save that failed under Metal pressure) took every warm prefix with
+# it. Referenced by cli.py so the CLI default and this default can't drift.
+# 0 disables the periodic flush (shutdown-only, the historical behavior).
+CACHE_PERSIST_INTERVAL_SECONDS_DEFAULT: float = 300.0
+_cache_persist_interval_seconds: float = CACHE_PERSIST_INTERVAL_SECONDS_DEFAULT
+# Handle on the background flush loop so lifespan can cancel it on shutdown.
+_cache_flush_task: asyncio.Task | None = None
+# Overlap guard: a flush that outruns its interval must not stack.
+_cache_flush_running: bool = False
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
@@ -525,6 +536,54 @@ def _save_prefix_cache_to_disk() -> None:
         logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
 
 
+def _flush_prefix_cache_to_disk() -> None:
+    """Incrementally persist the hottest prefixes. Runs on a worker thread."""
+    try:
+        d = _get_cache_dir()
+        saved = _engine.flush_cache_to_disk(d)
+        logger.info(f"[cache_persist] periodic flush: saved={saved}")
+    except Exception as e:
+        logger.warning(
+            f"[cache_persist] periodic flush failed: {e}",
+            exc_info=True,
+        )
+
+
+async def _periodic_cache_flush_loop() -> None:
+    """Flush the prefix cache to disk every _cache_persist_interval_seconds.
+
+    Runs for the life of the server. Every failure mode is contained: the
+    flush itself runs on a worker thread (safetensors writes are blocking),
+    a raising flush is logged and the loop keeps its schedule, and a flush
+    that outruns the interval makes the next tick skip rather than stack.
+    """
+    global _cache_flush_running
+
+    while True:
+        await asyncio.sleep(_cache_persist_interval_seconds)
+
+        if _cache_flush_running:
+            logger.warning(
+                "[cache_persist] previous flush still running, skipping this tick"
+            )
+            continue
+
+        _cache_flush_running = True
+        try:
+            await asyncio.to_thread(_flush_prefix_cache_to_disk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Never let one bad flush kill the loop — the next prefix is
+            # exactly the one worth persisting.
+            logger.warning(
+                f"[cache_persist] periodic flush raised: {e}",
+                exc_info=True,
+            )
+        finally:
+            _cache_flush_running = False
+
+
 class _PrefixCacheEndpointAdapter:
     """Thin adapter that exposes .clear() and .get_stats() for HTTP endpoints.
 
@@ -645,7 +704,7 @@ def _install_refusal_directions() -> int:
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _cache_flush_task
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
@@ -659,6 +718,20 @@ async def lifespan(app: FastAPI):
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
+
+    # Keep the hottest prefixes durable WHILE serving, not just at shutdown.
+    # A Claude Code system-prompt prefill costs minutes; a crash between
+    # restarts used to throw all of them away.
+    if (
+        _engine is not None
+        and hasattr(_engine, "flush_cache_to_disk")
+        and _cache_persist_interval_seconds > 0
+    ):
+        _cache_flush_task = asyncio.create_task(_periodic_cache_flush_loop())
+        logger.info(
+            f"[cache_persist] periodic flush enabled "
+            f"(every {_cache_persist_interval_seconds:.0f}s)"
+        )
 
     # Expose prefix cache to HTTP endpoints via app.state. The adapter is safe
     # to attach unconditionally — it no-ops when no scheduler / cache tier is
@@ -675,6 +748,16 @@ async def lifespan(app: FastAPI):
         await init_mcp(mcp_config)
 
     yield
+
+    # Shutdown: stop the periodic flush before the final save so the two
+    # can't race for the same cache directory.
+    if _cache_flush_task is not None:
+        _cache_flush_task.cancel()
+        try:
+            await _cache_flush_task
+        except asyncio.CancelledError:
+            pass
+        _cache_flush_task = None
 
     # Shutdown: Save cache to disk BEFORE stopping engine
     if _engine is not None and hasattr(_engine, "save_cache_to_disk"):

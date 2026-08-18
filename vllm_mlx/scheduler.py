@@ -1471,10 +1471,26 @@ class Scheduler:
 
             total_cached = (request.cached_tokens or 0) + processed_tokens
 
-            # Always save at prefix_boundary (message boundary for cache
-            # reuse with different final user messages).
+            # Save the last chunk that still lies entirely inside the shared
+            # prefix, so a later turn carrying a different final user message
+            # reuses that whole prefix instead of re-prefilling it.
+            #
+            # total_cached advances in prefill_step_size chunks, so it coincides
+            # with prefix_boundary only when the gap happens to be an exact
+            # multiple of the chunk size. An equality test therefore almost
+            # never fired. The interval throttle took over instead, and because
+            # _mid_prefill_last_save restarts at 0 on every request, exactly one
+            # save happened per request. The reusable prefix then crept forward
+            # one chunk per request (8192 -> 10240 -> 12288 on a 16K prompt), so
+            # a conversation whose prompt grows every turn never caught up and
+            # re-prefilled thousands of tokens on each turn.
+            step = self.config.chunked_prefill_tokens or self.config.prefill_step_size
             prefix_boundary = getattr(request, "prefix_boundary", 0)
-            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
+            at_prefix_boundary = (
+                prefix_boundary > 0
+                and total_cached <= prefix_boundary
+                and total_cached + step > prefix_boundary
+            )
 
             # Throttle: only save every save_interval tokens,
             # unless we're at the prefix boundary.
@@ -1494,22 +1510,45 @@ class Scheduler:
 
             prefix_tokens = list(request.prompt_token_ids[:total_cached])
 
-            # Remove previous intermediate entry to avoid memory waste
-            old_key = getattr(request, "_mid_prefill_cache_key", None)
+            # Remove previous intermediate entry to avoid memory waste.
+            # The boundary checkpoint is exempt. It is precisely the entry a
+            # LATER turn carrying a different final user message needs, and the
+            # rolling replacement would otherwise delete it in favour of a
+            # checkpoint that already contains this turn's final message and is
+            # therefore useless to every other turn.
+            old_key = None
+            if not at_prefix_boundary:
+                old_key = getattr(request, "_mid_prefill_cache_key", None)
             if old_key is not None:
                 self.memory_aware_cache.remove(list(old_key))
 
+            # Never evict-prefixes from a mid-prefill save. The boundary
+            # entry (saved exactly at the shared message boundary) is the only
+            # entry a later turn with a different final user message can
+            # PREFIX-match, and hybrid models cannot LCP-match because their
+            # recurrent state is not trimmable. It is shared state across
+            # turns, and any same-conversation save is a supersequence of it,
+            # so the default evict_prefixes=True let even a request that
+            # merely FETCHED from the boundary evict it with its own rolling
+            # save, producing alternating hit/miss turns. Rolling-entry
+            # hygiene is handled explicitly through old_key removal below.
             _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
+            stored = self.memory_aware_cache.store(
+                prefix_tokens,
+                reconstructed,
+                evict_prefixes=False,
+            )
             _dt = _time.monotonic() - _t0
 
             if stored:
                 request._mid_prefill_last_save = total_cached
-                request._mid_prefill_cache_key = tuple(prefix_tokens)
+                if not at_prefix_boundary:
+                    request._mid_prefill_cache_key = tuple(prefix_tokens)
                 logger.info(
                     f"[mid_prefill_cache] request={request_id[:12]} "
                     f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
                     f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
+                    f"boundary={prefix_boundary} sticky={at_prefix_boundary} "
                     f"store_time={_dt:.3f}s"
                 )
             else:

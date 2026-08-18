@@ -175,7 +175,9 @@ class TestPrefixCacheIntegration:
         fetched, remaining = pc.fetch(tokens)
 
         assert fetched is not None
-        assert remaining == []
+        # Full-coverage hits return the last token as remaining so the
+        # scheduler kickoff does not duplicate it in the KV cache.
+        assert remaining == tokens[-1:]
         for layer in fetched:
             assert isinstance(layer, KVCache)
 
@@ -201,7 +203,9 @@ class TestPrefixCacheIntegration:
         # Fetched as dequantized KVCache
         fetched, remaining = pc.fetch(tokens)
         assert fetched is not None
-        assert remaining == []
+        # Full-coverage hits return the last token as remaining so the
+        # scheduler kickoff does not duplicate it in the KV cache.
+        assert remaining == tokens[-1:]
         for layer in fetched:
             assert isinstance(layer, KVCache)
 

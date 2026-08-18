@@ -133,11 +133,24 @@ class MockShapeArray:
 
 
 class MockKVCache:
-    """Mock KV cache with keys/values attributes."""
+    """Mock trimmable KV cache with keys/values/offset attributes.
+
+    The offset attribute marks it trimmable, like the real KVCache. A cache
+    without offset models a hybrid recurrent layer and is treated as
+    non-trimmable by full-coverage fetch handling.
+    """
 
     def __init__(self, key_bytes: int, value_bytes: int):
         self.keys = MockArray(key_bytes)
         self.values = MockArray(value_bytes)
+        self.offset = 8
+
+
+class MockNonTrimmableCache:
+    """Mock recurrent-state cache: no offset/keys, cannot be trimmed."""
+
+    def __init__(self, nbytes: int):
+        self.state = MockArray(nbytes)
 
 
 class MockStateCache:
@@ -265,10 +278,24 @@ class TestMemoryAwarePrefixCache:
         assert small_cache.store(tokens, kv) is True
         assert len(small_cache) == 1
 
-        # Fetch exact match
+        # Fetch exact match. Full-coverage hits return a copy trimmed by one
+        # token plus the last token as remaining, so the scheduler kickoff
+        # does not duplicate the final token in the KV cache.
         result, remaining = small_cache.fetch(tokens)
-        assert result is kv  # Same reference, no copy
-        assert remaining == []
+        assert result is not None
+        assert result is not kv  # Trimmed copy, not the stored reference
+        assert remaining == tokens[-1:]
+        assert small_cache.get_stats()["hits"] == 1
+
+    def test_exact_match_non_trimmable_fails_closed(self, small_cache):
+        """A full-coverage hit on a non-trimmable (hybrid) cache cannot be
+        returned without replaying the final token, so it must miss."""
+        tokens = [1, 2, 3, 4, 5]
+        assert small_cache.store(tokens, [MockNonTrimmableCache(1000)]) is True
+
+        result, remaining = small_cache.fetch(tokens)
+        assert result is None
+        assert remaining == tokens
 
     def test_fetch_prefix_match(self, small_cache, mock_kv_cache):
         # Store shorter sequence

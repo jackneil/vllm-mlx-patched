@@ -11,8 +11,16 @@ causes the template to pre-emit ``<think>\\n\\n</think>\\n\\n`` in the
 generation prompt, so the model skips think mode entirely — no runaway
 possible.
 
-This helper detects that exact fingerprint and injects the kwarg, while
-respecting all client-explicit thinking signals.
+This helper detects agent (tools-carrying) qwen3 conversations and injects
+the kwarg, while respecting all client-explicit thinking signals.
+
+The injection deliberately fires on EVERY turn of the conversation, not
+just the first. A turn-dependent kwarg makes the chat template render a
+DIFFERENT system region per turn (Qwen3.8 templates emit a
+reasoning-effort preamble only when thinking is enabled), which collapses
+the shared token prefix between consecutive turns to almost nothing and
+silently defeats prefix caching for the whole conversation. Template
+kwargs must be a pure function of the conversation, never the turn index.
 
 Upstream references:
 - https://github.com/ggml-org/llama.cpp/issues/21118 (root cause)
@@ -26,16 +34,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..metrics import qwen3_first_turn_no_think_applied_total
-
-
-def _has_prior_assistant_message(messages: list[Any] | None) -> bool:
-    if not messages:
-        return False
-    for m in messages:
-        role = getattr(m, "role", None) if not isinstance(m, dict) else m.get("role")
-        if role == "assistant":
-            return True
-    return False
 
 
 def _client_set_enable_thinking(chat_template_kwargs: dict | None) -> bool:
@@ -69,11 +67,13 @@ def maybe_disable_thinking_for_qwen3_agent_first_turn(
     Predicate (all must hold):
       1. ``reasoning_parser_name == "qwen3"`` (strictly qwen3 family).
       2. ``len(request.tools or []) > 0``.
-      3. No prior ``assistant`` role message in ``request.messages``.
-      4. Operator hasn't opted out (``disabled is False``).
-      5. No client-supplied ``chat_template_kwargs["enable_thinking"]``.
-      6. No client-explicit ``thinking.type`` of ``"enabled"`` or ``"disabled"``
+      3. Operator hasn't opted out (``disabled is False``).
+      4. No client-supplied ``chat_template_kwargs["enable_thinking"]``.
+      5. No client-explicit ``thinking.type`` of ``"enabled"`` or ``"disabled"``
          (``None`` and ``"adaptive"`` are both treated as no-signal).
+
+    Firing on later turns (prior assistant messages present) is required
+    for prefix-cache correctness: see the module docstring.
 
     Returns ``True`` if injection fired (and increments the metric),
     ``False`` otherwise. Request is mutated in place when firing.
@@ -86,10 +86,8 @@ def maybe_disable_thinking_for_qwen3_agent_first_turn(
     if not tools:
         return False
     messages = getattr(request, "messages", None)
-    # No messages at all = nothing to protect on "first turn". Cleanly skip.
+    # No messages at all = nothing to protect. Cleanly skip.
     if not messages:
-        return False
-    if _has_prior_assistant_message(messages):
         return False
     ctk = getattr(request, "chat_template_kwargs", None)
     if _client_set_enable_thinking(ctk):

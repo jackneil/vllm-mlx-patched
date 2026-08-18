@@ -103,7 +103,12 @@ class TestNonFiringConditions:
         )
         assert fired is False
 
-    def test_skips_when_prior_assistant_message(self):
+    def test_fires_on_later_turns_for_conversation_stability(self):
+        # Firing must NOT depend on the turn index: a turn-dependent
+        # enable_thinking makes the template render a different system
+        # region per turn (the reasoning-effort preamble is gated on
+        # thinking), which collapses the shared token prefix and defeats
+        # prefix caching for the whole conversation.
         req = _make_request(
             tools=[_tool()],
             messages=[
@@ -115,7 +120,8 @@ class TestNonFiringConditions:
         fired = maybe_disable_thinking_for_qwen3_agent_first_turn(
             req, reasoning_parser_name="qwen3", disabled=False
         )
-        assert fired is False
+        assert fired is True
+        assert req.chat_template_kwargs["enable_thinking"] is False
 
     def test_skips_when_operator_opted_out(self):
         req = _make_request(tools=[_tool()])

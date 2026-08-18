@@ -723,7 +723,8 @@ def test_save_to_disk_retries_a_failed_entry_after_clearing_the_buffer_cache(
 ):
     """An entry whose first save dies on Metal pressure must be retried after
     mx.clear_cache() — and the retry must come AFTER a clear, not blind."""
-    import mlx.core as mx  # noqa: F401 — asserts the patch target exists
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
 
     events = []
     attempts = {"n": 0}
@@ -764,6 +765,8 @@ def test_save_to_disk_gives_up_on_an_entry_after_exactly_one_retry(
 ):
     """A persistently-failing entry is skipped after two attempts — the retry
     must not loop, and the other entries must still be saved."""
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
     calls = {"n": 0}
 
     def always_fail_first_key(path, cache_obj, metadata=None):

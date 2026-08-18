@@ -51,13 +51,16 @@ def test_issue_29_supersequence_fetch_no_stale_kv():
     fetched, remaining = pc.fetch(list(range(1, 15)))
 
     assert fetched is not None
+    # Full-coverage supersequence hits trim excess + 1 so the scheduler
+    # kickoff does not duplicate the final token; 13 of 14 tokens remain
+    # cached and the last token comes back as remaining.
     for layer in fetched:
         keys_view, values_view = layer.state
-        assert keys_view.shape[-2] == 14
-        assert values_view.shape[-2] == 14
+        assert keys_view.shape[-2] == 13
+        assert values_view.shape[-2] == 13
         assert float(mx.max(keys_view).item()) == 1.0
         assert float(mx.max(values_view).item()) == 1.0
-    assert remaining == []
+    assert remaining == [14]
 
 
 def test_issue_29_pre_fix_persisted_cache_is_discarded(tmp_path):

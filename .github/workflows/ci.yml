@@ -136,6 +136,8 @@ jobs:
             tests/test_prefill_cache_hooks.py \
             tests/test_mtp_decode.py \
             tests/test_deepseek_v4_refusal.py \
+            tests/test_memory_cache.py \
+            tests/test_cache_persist_loop.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"

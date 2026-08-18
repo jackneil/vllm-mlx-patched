@@ -1116,11 +1116,24 @@ async def get_refusal_lambda():
 
 @app.post("/admin/refusal_lambda", dependencies=[Depends(verify_api_key)])
 async def post_refusal_lambda(request: Request, body: RefusalLambdaRequest):
-    """Set the refusal-direction dial; effective on the next request.
+    """Set the refusal-direction dial; effective mid-flight, not next request.
 
     0 is stock (bit-exact), ~1.5 removes refusal, negative values make the
     model more reticent than stock. Rejected when no directions are loaded,
     so a silent no-op can never be mistaken for a working dial.
+
+    When it lands: the hook reads lambda once per attention module per token,
+    not once per request and not once per forward pass. A change therefore
+    takes effect in the middle of any generation already streaming, and the
+    one forward pass in flight when it lands is a HYBRID — the modules it has
+    already run used the old value, the rest use the new one, a mixture that
+    corresponds to no configured lambda.
+
+    Operator note: dialling down to stop unsafe output that is ALREADY
+    streaming does not retract the tokens already sent, and the next token or
+    two come out of that hybrid pass. Treat the dial as "what subsequent
+    tokens and requests get"; to stop a response in progress, cancel the
+    request.
     """
     from .patches.deepseek_v4_refusal import apply_lambda, status
 
@@ -1140,7 +1153,12 @@ async def post_refusal_lambda(request: Request, body: RefusalLambdaRequest):
         raise HTTPException(status_code=400, detail="lambda must be between -10 and 10")
     # One lock hold: set and read back together. Echoing `value` instead would
     # let two concurrent POSTs each be told their own input while a third value
-    # is live. What comes back is what the next forward pass will actually use.
+    # is live. The guarantee this buys is narrow and worth stating exactly: the
+    # value returned WAS the live dial at the instant this request set it. It
+    # is NOT a promise about what the next forward pass will use — no read that
+    # completes before the response is serialized can make that promise, and a
+    # later writer may already have superseded this value by the time the
+    # client reads it.
     previous, applied = apply_lambda(value)
     # This is the entire audit trail for a safety-relevant change, so it names
     # the actor, the old value and the new one — not just the new one.

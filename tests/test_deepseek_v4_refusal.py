@@ -20,8 +20,11 @@ Basis used throughout:
 """
 
 import contextlib
+import inspect
 import logging
+import math
 import sys
+import threading
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -647,6 +650,55 @@ def test_compiled_forward_really_does_freeze_the_dial(tmp_path, attn_cls):
     assert refusal.status()["lambda"] == 1.5  # ...while status() says otherwise
 
 
+def test_apply_compile_is_bypassed_by_implicit_calls(tmp_path, attn_cls):
+    """The measurement behind the "inert today" sentence in the refusal log.
+
+    ``apply_compile`` assigns the compiled function to ``model.__call__`` as an
+    INSTANCE attribute; Python resolves ``model(x)`` against
+    ``type(model).__call__``. Every serving call site uses the implicit form
+    (``vllm_mlx/engine/batched.py``, ``engine/simple.py``, ``specprefill.py``,
+    ``mllm_batch_generator.py``), so today the compiled trace never runs and
+    dropping ``--compile`` to get the dial costs nothing.
+    """
+    path, model = _compiled_sidecar(tmp_path, attn_cls)
+    assert refusal.load_refusal_directions(model, path, attn_cls=attn_cls) == 1
+    x = mx.zeros((1, 4), dtype=mx.float32)
+
+    apply_compile(model)
+    refusal.set_lambda(0.0)
+    assert bool(mx.all(model.__call__(x) == V).item())  # trace captured at 0
+
+    refusal.set_lambda(1.5)
+    # Explicit __call__ finds the compiled instance attribute: frozen.
+    assert bool(mx.all(model.__call__(x) == V).item())
+    # Implicit call — the only form the serving path uses — resolves
+    # type(model).__call__ and never sees the compiled function at all.
+    assert bool(
+        mx.all(model(x) == refusal.apply_projection(V, R, 1.5)).item()
+    ), "the implicit call should still be eager, and the dial should move"
+
+
+def test_compile_refusal_says_compile_is_inert_on_the_serving_path_today(
+    tmp_path, attn_cls, caplog
+):
+    """The refusal stays (future-proofing), but must not cost an operator a
+    feature they were never actually getting.
+    """
+    path, model = _compiled_sidecar(tmp_path, attn_cls)
+    apply_compile(model)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOG):
+        assert refusal.load_refusal_directions(model, path, attn_cls=attn_cls) == 0
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, caplog.text
+    msg = " ".join(errors[0].getMessage().split())
+    assert "Dropping --compile costs you nothing today" in msg
+    assert "INERT on the serving path" in msg
+    assert "INSTANCE attribute" in msg
+    assert "type(model).__call__" in msg
+
+
 # --- 19: poisonous sidecar tensors are rejected, not counted as hooked -------
 
 
@@ -970,30 +1022,165 @@ def test_post_logs_actor_and_both_lambda_values(client, tmp_path, attn_cls, capl
     assert "testclient" in line, line  # the actor
 
 
-def test_post_reports_the_live_dial_rather_than_echoing_the_input(
+class _LockProbe:
+    """``refusal._lock``, with a second writer landing at a chosen release.
+
+    A writer that lands exactly at a lock RELEASE is invisible to a
+    set-and-read done under one hold and fatal to one that takes the lock
+    twice. That makes the difference deterministic instead of hoping a sleep
+    wins a race — and, unlike stubbing ``apply_lambda``, it leaves the
+    production function itself running.
+    """
+
+    def __init__(self, lock, fire_when, land):
+        self._lock = lock
+        self._fire_when = fire_when
+        self._land = land
+        self._armed = True
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        released = self._lock.__exit__(*exc)
+        if self._armed and self._fire_when():
+            self._armed = False  # the racing writer must not re-trigger itself
+            self._land()
+        return released
+
+
+def test_post_reports_a_dial_value_that_was_actually_live(
     client, tmp_path, attn_cls, monkeypatch
 ):
-    """Two concurrent POSTs must not each be told their own input won."""
+    """Production ``apply_lambda``, raced by a real thread at the lock boundary.
+
+    The previous version of this test replaced ``refusal.apply_lambda`` with a
+    stub that raced and then re-read ``status()``, and asserted on the stub's
+    output — production ``apply_lambda`` never ran, so the test asserted its
+    own double. Here the only thing patched is the module lock, and writer B
+    is a real thread contending for it.
+
+    What is asserted is the guarantee that actually holds. "What comes back is
+    what the next forward pass will use" cannot be delivered by any read that
+    completes before the response is serialized — the real production sequence
+    returns ``{'lambda': 1.5}`` while the live value is already 0.0. What CAN
+    be delivered, and is: the value returned was the live dial at the instant
+    this request set it, so a caller is never told a number that was never
+    live. A later writer may already have superseded it.
+    """
     _install_for_endpoint(tmp_path, attn_cls)
-    real_apply = refusal.apply_lambda
+    # Not a double: this is the module's own function, unwrapped.
+    assert refusal.apply_lambda.__module__ == refusal.__name__
 
-    def _apply_with_a_racing_writer(value):
-        previous, _ = real_apply(value)
-        real_apply(0.0)  # writer B lands before A formats its response
-        return previous, refusal.status()
+    landed: list[float] = []
 
-    def _set_with_a_racing_writer(value):
-        real_apply(value)
-        real_apply(0.0)
-        return float(value)
+    def _writer_b():
+        refusal.set_lambda(0.0)
+        landed.append(refusal.get_lambda())
 
-    monkeypatch.setattr(refusal, "apply_lambda", _apply_with_a_racing_writer)
-    monkeypatch.setattr(refusal, "set_lambda", _set_with_a_racing_writer)
+    def _land():
+        thread = threading.Thread(target=_writer_b)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive(), "the racing writer never landed"
+
+    monkeypatch.setattr(
+        refusal,
+        "_lock",
+        _LockProbe(
+            refusal._lock,
+            fire_when=lambda: refusal._state["lambda"] == 1.5,
+            land=_land,
+        ),
+    )
 
     body = client.post("/admin/refusal_lambda", json={"lambda": 1.5}).json()
 
+    assert landed == [0.0], "the racing writer did not run"
+    # A set-then-read across two lock holds would have returned writer B's 0.0.
+    assert body == {"lambda": 1.5, "installed": True, "modules": 2}
+    # ...and by the time the client reads it, it is already stale.
     assert refusal.get_lambda() == 0.0
-    assert body["lambda"] == 0.0, "response echoed the caller's input, not the dial"
+
+    # The route must not claim more than that in its own comments either.
+    from vllm_mlx import server
+
+    src = " ".join(
+        inspect.getsource(server.post_refusal_lambda).replace("#", " ").split()
+    )
+    assert "what the next forward pass will actually use" not in src
+    assert "WAS the live dial at the instant this request set it" in src
+
+
+# --- 27: the dial is read per MODULE, not per request or per forward ---------
+
+
+class _MidPassDialFlip(_CallableInner):
+    """A forward pass that changes the dial partway through.
+
+    Stands in for the admin thread landing between two attention modules,
+    which is what actually happens: the hook's ``_state["lambda"]`` read is
+    per module per token, so nothing holds a value steady for a whole pass.
+    """
+
+    def __init__(self, layers, flip_at, to):
+        super().__init__(layers)
+        self.flip_at = flip_at
+        self.to = to
+
+    def __call__(self, x):
+        seen = []
+        for i, layer in enumerate(self.layers):
+            if i == self.flip_at:
+                refusal.set_lambda(self.to)
+            seen.append(layer.attn(x))
+        return seen
+
+
+def test_a_dial_change_lands_mid_forward_and_yields_a_hybrid_pass(tmp_path, attn_cls):
+    """One forward pass, two lambdas — the semantics the docs now state."""
+    path = _write_sidecar(tmp_path, [f"layers.{i}" for i in range(4)])
+    model = _MidPassDialFlip([_Block(attn_cls()) for _ in range(4)], flip_at=2, to=1.5)
+    assert refusal.load_refusal_directions(model, path, attn_cls=attn_cls) == 4
+
+    refusal.set_lambda(0.0)
+    seen = model(mx.zeros((1, 4), dtype=mx.float32))
+
+    stock = V
+    dialed = refusal.apply_projection(V, R, 1.5)
+    assert not bool(mx.all(dialed == stock).item())  # the two really differ
+
+    assert bool(mx.all(seen[0] == stock).item()), "layer 0 should predate the flip"
+    assert bool(mx.all(seen[1] == stock).item()), "layer 1 should predate the flip"
+    assert bool(mx.all(seen[2] == dialed).item()), "layer 2 should follow the flip"
+    assert bool(mx.all(seen[3] == dialed).item()), "layer 3 should follow the flip"
+    assert refusal.get_lambda() == 1.5
+
+
+def test_the_dial_docs_state_the_real_concurrency_semantics():
+    """Both of these used to describe the opposite of what happens.
+
+    The hook comment claimed the worst case was a whole forward pass seeing
+    the old value; the route claimed the change was "effective on the next
+    request". A change actually lands mid-request, mid-token, and the pass in
+    flight is a hybrid of both lambdas.
+    """
+    from vllm_mlx import server
+
+    # Strip comment markers first, so a phrase that wrapped across two comment
+    # lines still reads as one sentence.
+    hook = " ".join(inspect.getsource(refusal._install_hook).replace("#", " ").split())
+    assert "one forward pass in flight" not in hook
+    assert "HYBRID" in hook
+    assert "per attention module per token" in hook
+
+    route = inspect.getdoc(server.post_refusal_lambda)
+    assert "effective on the next request" not in route
+    assert "HYBRID" in route
+    assert "cancel the request" in " ".join(route.split())
+
+    setter = inspect.getdoc(refusal.set_lambda)
+    assert "Takes effect on the next forward pass" not in setter
 
 
 def test_apply_lambda_returns_previous_and_a_coherent_snapshot(tmp_path, attn_cls):
@@ -1161,6 +1348,114 @@ def test_all_zero_direction_is_rejected_and_counted_unmatched(
     refusal.set_lambda(1.5)
     assert model.layers[1].attn(None) is V  # untouched, not NaN
     assert bool(mx.all(mx.isfinite(model.layers[0].attn(None))).item())
+
+
+def test_a_direction_whose_norm_overflows_to_inf_is_rejected(
+    tmp_path, attn_cls, caplog
+):
+    """Finite components, INFINITE norm: ``vec / inf`` is an all-ZERO direction.
+
+    Both guards that came before this one wave it through — a corrupt or
+    truncated sidecar whose bytes reinterpret as ~1e38 floats has
+    ``isfinite(vec).all() == True`` and ``norm == 0`` False — and the module
+    was then counted in ``hooked``, logged as installed and reported by
+    ``status()`` while projecting exactly nothing at every lambda. That is the
+    "hooked but silently inert" hole this feature keeps having to close.
+    """
+    huge = mx.array([3.0e38] * 4, dtype=mx.float32)
+    assert bool(mx.isfinite(huge).all().item())  # clears the component check
+    norm = mx.linalg.norm(huge).item()
+    assert norm != 0  # ...and clears a bare `norm == 0` guard
+    assert not math.isfinite(norm)
+    assert bool(mx.all((huge / norm) == 0.0).item())  # what it would install
+
+    path = _write_raw(tmp_path, {"layers.0.attn.wo_b": R, "layers.1.attn.wo_b": huge})
+    model = _tree(2, attn_factory=attn_cls)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOG):
+        assert refusal.load_refusal_directions(model, path, attn_cls=attn_cls) == 1
+
+    assert refusal.status()["modules"] == 1
+    assert id(model.layers[1].attn) not in refusal._directions
+    assert "layers.1.attn.wo_b" in caplog.text
+    assert "non-finite norm" in caplog.text
+
+    # Counted as an orphan, exactly like every other reject.
+    unusable = [
+        r for r in caplog.records if "got no usable direction" in r.getMessage()
+    ]
+    assert unusable and "layers.1" in unusable[0].getMessage()
+
+    # The layer serves stock rather than carrying an inert hook.
+    refusal.set_lambda(1.5)
+    assert model.layers[1].attn(None) is V
+    assert not bool(mx.all(model.layers[0].attn(None) == V).item())
+
+
+# --- 26: the projection coefficient is a matvec ------------------------------
+
+
+def _reduction_projection(out, r, lam):
+    """The pre-matvec form of apply_projection, kept as a reference."""
+    if lam == 0.0:
+        return out
+    r = r.astype(out.dtype)
+    return out - lam * mx.sum(out * r, axis=-1, keepdims=True) * r
+
+
+def test_matvec_projection_matches_the_reduction_bit_for_bit_on_this_basis():
+    """The switch to ``out @ r`` must not move a single bit on the exact basis.
+
+    Guards a botched matvec (wrong axis, missing keepdims, a broadcast that
+    silently changes the math) rather than the perf win itself.
+    """
+    batched = mx.stack([mx.stack([V, W]), mx.stack([R, V * 2.0])])
+    for lam in (1.0, 1.5, 2.0, -1.0, 0.25):
+        for x in (V, W, R, batched):
+            got = refusal.apply_projection(x, R, lam)
+            assert got.shape == x.shape, (lam, x.shape)
+            assert bool(
+                mx.all(got == _reduction_projection(x, R, lam)).item()
+            ), f"lam={lam} shape={x.shape}"
+
+
+def test_projection_does_not_materialize_a_full_size_intermediate():
+    """The reason for the matvec: ``out * r`` allocates a whole extra activation.
+
+    Fails against the reduction form. Measured [1, 4096, 4096] bfloat16 on an
+    M3 Ultra: reduction 100.7 MB, matvec 67.1 MB. The assertion carries a wide
+    margin because the point is the missing allocation, not a precise number.
+    """
+    x = mx.random.normal((1, 4096, 4096)).astype(mx.bfloat16)
+    r = mx.random.normal((4096,)).astype(mx.bfloat16)
+    mx.eval(x, r)
+
+    def peak_mb(fn):
+        best = None
+        for _ in range(2):
+            mx.clear_cache()
+            mx.reset_peak_memory()
+            base = mx.get_peak_memory()
+            mx.eval(fn(x, r, 1.5))
+            used = (mx.get_peak_memory() - base) / 1e6
+            best = used if best is None else min(best, used)
+        return best
+
+    served = peak_mb(refusal.apply_projection)
+    reduction = peak_mb(_reduction_projection)
+    assert served < reduction * 0.85, f"matvec {served:.1f} MB vs {reduction:.1f} MB"
+
+
+def test_lambda_zero_is_where_the_exactness_guarantee_lives():
+    """The short-circuit, not the arithmetic form, is what makes "off" exact."""
+    src = inspect.getsource(refusal.apply_projection)
+    assert "if lam == 0.0:" in src
+    assert "mx.sum(out * r" not in src, "reduction form is back"
+    assert "out @ r" in src
+
+    for dtype in (mx.float32, mx.bfloat16, mx.float16):
+        x = V.astype(dtype)
+        assert refusal.apply_projection(x, R, 0.0) is x
 
 
 def test_hooked_modules_holds_a_strong_ref_per_hooked_module(tmp_path, attn_cls):

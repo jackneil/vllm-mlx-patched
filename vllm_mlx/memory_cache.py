@@ -788,9 +788,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "exact"
                 trimmed = _trim_cache_offset(entry.cache, 1)
                 cache_out = (
-                    _dequantize_cache(trimmed)
-                    if self._config.kv_quantize
-                    else trimmed
+                    _dequantize_cache(trimmed) if self._config.kv_quantize else trimmed
                 )
                 return cache_out, tokens[-1:]
 

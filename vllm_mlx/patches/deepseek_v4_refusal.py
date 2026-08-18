@@ -168,6 +168,11 @@ def apply_projection(out: mx.array, direction: mx.array, lam: float) -> mx.array
         B=1  T=8192   reduction 346.1ms   matvec  76.1ms   (4.55x)
         peak memory, one layer at T=16384:  402.7MB -> 268.5MB
 
+    The speedup magnitude varies with concurrent GPU load — a re-run on a
+    busy box measured 1.1x-1.6x on the same shapes. The direction and the
+    peak-memory reduction are stable, and the memory half is pinned by a
+    test (100.7MB -> 67.1MB on the test's shapes).
+
     and against an fp32 reference computed from the SAME rounded inputs the two
     forms are equidistant at the dtypes actually served (bf16 1.561e-02 both,
     fp16 1.876e-03 both; fp32 0.0 vs 2.384e-07, i.e. 1 ulp) — the bf16 "delta"
